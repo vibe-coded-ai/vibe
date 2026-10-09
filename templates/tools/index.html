@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Notes</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
+    form { display: flex; gap: .5rem; margin: 1rem 0; }
+    input { flex: 1; padding: .5rem; font: inherit; }
+    button { padding: .5rem 1rem; font: inherit; }
+    li { margin: .5rem 0; }
+    .meta { color: #777; font-size: .85rem; }
+    .error { color: #b00020; }
+    code { background: #f3f3f3; padding: .1rem .3rem; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>Notes</h1>
+  <p class="meta">Your AI reads and writes these through this vibe's MCP server at <code id="mcp"></code>.</p>
+  <form id="add">
+    <input name="text" placeholder="Add a note" aria-label="Note text" required>
+    <button>Add</button>
+  </form>
+  <p id="error" class="error" role="alert"></p>
+  <ul id="notes"></ul>
+  <script>
+    document.getElementById('mcp').textContent = location.origin + '/mcp';
+    async function call(name, args = {}) {
+      const response = await fetch('/api/' + name, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+      const result = await response.json();
+      if (!response.ok || result.success !== true) throw new Error(result.error || `Request failed (${response.status})`);
+      return result;
+    }
+    async function render() {
+      const res = await call('list_notes');
+      const list = document.getElementById('notes');
+      list.replaceChildren(...(res.data || []).map((n) => {
+        const li = document.createElement('li');
+        li.textContent = n.text;
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = new Date(n.createdAt).toLocaleString() + (n.tag ? ' · ' + n.tag : '');
+        li.append(meta);
+        return li;
+      }));
+    }
+    document.getElementById('add').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const text = e.target.elements.text.value.trim();
+      if (!text) return;
+      const error = document.getElementById('error');
+      error.textContent = '';
+      try {
+        await call('add_note', { text });
+        e.target.reset();
+        await render();
+      } catch (err) {
+        error.textContent = err.message || String(err);
+      }
+    });
+    render().catch((err) => { document.getElementById('error').textContent = err.message || String(err); });
+  </script>
+</body>
+</html>

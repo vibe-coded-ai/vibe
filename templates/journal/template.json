@@ -1,0 +1,5 @@
+{
+  "name": "journal",
+  "description": "A searchable journal for evidence-based records such as a bread-baking diary.",
+  "storage": "kv"
+}

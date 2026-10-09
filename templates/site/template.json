@@ -1,0 +1,6 @@
+{
+  "name": "site",
+  "description": "A static page: one index.html, no build step, no backend.",
+  "storage": "kv",
+  "type": "static"
+}

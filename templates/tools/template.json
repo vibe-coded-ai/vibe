@@ -1,0 +1,5 @@
+{
+  "name": "tools",
+  "description": "Blank data vibe: notes your AI can add, list, update and delete. Start here and rename.",
+  "storage": "kv"
+}

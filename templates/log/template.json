@@ -1,0 +1,5 @@
+{
+  "name": "log",
+  "description": "A minimal event log with tags and full-text search.",
+  "storage": "kv"
+}

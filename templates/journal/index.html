@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bake Journal</title>
+  <style>
+    :root { color-scheme: light; --ink: #29231f; --muted: #74675e; --paper: #fffaf1; --card: #fff; --accent: #a54827; --line: #e5d9c8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: #f3eadc; font: 16px/1.5 ui-sans-serif, system-ui, sans-serif; }
+    main { width: min(960px, calc(100% - 32px)); margin: 48px auto; }
+    header { margin-bottom: 28px; }
+    h1 { margin: 0; font: 700 clamp(2.2rem, 8vw, 4.8rem)/.95 Georgia, serif; letter-spacing: -.05em; }
+    header p { max-width: 620px; color: var(--muted); }
+    .layout { display: grid; grid-template-columns: minmax(270px, .8fr) minmax(0, 1.2fr); gap: 24px; align-items: start; }
+    .panel, article { background: var(--card); border: 1px solid var(--line); border-radius: 16px; box-shadow: 0 10px 30px #593a1910; }
+    .panel { padding: 22px; position: sticky; top: 20px; }
+    h2 { margin: 0 0 16px; font: 700 1.25rem Georgia, serif; }
+    form { display: grid; gap: 12px; }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: .82rem; font-weight: 700; letter-spacing: .03em; }
+    input, textarea, select, button { width: 100%; border-radius: 9px; font: inherit; }
+    input, textarea, select { border: 1px solid var(--line); background: var(--paper); color: var(--ink); padding: 10px 12px; }
+    textarea { min-height: 100px; resize: vertical; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    button { border: 0; padding: 11px 14px; background: var(--accent); color: white; font-weight: 800; cursor: pointer; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .toolbar { display: flex; gap: 8px; margin-bottom: 14px; }
+    .toolbar input { flex: 1; }
+    .toolbar button { width: auto; }
+    #entries { display: grid; gap: 12px; }
+    article { padding: 18px 20px; }
+    article h3 { margin: 0 0 3px; font: 700 1.2rem Georgia, serif; }
+    article p { margin: 12px 0; white-space: pre-wrap; }
+    .meta, .details { display: flex; flex-wrap: wrap; gap: 7px 14px; color: var(--muted); font-size: .85rem; }
+    .details span { padding: 3px 8px; background: var(--paper); border-radius: 999px; }
+    .empty, #message { color: var(--muted); }
+    #message { min-height: 1.5em; margin: 10px 0 0; font-size: .9rem; }
+    @media (max-width: 740px) { main { margin: 28px auto; } .layout { grid-template-columns: 1fr; } .panel { position: static; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Bake journal.</h1>
+      <p>A record of formulas, observations, and outcomes—ready for you or your AI agent to query later.</p>
+    </header>
+    <div class="layout">
+      <section class="panel">
+        <h2>Log a bake</h2>
+        <form id="entry-form">
+          <label>Title <input name="title" placeholder="Country sourdough #14" required></label>
+          <div class="row">
+            <label>Date <input name="date" type="date"></label>
+            <label>Rating
+              <select name="rating"><option value="">—</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option></select>
+            </label>
+          </div>
+          <div class="row">
+            <label>Hydration % <input name="hydrationPct" type="number" min="0" step="0.1" placeholder="78"></label>
+            <label>Flour <input name="flour" placeholder="80% bread, 20% rye"></label>
+          </div>
+          <label>Outcome <input name="outcome" placeholder="Open crumb, crisp crust"></label>
+          <label>Notes <textarea name="notes" placeholder="Fermentation, shaping, and tasting notes…" required></textarea></label>
+          <button type="submit">Save entry</button>
+        </form>
+        <p id="message" role="status"></p>
+      </section>
+      <section>
+        <div class="toolbar">
+          <input id="search" type="search" aria-label="Search entries" placeholder="Search title, notes, or flour">
+          <button id="search-button" type="button">Search</button>
+        </div>
+        <div id="entries"><p class="empty">Loading entries…</p></div>
+      </section>
+    </div>
+  </main>
+  <script>
+    const form = document.querySelector('#entry-form');
+    const entriesEl = document.querySelector('#entries');
+    const messageEl = document.querySelector('#message');
+    const searchEl = document.querySelector('#search');
+
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+    })[char]);
+
+    async function callApi(name, args = {}) {
+      const response = await fetch(`/api/${name}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(args)
+      });
+      const result = await response.json();
+      if (!response.ok || result.success === false) throw new Error(result.error || 'Request failed');
+      return result.data;
+    }
+
+    function render(entries) {
+      if (!entries.length) {
+        entriesEl.innerHTML = '<p class="empty">No entries yet. Log the first bake.</p>';
+        return;
+      }
+      entriesEl.innerHTML = entries.map((entry) => `
+        <article>
+          <h3>${escapeHtml(entry.title)}</h3>
+          <div class="meta"><time>${escapeHtml(entry.date)}</time><span>Logged ${escapeHtml(new Date(entry.createdAt).toLocaleString())}</span></div>
+          <p>${escapeHtml(entry.notes)}</p>
+          <div class="details">
+            ${entry.hydrationPct == null ? '' : `<span>${escapeHtml(entry.hydrationPct)}% hydration</span>`}
+            ${entry.flour ? `<span>${escapeHtml(entry.flour)}</span>` : ''}
+            ${entry.rating == null ? '' : `<span>${'★'.repeat(entry.rating)}${'☆'.repeat(5 - entry.rating)}</span>`}
+            ${entry.outcome ? `<span>${escapeHtml(entry.outcome)}</span>` : ''}
+          </div>
+        </article>`).join('');
+    }
+
+    async function loadEntries() {
+      try { render(await callApi('list_entries', { limit: 50 })); }
+      catch (error) { entriesEl.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`; }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('button');
+      const values = Object.fromEntries(new FormData(form));
+      const payload = {
+        ...values,
+        date: values.date || undefined,
+        hydrationPct: values.hydrationPct ? Number(values.hydrationPct) : undefined,
+        rating: values.rating ? Number(values.rating) : undefined
+      };
+      button.disabled = true;
+      messageEl.textContent = 'Saving…';
+      try {
+        await callApi('log_entry', payload);
+        form.reset();
+        form.elements.date.value = new Date().toLocaleDateString('en-CA');
+        messageEl.textContent = 'Entry saved.';
+        searchEl.value = '';
+        await loadEntries();
+      } catch (error) {
+        messageEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    async function search() {
+      const query = searchEl.value.trim();
+      if (!query) return loadEntries();
+      try { render(await callApi('search_entries', { query })); }
+      catch (error) { entriesEl.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`; }
+    }
+    document.querySelector('#search-button').addEventListener('click', search);
+    searchEl.addEventListener('keydown', (event) => { if (event.key === 'Enter') search(); });
+    form.elements.date.value = new Date().toLocaleDateString('en-CA');
+    loadEntries();
+  </script>
+</body>
+</html>

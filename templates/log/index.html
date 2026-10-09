@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Event Log</title>
+  <style>
+    :root { color-scheme: dark; --ink: #e8edf4; --muted: #8491a4; --bg: #0c1118; --card: #121a24; --line: #263242; --accent: #76e3b5; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    main { width: min(860px, calc(100% - 32px)); margin: 50px auto; }
+    h1 { margin: 0; font-size: clamp(2rem, 7vw, 4rem); letter-spacing: -.07em; }
+    header p { color: var(--muted); margin: 8px 0 24px; }
+    .composer, .toolbar { display: flex; gap: 9px; }
+    .composer { padding: 14px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+    input, button { border-radius: 7px; font: inherit; }
+    input { min-width: 0; padding: 10px 12px; color: var(--ink); background: #0e151e; border: 1px solid var(--line); }
+    input[name="message"] { flex: 1; }
+    input[name="tags"] { width: 220px; }
+    button { padding: 10px 14px; border: 0; background: var(--accent); color: #082217; font-weight: 900; cursor: pointer; }
+    button:disabled { opacity: .55; }
+    #message { min-height: 1.5em; color: var(--muted); margin: 8px 3px 18px; }
+    .toolbar { margin-bottom: 12px; }
+    .toolbar input { flex: 1; }
+    #events { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+    article { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 18px; padding: 15px 17px; background: var(--card); border-bottom: 1px solid var(--line); }
+    article:last-child { border-bottom: 0; }
+    time { color: var(--muted); font-size: .82rem; }
+    article p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+    .tags span { padding: 1px 6px; color: var(--accent); background: #76e3b512; border: 1px solid #76e3b538; border-radius: 999px; font-size: .75rem; }
+    .empty { padding: 28px; margin: 0; color: var(--muted); text-align: center; background: var(--card); }
+    @media (max-width: 680px) { main { margin: 28px auto; } .composer { flex-wrap: wrap; } .composer input { width: 100%; flex: auto; } .composer button { width: 100%; } article { grid-template-columns: 1fr; gap: 5px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header><h1>event.log</h1><p>Events with exact timestamps and searchable context.</p></header>
+    <form class="composer" id="event-form">
+      <input name="message" aria-label="Event message" placeholder="What happened?" required>
+      <input name="tags" aria-label="Tags" placeholder="tags, comma, separated">
+      <button type="submit">Record</button>
+    </form>
+    <p id="message" role="status"></p>
+    <div class="toolbar">
+      <input id="search" type="search" aria-label="Search events" placeholder="Find messages or tags">
+      <button id="search-button" type="button">Find</button>
+    </div>
+    <section id="events"><p class="empty">Loading events…</p></section>
+  </main>
+  <script>
+    const form = document.querySelector('#event-form');
+    const eventsEl = document.querySelector('#events');
+    const searchEl = document.querySelector('#search');
+    const messageEl = document.querySelector('#message');
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
+    })[char]);
+
+    async function callApi(name, args = {}) {
+      const response = await fetch(`/api/${name}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args)
+      });
+      const result = await response.json();
+      if (!response.ok || result.success === false) throw new Error(result.error || 'Request failed');
+      return result.data;
+    }
+
+    function render(events) {
+      if (!events.length) {
+        eventsEl.innerHTML = '<p class="empty">No matching events.</p>';
+        return;
+      }
+      eventsEl.innerHTML = events.map((event) => `
+        <article>
+          <time datetime="${escapeHtml(event.timestamp)}">${escapeHtml(new Date(event.timestamp).toLocaleString())}</time>
+          <div><p>${escapeHtml(event.message)}</p><div class="tags">${event.tags.map((tag) => `<span>#${escapeHtml(tag)}</span>`).join('')}</div></div>
+        </article>`).join('');
+    }
+
+    async function loadEvents() {
+      try { render(await callApi('tail', { limit: 50 })); }
+      catch (error) { eventsEl.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`; }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const button = form.querySelector('button');
+      const values = Object.fromEntries(new FormData(form));
+      const tags = values.tags.split(',').map((tag) => tag.trim()).filter(Boolean);
+      button.disabled = true;
+      messageEl.textContent = 'Recording…';
+      try {
+        await callApi('record', { message: values.message, tags });
+        form.reset();
+        searchEl.value = '';
+        messageEl.textContent = 'Event recorded.';
+        await loadEvents();
+      } catch (error) {
+        messageEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+
+    async function search() {
+      const query = searchEl.value.trim();
+      if (!query) return loadEvents();
+      try { render(await callApi('find', { query })); }
+      catch (error) { eventsEl.innerHTML = `<p class="empty">${escapeHtml(error.message)}</p>`; }
+    }
+    document.querySelector('#search-button').addEventListener('click', search);
+    searchEl.addEventListener('keydown', (event) => { if (event.key === 'Enter') search(); });
+    loadEvents();
+  </script>
+</body>
+</html>

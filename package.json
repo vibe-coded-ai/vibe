@@ -1,0 +1,18 @@
+{
+  "name": "vibe-coded-ai-skill",
+  "version": "4.5.6",
+  "private": true,
+  "type": "module",
+  "description": "Local dev runtime for the vibe-coded.ai CLI skill (vibe dev).",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "esbuild": "^0.23.0",
+    "miniflare": "^3.20240925.0"
+  }
+}
