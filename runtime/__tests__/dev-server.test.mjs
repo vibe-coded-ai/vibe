@@ -633,7 +633,7 @@ const CLIENT_HEADERS = {
 const DEV_CONTEXT_HEADERS = ['x-client-ip', 'x-request-id', 'x-vibe-access-mode', 'x-vibe-access-token',
   'x-vibe-env', 'x-vibe-id', 'x-vibe-slug', 'x-vibe-user-slug'];
 
-test('withDispatchHeaders forwards only the production allowlist (2r8e.84)', () => {
+test('withDispatchHeaders forwards only the production allowlist', () => {
   const headers = withDispatchHeaders(CLIENT_HEADERS, { vibeId: '1', vibeSlug: 'app', userSlug: 'alice' }, 'c'.repeat(64));
   assert.deepEqual([...headers.keys()].sort(),
     ['accept', 'stripe-signature', 'x-webhook-token', ...DEV_CONTEXT_HEADERS].sort());
@@ -910,13 +910,13 @@ test('vibe init renders a vibe-cap response through the plan gate', () => {
 });
 
 test('vibe init prints one agent instruction with every original option on a vibe cap', () => {
-  const args = ['fresh-vibe', '--template', 'tracker', '--title', 'Fresh Tracker', '--visibility', 'private', '--storage', 'kv'];
+  const args = ['fresh-vibe', '--template', 'tools', '--title', 'Fresh Tracker', '--visibility', 'private', '--storage', 'kv'];
   for (const scenario of ['vibecap', 'vibecapbyov', 'vibecappro']) {
     const result = runCli('init', args, scenario);
 
     assert.equal(result.status, 1, result.stderr);
     assert.equal((result.stderr.match(/Tell your agent:/g) || []).length, 1, result.stderr);
-    assert.match(result.stderr, /Tell your agent:.*--template tracker/);
+    assert.match(result.stderr, /Tell your agent:.*--template tools/);
     const retryCommand = result.stderr.match(/then retry (vibe init .*?)(?:\.?)"\s*$/)?.[1];
     assert.ok(retryCommand, result.stderr);
     const replay = spawnSync('bash', ['-c', `vibe() { printf '%s\\0' "$@"; }\n${retryCommand}`], { encoding: 'utf8' });
@@ -1092,7 +1092,7 @@ test('login without connections, a denied login and login --start omit the recon
   }
 });
 
-test('vibe publish leaves a failed build to the platform: relays its 409, and publishes once the source was restored (2r8e.24)', () => {
+test('vibe publish leaves a failed build to the platform: relays its 409, and publishes once the source was restored', () => {
   const failed = runCli('publish', [], 'publishfailed');
   assert.equal(failed.status, 1);
   assert.match(failed.calls, /^POST\t[^\n]*\/publish\t/m);
@@ -1345,7 +1345,7 @@ test('vibe connect fails loudly when Claude Code cannot reach the vibe', () => {
   assert.match(r.stderr, /Is the vibe published\?/);
 });
 
-test('needsViteBuild spots Vite apps that vibe dev cannot render (2r8e.9)', () => {
+test('needsViteBuild spots Vite apps that vibe dev cannot render', () => {
   const root = mkdtempSync(join(tmpdir(), 'vibe-vite-detect-'));
   try {
     const mk = (name, files) => {

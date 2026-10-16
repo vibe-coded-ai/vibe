@@ -104,12 +104,7 @@ test('VIBE_NO_UPDATE_CHECK disables the check; --version and help never check', 
 });
 
 test('installer only suggests login when signed out and PATH edits when needed', () => {
-  // install.sh sits at the skill root in the public repo and under vibes/www/public in the monorepo.
-  const installer = [
-    join(SKILL_DIR, 'install.sh'),
-    join(SKILL_DIR, '..', '..', 'vibes', 'www', 'public', 'install.sh'),
-  ].find(existsSync);
-  assert.ok(installer, 'install.sh not found next to the skill or in the monorepo');
+  const installer = join(SKILL_DIR, 'install.sh');
   for (const signedIn of [false, true, 'expired', 'malformed']) {
     for (const onPath of [false, true]) {
       const root = mkdtempSync(join(tmpdir(), 'vibe-installer-'));

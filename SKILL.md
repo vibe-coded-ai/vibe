@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.5.6
+version: 4.6.0
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -37,7 +37,7 @@ Ask (with `AskUserQuestion`) only if the request doesn't make it obvious:
 
 | If the user wants… | Path | Start with |
 |---|---|---|
-| Something their AI can **remember, look up, or update** (a tracker, log, journal, notes) | **A. Your AI's data** (default) | `vibe init --template tools <slug>` (KV, every plan) or `--template tools-sql` (SQL, needs Pro); closer starting points: `tracker`, `log`, `journal` |
+| Something their AI can **remember, look up, or update** (a tracker, log, journal, notes) | **A. Your AI's data** (default) | `vibe init --template tools <slug>` (KV, every plan) or `--template tools-sql` (SQL, needs Pro); rename the note record and its fields to fit |
 | A **page or site** with no data | **B. Site** | `vibe init --template site <slug>` |
 | A **web app with a build step** (Vue) | **B. Web app** | `vibe init <slug>`, then the files in `references/vue-template.md` |
 | To **host a project that already exists** | **C. Existing app** | `vibe init <slug>` in the project folder |

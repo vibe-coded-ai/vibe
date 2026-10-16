@@ -45,6 +45,7 @@ async function add_note(text, tag, env) {
 
 /**
  * @mcp-expose
+ * @mcp-scope read
  * @description List notes, newest first. Optionally only one tag.
  * @param {string} [tag] - Only notes with this tag
  * @param {number} [limit] - Maximum notes to return (default 100, max 500)

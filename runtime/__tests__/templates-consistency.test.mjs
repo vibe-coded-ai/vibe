@@ -29,9 +29,6 @@ async function call(worker, env, fn, args) {
 }
 
 for (const [template, write, writeArgs, read, readArgs, pick] of [
-  ['tracker', 'add_item', { name: 'Order the range hood', priority: 'high' }, 'list_items', {}, (r) => r.data.map((i) => i.name)],
-  ['journal', 'log_entry', { title: 'Sourdough', notes: 'first bake' }, 'list_entries', {}, (r) => r.data.map((e) => e.title)],
-  ['log', 'record', { message: 'deploy finished' }, 'tail', {}, (r) => r.data.map((e) => e.message)],
   ['tools', 'add_note', { text: 'Buy more flour' }, 'list_notes', {}, (r) => r.data.map((n) => n.text)],
 ]) {
   test(`${template}: ${read} includes a record written moments earlier (KV list lag)`, async () => {
@@ -51,7 +48,7 @@ for (const [template, write, writeArgs, read, readArgs, pick] of [
 
 // Only registered tools dispatch: inherited names like constructor are 404, not
 // a call into Object.
-for (const template of ['tracker', 'journal', 'log', 'tools', 'tools-sql']) {
+for (const template of ['tools', 'tools-sql']) {
   test(`${template}: /api/constructor and /api/toString are not tools`, async () => {
     const { default: worker } = await import(join(TEMPLATES, template, 'worker.js'));
     for (const name of ['constructor', 'toString', '__proto__']) {
@@ -97,9 +94,7 @@ test('tools: delete_note removes the exact verification record', async () => {
 // SKILL.md's verify step deletes the test record by id, so every template with
 // a worker needs a delete tool.
 for (const [template, write, writeArgs, read, del, prefix] of [
-  ['tracker', 'add_item', { name: 'vibe verification test' }, 'list_items', 'delete_item', 'items:'],
-  ['journal', 'log_entry', { title: 'vibe verification test', notes: '' }, 'list_entries', 'delete_entry', 'entries:'],
-  ['log', 'record', { message: 'vibe verification test' }, 'tail', 'delete_event', 'events:'],
+  ['tools', 'add_note', { text: 'vibe verification test' }, 'list_notes', 'delete_note', 'notes:'],
 ]) {
   test(`${template}: add → list → ${del} → list leaves no record (KV list lag)`, async () => {
     const { default: worker } = await import(join(TEMPLATES, template, 'worker.js'));
@@ -211,69 +206,6 @@ test('tools-sql: a read-only caller hitting a write tool does not break the owne
   assert.equal(saved.success, true, JSON.stringify(saved));
   assert.equal(db.tableExists, true);
   assert.equal(db.rows.length, 1);
-});
-
-test('tracker: only the page\'s status and priority values are accepted', async () => {
-  const { default: worker } = await import(join(TEMPLATES, 'tracker', 'worker.js'));
-  const env = { VIBE_STORAGE: laggyKv() };
-  assert.match((await call(worker, env, 'add_item', { name: 'x', status: 'closed' })).error, /status must be one of: open, in progress, blocked, done/);
-  assert.match((await call(worker, env, 'add_item', { name: 'x', priority: 'medium' })).error, /priority must be one of: low, normal, high, urgent/);
-  const item = (await call(worker, env, 'add_item', { name: 'x', status: 'in progress', priority: 'urgent' })).data;
-  assert.equal(item.status, 'in progress');
-  assert.match((await call(worker, env, 'update_status', { id: item.id, status: 'finished' })).error, /status must be one of/);
-});
-
-test('tracker: update_status replaces notes when given, keeps them when omitted, rejects non-text', async () => {
-  const { default: worker } = await import(join(TEMPLATES, 'tracker', 'worker.js'));
-  const env = { VIBE_STORAGE: laggyKv() };
-  const item = (await call(worker, env, 'add_item', { name: 'Ship the draft', notes: 'first' })).data;
-  const replaced = await call(worker, env, 'update_status', { id: item.id, status: 'blocked', notes: 'waiting on review' });
-  assert.deepEqual([replaced.data.status, replaced.data.notes], ['blocked', 'waiting on review']);
-  const kept = await call(worker, env, 'update_status', { id: item.id, status: 'done' });
-  assert.deepEqual([kept.data.status, kept.data.notes], ['done', 'waiting on review']);
-  const bad = await call(worker, env, 'update_status', { id: item.id, status: 'done', notes: 5 });
-  assert.deepEqual(bad, { success: false, error: 'notes must be text' });
-});
-
-test('journal: the date must be a real calendar day in YYYY-MM-DD', async () => {
-  const { default: worker } = await import(join(TEMPLATES, 'journal', 'worker.js'));
-  const env = { VIBE_STORAGE: laggyKv() };
-  for (const date of ['2026-02-31', '2025-02-29', '2026-13-01', '2026-09-9', '26-09-09', 'yesterday', 20260909]) {
-    const res = await call(worker, env, 'log_entry', { title: 't', notes: 'n', date });
-    assert.deepEqual(res, { success: false, error: 'date must be YYYY-MM-DD' }, String(date));
-  }
-  for (const date of ['2026-02-28', '2028-02-29', '2026-12-31']) {
-    const res = await call(worker, env, 'log_entry', { title: 't', notes: 'n', date });
-    assert.equal(res.success, true, date);
-    assert.equal(res.data.date, date);
-  }
-});
-
-test('journal: list and search sort by user date, then insertion time', async () => {
-  const { default: worker } = await import(join(TEMPLATES, 'journal', 'worker.js'));
-  const kv = laggyKv();
-  await kv.put('entries:old-backfill', JSON.stringify({
-    id: 'old-backfill', title: 'Bake old', notes: 'bread', flour: '',
-    date: '2026-09-20', createdAt: '2026-09-28T10:00:00.000Z',
-  }));
-  await kv.put('entries:newer-date-older-insert', JSON.stringify({
-    id: 'newer-date-older-insert', title: 'Bake first', notes: 'bread', flour: '',
-    date: '2026-09-27', createdAt: '2026-09-27T10:00:00.000Z',
-  }));
-  await kv.put('entries:newer-date-newer-insert', JSON.stringify({
-    id: 'newer-date-newer-insert', title: 'Bake second', notes: 'bread', flour: '',
-    date: '2026-09-27', createdAt: '2026-09-27T11:00:00.000Z',
-  }));
-  kv.sync();
-  const env = { VIBE_STORAGE: kv };
-  const listed = await call(worker, env, 'list_entries', {});
-  assert.deepEqual(listed.data.map((entry) => entry.id), [
-    'newer-date-newer-insert', 'newer-date-older-insert', 'old-backfill',
-  ]);
-  const searched = await call(worker, env, 'search_entries', { query: 'bread' });
-  assert.deepEqual(searched.data.map((entry) => entry.id), [
-    'newer-date-newer-insert', 'newer-date-older-insert', 'old-backfill',
-  ]);
 });
 
 for (const template of ['tools', 'tools-sql']) {

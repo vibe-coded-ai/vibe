@@ -24,6 +24,12 @@ async function rememberWrite(env, prefix, id) {
   await env.VIBE_STORAGE.put(key, JSON.stringify(next));
 }
 
+async function forgetWrite(env, prefix, id) {
+  const key = `recent:${prefix}`;
+  const recent = JSON.parse((await env.VIBE_STORAGE.get(key)) || '[]');
+  await env.VIBE_STORAGE.put(key, JSON.stringify(recent.filter((x) => x !== id)));
+}
+
 async function loadAll(env, prefix) {
   const ids = new Set();
   let cursor;
@@ -63,6 +69,7 @@ async function add_note(text, tag, env) {
 
 /**
  * @mcp-expose
+ * @mcp-scope read
  * @description List notes, newest first. Optionally only one tag.
  * @param {string} [tag] - Only notes with this tag
  */
@@ -101,6 +108,7 @@ async function delete_note(id, env) {
   const stored = await env.VIBE_STORAGE.get(`notes:${id}`);
   if (!stored) return { success: false, error: 'note not found' };
   await env.VIBE_STORAGE.delete(`notes:${id}`);
+  await forgetWrite(env, 'notes:', id);
   return { success: true, data: { deleted: id } };
 }
 

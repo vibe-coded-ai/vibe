@@ -1,5 +1,0 @@
-{
-  "name": "tracker",
-  "description": "A simple status tracker for prioritized items and progress notes.",
-  "storage": "kv"
-}
