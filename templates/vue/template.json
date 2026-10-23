@@ -1,0 +1,6 @@
+{
+  "name": "vue",
+  "description": "A Vue 3 + Vite web app with TypeScript and a build step, no backend.",
+  "storage": "kv",
+  "type": "static"
+}

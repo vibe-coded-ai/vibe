@@ -637,17 +637,16 @@ export function createPrefixedR2(bucket, vibeId, env) {
     },
 
     /**
-     * Mint a presigned GET URL for browser direct-download from R2.
+     * Mint a presigned GET URL for a direct download from R2.
      *
-     * Use this to serve images / files to the browser without proxying
-     * bytes through your worker — `<img src={url} />` works directly.
+     * For fetching a file outside a page (a script, another server). A page
+     * shows a stored file from `/files/<key>` on the vibe's own origin and
+     * needs no signed URL.
      *
      * @param {string} key - User-supplied key (auto-namespaced to vibes/{vibeId}/key)
      * @param {object} [opts]
-     * @param {number} [opts.ttl=3600] - Requested URL lifetime in seconds. NOTE:
-     *   the platform clamps download URLs to 120s server-side (presigned GETs are
-     *   meant for an immediate fetch, not long-lived links), so values above 120
-     *   are silently capped. The 3600 default is accepted and clamped to 120.
+     * @param {number} [opts.ttl=120] - URL lifetime in seconds (max 120).
+     *   Download URLs are meant for an immediate fetch, not long-lived links.
      * @returns {Promise<{ url: string, expiresAt: number }>}
      */
     async createDownloadUrl(key, opts) {
@@ -658,7 +657,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
         environment: environment,
         key: fullKey,
         mode: 'download',
-        ttl: options.ttl || 3600,
+        ttl: Math.min(options.ttl || 120, 120),
       });
     },
   };

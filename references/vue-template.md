@@ -1,7 +1,10 @@
 # Vue 3 + Vite template
 
-Files for a Vue vibe with a build step. The platform runs the build and
-serves `dist/`.
+Start from the bundled [`vue` template](../templates/vue/). Through the CLI,
+run `vibe init --template vue <slug>` in an empty folder. Through MCP, read
+`vibe-coded://templates/vue`, then call `create_vibe` with `template: "vue"`.
+The starter files below are included; no manual copying is needed. The platform
+runs the build and serves `dist/`.
 
 ## File Structure
 
@@ -150,7 +153,14 @@ declare module '*.vue' {
 
 ## Install, build, and preview
 
-After writing the files above, run these commands from the project root:
+Through MCP, `create_vibe` with `template: "vue"` pushes the starter files and
+waits for the preview build, reporting its outcome. Edit with `push_source`,
+which also waits for the build; check pages with `fetch_page` and any backend
+tools with `call_tool`, then publish when the user asks. The platform installs
+dependencies and runs the build.
+
+Through the CLI, after `vibe init --template vue <slug>`, run these commands
+from the project root:
 
 ```bash
 npm install

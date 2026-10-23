@@ -1,11 +1,11 @@
 # Worker template
 
-The full, tested workers ship with the CLI templates. Copy the one that fits:
+Start from the template that fits: through MCP read
+`vibe-coded://templates/<name>` and `push_source` its files; through the CLI run
+`vibe init --template <name> <slug>`.
 
-- KV (every plan): `templates/tools/worker.js` in this skill folder
-- SQL (needs Pro): `templates/tools-sql/worker.js`
-
-Or scaffold one with `vibe init --template tools <slug>` / `--template tools-sql`.
+- `tools`: KV (every plan).
+- `tools-sql`: SQL (Pro or Pro+).
 
 ## Shape
 

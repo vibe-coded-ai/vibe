@@ -1,6 +1,7 @@
 // Local mirror of src/services/mcp-extractor.ts's JSDoc-to-schema mapping.
 // This file is vendored with the skill, so it cannot import platform code.
 function mapType(jsDocType) {
+  if (/^(?:\w+\[\]|Array<\s*\w+\s*>)$/i.test(jsDocType)) return 'array';
   const nullable = jsDocType.toLowerCase().match(/^(?:\?(string|number|boolean)|(string|number|boolean)\s*\|\s*null)$/);
   if (nullable) return [nullable[1] || nullable[2], 'null'];
   const typeMap = {
@@ -9,9 +10,6 @@ function mapType(jsDocType) {
     boolean: 'boolean',
     object: 'object',
     array: 'array',
-    'string[]': 'array',
-    'number[]': 'array',
-    'object[]': 'array',
     '*': 'string',
   };
   return typeMap[jsDocType.toLowerCase()] || 'string';
@@ -61,7 +59,7 @@ export function extractToolsWithWarnings(workerSource) {
     const description = descMatch ? descMatch[1].trim() : `${name} function`;
     const properties = {};
     const required = [];
-    const paramRe = /@param\s+\{(\??\w+(?:\[\])?(?:\s*\|\s*null)?)\}\s+(\[?\w+\]?)\s*-?\s*(.*)/g;
+    const paramRe = /@param\s+\{(\??\w+(?:\[\]|<\s*\w+\s*>)?(?:\s*\|\s*null)?)\}\s+(\[?\w+\]?)\s*-?\s*(.*)/g;
     let paramMatch;
 
     while ((paramMatch = paramRe.exec(doc)) !== null) {
@@ -74,6 +72,13 @@ export function extractToolsWithWarnings(workerSource) {
         type: mapType(jsType),
         description: paramDesc.trim() || paramName,
       };
+      const arrayMatch = jsType.match(/^(?:(\w+)\[\]|Array<\s*(\w+)\s*>)$/i);
+      if (arrayMatch) {
+        const elementType = arrayMatch[1] || arrayMatch[2];
+        properties[paramName].items = /^(string|number|boolean|object)$/i.test(elementType)
+          ? { type: mapType(elementType) }
+          : {};
+      }
 
       const hasDefault = paramsString.includes(`${paramName}=`) ||
         paramsString.includes(`${paramName} =`);

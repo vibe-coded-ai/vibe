@@ -21,8 +21,8 @@
 
 import { createServer as createNetServer } from 'node:net';
 import { createServer } from 'node:http';
-import { readFileSync, existsSync, rmSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve, extname } from 'node:path';
+import { readFileSync, existsSync, rmSync, mkdirSync, copyFileSync, writeFileSync, statSync } from 'node:fs';
+import { dirname, join, resolve, extname, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -269,6 +269,58 @@ async function handleMcp(body, tools, callTool) {
   return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } };
 }
 
+// Keep these rules and glob semantics aligned with bin/vibe.
+const DEFAULT_IGNORES = [
+  '/README*', '/REPORT*', '/NOTES*', '/CHANGELOG*', '/LICENSE*', '/*.md',
+  '.git*', 'node_modules/', '.env*', '.vibe-coded.json', '.DS_Store',
+];
+
+function ignoreRegex(pattern) {
+  let regex = pattern.startsWith('/') || pattern.replace(/\/$/, '').includes('/') ? '^' : '(^|/)';
+  pattern = pattern.replace(/^\//, '');
+  const directory = pattern.endsWith('/');
+  if (directory) pattern = pattern.slice(0, -1);
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === '*') {
+      if (pattern[i + 1] === '*') {
+        if (pattern[i + 2] === '/') { regex += '(.*/)?'; i += 2; }
+        else { regex += '.*'; i++; }
+      } else regex += '[^/]*';
+    } else if (c === '?') regex += '[^/]';
+    else if (c === '[' && pattern.indexOf(']', i + 1) !== -1) {
+      const end = pattern.indexOf(']', i + 1);
+      regex += '[' + pattern.slice(i + 1, end).replace(/^!/, '^') + ']';
+      i = end;
+    } else regex += /[.\[\]+(){}^$|\\]/.test(c) ? '\\' + c : c;
+  }
+  return new RegExp(regex + (directory ? '/' : '(/|$)'), 's');
+}
+
+export function createVibeIgnore(root) {
+  let source, rules = [];
+  return (file) => {
+    const path = relative(root, resolve(root, file)).split('\\').join('/');
+    if (!path || path === '..' || path.startsWith('../')) return false;
+    // Mandatory local-only exclusions cannot be re-included.
+    if (/^(node_modules|dist|\.git|\.vibe-coded)\//.test(path)
+      || /(^|\/)(\.git|\.vibeignore|\.vibe-coded\.json|\.DS_Store|\.gitignore|\.env[^/]*|\.dev\.vars|[^/]*\.(map|sql)|\.aider[^/]*)(\/|$)/.test(path)
+      || /(^|\/)(\.claude|\.cursor|\.codex|\.agents|\.gemini|\.windsurf|\.continue|\.aider|\.vscode|\.idea|\.zed)(\/|$)/.test(path)
+      || /^(AGENTS|CLAUDE|GEMINI|MODEL|[^/]*-MODEL|OBSERVATIONS|SPEC|TODO|NOTES|README)\.md$/i.test(path)) return true;
+    const ignoreFile = join(root, '.vibeignore');
+    const content = existsSync(ignoreFile) ? readFileSync(ignoreFile, 'utf8') : null;
+    if (content !== source) {
+      rules = (content === null ? DEFAULT_IGNORES : content.split('\n').map(line => line.replace(/\r$/, '')))
+        .filter(line => line && !/^\s*$/.test(line) && !line.startsWith('#'))
+        .map(line => ({ negated: line.startsWith('!'), regex: ignoreRegex(line.replace(/^!/, '')) }));
+      source = content;
+    }
+    let ignored = false;
+    for (const rule of rules) if (rule.regex.test(path)) ignored = !rule.negated;
+    return ignored;
+  };
+}
+
 // ── Static file fallback (serves the user's frontend) ─────────────────────────
 const MIME = {
   '.html': 'text/html', '.js': 'application/javascript', '.mjs': 'application/javascript',
@@ -286,20 +338,20 @@ function sendFile(target, res) {
 // Serve an exact static file if one exists for this path. Returns true if served.
 // `/` resolves to index.html so a static frontend is authoritative for the root,
 // matching production (platform serves the frontend; the worker serves /api).
-function tryStaticFile(pathname, res) {
+function tryStaticFile(pathname, res, isIgnored) {
   const rel = pathname === '/' ? '/index.html' : pathname;
   if (!extname(rel)) return false;
   const filePath = resolve('.' + rel);
   // Prevent traversal outside the project dir.
-  if (!filePath.startsWith(resolve('.') + '/') || !existsSync(filePath)) return false;
+  if (!filePath.startsWith(resolve('.') + '/') || isIgnored(filePath) || !existsSync(filePath) || !statSync(filePath).isFile()) return false;
   sendFile(filePath, res);
   return true;
 }
 
 // SPA fallback to index.html. Returns true if served.
-function serveIndexFallback(res) {
+function serveIndexFallback(res, isIgnored) {
   const indexHtml = resolve('index.html');
-  if (!existsSync(indexHtml)) return false;
+  if (isIgnored(indexHtml) || !existsSync(indexHtml)) return false;
   sendFile(indexHtml, res);
   return true;
 }
@@ -330,6 +382,7 @@ export function needsViteBuild(dir) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const manifest = loadManifest();
+  const isIgnored = createVibeIgnore(process.cwd());
   const devDir = resolve('.vibe-coded', 'dev');
 
   if (opts.reset) {
@@ -385,7 +438,7 @@ async function main() {
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, `http://localhost:${opts.port}`);
-      const path = url.pathname;
+      const path = decodeURIComponent(url.pathname);
       if (path === '/mcp' || path === '/mcp/' || path.startsWith('/mcp/messages')) {
         const body = (await readBody(req)) || Buffer.from('');
         const rpc = await handleMcp(body, tools, async (name, args) => {
@@ -404,14 +457,19 @@ async function main() {
         return;
       }
       // Non-API: exact static file → worker (vibes that render routes) → SPA fallback.
-      if (tryStaticFile(path, res)) return;
+      if (isIgnored(resolve('.' + path))) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not found');
+        return;
+      }
+      if (tryStaticFile(path, res, isIgnored)) return;
       const body = await readBody(req);
       const wr = await dispatch(req.method, `http://localhost${req.url}`, req.headers, body);
       if (wr.status !== 404) {
         await relayWorkerResponse(wr, res);
         return;
       }
-      if (serveIndexFallback(res)) return;
+      if (serveIndexFallback(res, isIgnored)) return;
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('Not found');
     } catch (err) {
@@ -453,7 +511,11 @@ async function main() {
   const workerDir = dirname(workerFile);
   const watchPaths = workerDir === resolve('.') ? [workerFile] : [workerFile, workerDir];
   const watcher = chokidar.watch(watchPaths, {
-    ignoreInitial: true, ignored: /node_modules|\.vibe-coded/,
+    ignoreInitial: true,
+    // Directories are pruned by name so the watcher never descends into them.
+    ignored: (file, stats) => stats?.isDirectory()
+      ? /(^|\/)(node_modules|dist|\.git|\.vibe-coded)$/.test(file)
+      : stats?.isFile() === true && isIgnored(file),
   });
   let reloading = false, pending = false;
   const reload = async () => {

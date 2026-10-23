@@ -1,5 +1,14 @@
 # Platform patterns
 
+## Access and owner checks
+
+New vibes start with visibility private and interaction policy invite_only. Publishing does not change these access settings.
+On private vibes, anonymous requests receive 401 before the worker runs, including webhook and cron requests.
+Visibility (private, unlisted, public) and interaction policy (public, public_read, authenticated, invite_only) change only on the website.
+Through MCP, get_vibe returns the manageUrl to give the owner; through the CLI, vibe settings prints the page.
+Check private vibes as the owner with call_tool / fetch_page through MCP, or vibe call / vibe fetch through the CLI.
+MCP clients use worker tools for SQL and files; they do not need a CLI, a local credentials file or vibe r2.
+
 ## KV (`env.VIBE_STORAGE`, every plan)
 
 Store JSON strings under colon-separated keys (`items:<id>`). `list()` can miss
@@ -34,7 +43,7 @@ async function loadAll(env, prefix) {
 
 Need strictly consistent queries? Use SQL.
 
-## SQL (`env.VIBE_D1`, needs Pro)
+## SQL (`env.VIBE_D1`, Pro or Pro+)
 
 Preview and production have separate databases; preview starts empty.
 
@@ -62,17 +71,32 @@ try {
 
 Use `.prepare(...).run()` / `.all()`, not `.exec()`.
 
-**Running SQL by hand** (to check or fix live data): the owner can call
+Through MCP, use call_tool to exercise the worker's SQL tools as the owner.
+For a query the worker does not expose, add an @mcp-expose tool, push_source
+(it waits for the build), then call_tool (preview by default; production: true
+uses the published build).
+
+### CLI only: direct SQL
+
+For terminal users with local CLI login credentials (to check or fix live data), the owner can call
 `POST https://api.vibe-coded.ai/api/v1/vibes/<user>/<slug>/d1` with the CLI's
-login token. It works on the production database, not preview.
+login token (deploy scope is accepted). Use the API URL stored with that token.
+It works on the production database, not preview.
 
 ```bash
 # The token goes in through stdin (curl -K -), so it never shows up in `ps`.
-printf 'header = "Authorization: Bearer %s"\n' "$(jq -r .token ~/.vibe-coded/credentials.json)" |
-  curl -s -K - -X POST https://api.vibe-coded.ai/api/v1/vibes/<user>/<slug>/d1 \
+credentials="$HOME/.vibe-coded/credentials.json"
+api_url=$(jq -er '.apiUrl | strings | select(length > 0)' "$credentials") || exit 1
+user_slug=$(jq -er '.userSlug | strings | select(length > 0)' "$credentials") || exit 1
+vibe_slug="your-vibe-slug" # Replace with your vibe's slug.
+jq -er '.token | strings | select(length > 0) | "header = \"Authorization: Bearer \(.)\""' "$credentials" |
+  curl -sS -K - -X POST "${api_url}/api/v1/vibes/${user_slug}/${vibe_slug}/d1" \
     -H 'Content-Type: application/json' \
     -d '{"action":"query","sql":"SELECT * FROM items WHERE name = ?","params":["a"]}'
 ```
+
+If it returns `Authentication required`, run `vibe login` (CLI only), then rerun the recipe
+with the refreshed credentials. Never paste the token into output.
 
 `action` is `tables`, `query` (SELECT), `execute` (INSERT/UPDATE/DELETE),
 `schema` or `usage`. One statement per request, values as `?` with `params`,
@@ -80,30 +104,68 @@ no subqueries or `WITH`. Vibes on the older shared database name tables
 `vibe_<id>_<table>` in raw SQL (`id` from `GET /api/v1/vibes/<user>/<slug>`);
 `tables` lists the short names.
 
-## Files (`env.VIBE_R2`, needs Pro)
+## Files (`env.VIBE_R2`, Pro or Pro+)
+
+Static/source uploads accept only web asset extensions (html, htm, css, js, mjs, ts/tsx/jsx, vue, svelte, json/xml/yaml/yml/toml/csv/tsv, images, fonts, md/txt/pdf, gitignore/npmrc/nvmrc, lock/map) and named extensionless project files; any other file type goes to R2 and is served from `/files/<key>`.
 
 In the worker:
 
 ```javascript
 await env.VIBE_R2.put('uploads/logo.png', bytes, { httpMetadata: { contentType: 'image/png' } });
 const obj = await env.VIBE_R2.get('uploads/logo.png');
+const metadata = await env.VIBE_R2.head('uploads/logo.png');
 const { objects } = await env.VIBE_R2.list({ prefix: 'uploads/' });
 await env.VIBE_R2.delete('uploads/logo.png');
 ```
 
-Large browser uploads go straight to R2 with a signed URL the worker mints:
+**Serving:** every stored object is reachable at `/files/<key>` on the vibe's
+own origin, under the vibe's visibility and interaction settings, so an
+`<img src="/files/uploads/logo.png">` or `<video src="/files/clips/intro.mp4">`
+just works and the browser can seek (range requests) and cache. Images, audio,
+video, PDFs, plain text and fonts display inline; anything else is a download
+(HTML, SVG and XML as plain text). Preview and production have separate files.
+`/files/` is reserved: a `files/` folder in the project is shadowed. Each read
+counts as a request against the vibe's daily and monthly limits.
+
+**Uploading from the browser:** large uploads go straight to R2 with a signed
+URL the worker mints:
 
 ```javascript
 // Worker tool
 async function upload_url(key, contentType, contentLength, env) {
   return { success: true, data: await env.VIBE_R2.createUploadUrl(key, { contentType, contentLength, ttl: 300 }) };
 }
-// Frontend: get the URL, then PUT the file to it
+// Frontend: get the URL, PUT the file to it, then show it from /files/<key>
 ```
 
-`contentLength` (the exact byte size) is required. Download URLs
-(`createDownloadUrl(key)`) last at most 120 seconds: mint one per request and
-never store or share it. From a terminal, use `vibe r2 upload|download|ls|rm|url`.
+`createUploadUrl` returns `{ url, expiresAt }`. `contentLength` (the exact byte
+size) is required: the signed PUT pins the byte size, not the Content-Type. A
+client can store any type under the key, so a worker that cares checks the first
+bytes; `/files/<key>` serves scriptable types as plain text regardless. The worker
+decides who may upload and to which key.
+A 403 SignatureDoesNotMatch on the PUT means the bytes sent differ from contentLength.
+The browser's PUT to the signed URL is CORS-allowed from the vibe's own origin (preflight answers 204); no CORS setup is needed.
+
+**Downloading outside the page** (a script, another server): the worker
+mints `createDownloadUrl(key)`; the URL lasts at most 120 seconds in local dev
+and production, so mint one per request and never store or share it. A page
+does not need this: use `/files/<key>`.
+
+Through MCP, expose file operations as worker tools and
+invoke them with call_tool. For an operation the worker does not expose, add an
+@mcp-expose tool, push_source (it waits for the build), then call_tool.
+
+### CLI only: file commands
+
+From a terminal with the CLI installed and signed in, use `vibe r2 upload|download|ls|rm|url` (MCP: expose a worker tool and invoke it with call_tool).
+These default to production's files; add `--preview` for the preview tree.
+The preview host serves the preview tree and the production host the production tree; upload to both when a page needs the file in both.
+`vibe r2 usage` (MCP: usage) reports storage usage shared across both trees.
+
+**Check a private vibe with curl:** the token in `~/.vibe-coded/credentials.json`
+works on the vibe host as `Authorization: Bearer <token>`, the same as the API.
+POST to `/api/<tool>` works the same way. `vibe fetch --headers /files/<key>` (MCP: fetch_page returns headers)
+shows how a file is served.
 
 ## MCP tool annotations
 
@@ -118,20 +180,23 @@ never store or share it. From a terminal, use `vibe r2 upload|download|ls|rm|url
 async function create_bookmark(url, title, rating, env) { /* ... */ }
 ```
 
-- `@mcp-expose` alone makes the function a tool; `vibe status` shows the count.
+- `@mcp-expose` alone makes the function a tool; get_vibe through MCP or
+  `vibe status` through the CLI shows the count. Put `env` last in its parameters.
 - `[name]` marks an optional parameter; types are `string`, `number`, `boolean`,
   `object`, `array`.
 - The platform decides who can write; annotations don't control access.
 
 ## Endpoints for machines (webhooks, cron)
 
-For people, rely on the vibe's visibility, interaction and invites. For a system
-that can't sign in, gate one endpoint with a token stored as a secret, sent in an
+For people, rely on the vibe's visibility, interaction and invites.
+For anonymous webhooks or cron, the owner must choose public or unlisted visibility and public interaction on the website, then protect the endpoint with a dedicated secret.
+A worker token cannot bypass the platform's access gate. Gate the endpoint with
+the token stored as a secret, sent in an
 `X-Webhook-Token` header. Authorization and Cookie never reach your worker;
-provider signature headers (Stripe, GitHub, Svix…) and any `X-Webhook-*` header do.
+provider signature headers (Stripe, Svix…) and any `X-Webhook-*` header do.
 
 ```javascript
-// vibe secrets create SYNC_TOKEN
+// Create SYNC_TOKEN with set_secret through MCP or vibe secrets create through the CLI.
 function _checkToken(request, env) {
   const expected = env.SYNC_TOKEN;
   if (!expected) return false;                 // fail closed if unset

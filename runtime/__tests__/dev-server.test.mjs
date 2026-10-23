@@ -362,12 +362,25 @@ function setupDevRuntime() {
     export async function build({ entryPoints, outfile }) { copyFileSync(entryPoints[0], outfile); }
   `);
   writeFileSync(join(skillDir, 'node_modules', 'chokidar', 'index.js'), `
-    export default { watch() { return { on() { return this; }, async close() {} }; } };
+    import assert from 'node:assert/strict';
+    import { statSync, writeFileSync, unlinkSync } from 'node:fs';
+    import { resolve } from 'node:path';
+    export default { watch(paths, options) {
+      const worker = resolve('worker.js');
+      const stats = statSync(worker);
+      assert.equal(options.ignored(worker, stats), false);
+      writeFileSync('.vibeignore', 'worker.js\\n');
+      assert.equal(options.ignored(worker, stats), true);
+      writeFileSync('.vibeignore', '*.js\\n!worker.js\\n');
+      assert.equal(options.ignored(worker, stats), false);
+      unlinkSync('.vibeignore');
+      return { on() { return this; }, async close() {} };
+    } };
   `);
   return { root, runtimeDir, project, devDir, staleFile };
 }
 
-test('vibe dev --reset wipes local state and continues to start the server', async (t) => {
+test('vibe dev --reset starts the server and honours ignore rules for serving and watching', async (t) => {
   const { root, runtimeDir, project, devDir, staleFile } = setupDevRuntime();
   let port;
   try {
@@ -407,6 +420,22 @@ test('vibe dev --reset wipes local state and continues to start the server', asy
       reject(new Error(`server exited before startup (${code ?? signal})\nstdout:\n${stdout}\nstderr:\n${stderr}`));
     });
   });
+
+  writeFileSync(join(project, 'REPORT.md'), 'private report');
+  writeFileSync(join(project, 'keep.md'), 'published markdown');
+  mkdirSync(join(project, 'docs'));
+  writeFileSync(join(project, 'docs', 'private.txt'), 'private docs');
+  const local = `http://127.0.0.1:${port}`;
+  assert.equal((await fetch(local + '/REPORT.md')).status, 404);
+  assert.equal(await (await fetch(local + '/docs/private.txt')).text(), 'private docs');
+  writeFileSync(join(project, '.vibeignore'), 'docs/\n*.md\n!keep.md\n');
+  assert.equal((await fetch(local + '/docs/private.txt')).status, 404);
+  assert.equal((await fetch(local + '/%64ocs/private.txt')).status, 404);
+  assert.equal(await (await fetch(local + '/keep.md')).text(), 'published markdown');
+  writeFileSync(join(project, '.vibeignore'), 'index.html\n');
+  writeFileSync(join(project, 'index.html'), 'private index');
+  assert.equal((await fetch(local + '/')).status, 404);
+  assert.equal((await fetch(local + '/missing')).status, 404);
 
   assert.equal(existsSync(staleFile), false);
   assert.equal(existsSync(join(devDir, 'worker.js')), true);
@@ -782,7 +811,7 @@ test('vibe preview excludes root agent notes but uploads build inputs and nested
   assert.match(result.calls, /"package\.json":/);
   assert.match(result.calls, /"tsconfig\.json":/);
   assert.match(result.calls, /"content\/posts\/MODEL\.md":/);
-  assert.match(result.calls, /"guide\.md":/);
+  assert.doesNotMatch(result.calls, /"guide\.md":/);
 });
 
 // The readable list leaves out what the platform never serves
