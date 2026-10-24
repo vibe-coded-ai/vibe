@@ -38,9 +38,6 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     apiUrl: 'https://stub.invalid',
     expiresAt: '2999-01-01T00:00:00Z',
   }));
-  if (scenario !== 'nomanifest') {
-    writeFileSync(join(project, '.vibe-coded.json'), JSON.stringify({ vibeSlug: 'demo' }));
-  }
   if (command !== 'init' || !args.includes('--template')) {
     writeFileSync(join(project, 'index.html'), '<h1>demo</h1>');
   }
@@ -113,6 +110,12 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     : scenario === 'over20'
       ? ['index.html', ...extraLocalPaths, ...Array.from({ length: 21 }, (_, i) => `stale-${i}.html`)]
       : ['index.html', 'stale.html'];
+  if (command !== 'init' && scenario !== 'nomanifest') {
+    writeFileSync(join(project, '.vibe-coded.json'), JSON.stringify({
+      vibeSlug: 'demo',
+      ...(['uploaded', 'guard', 'over20'].includes(scenario) ? { uploadedPaths: remotePaths } : {}),
+    }));
+  }
   const listResponse = JSON.stringify({
     success: true,
     files: remotePaths.map(path => ({ path })),
@@ -146,6 +149,8 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     'if [ "$VIBE_TEST_SCENARIO" = netdown ]; then exit 7; fi',
     'if [ "$VIBE_TEST_SCENARIO" = auth401 ]; then',
     '  emit \'{"success":false,"error":"Authentication required"}\' 401',
+    'elif [[ "$method" = GET && "$url" == */api/v1/templates/tools ]]; then',
+    '  emit \'{"name":"tools","storage":"kv","type":"fullstack","files":[{"path":"worker.js","content":"export default {};\\n"}]}\' 200',
     'elif [[ "$method" = POST && "$url" == */auth/cli/start ]]; then',
     '  emit \'{"success":true,"deviceCode":"synthetic-device-code","verificationUriComplete":"https://stub.invalid/approve","userCode":"TEST","interval":1,"expiresIn":600}\' 200',
     'elif [[ "$method" = POST && "$url" == */auth/cli/poll ]]; then',
@@ -174,11 +179,11 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     '  fi',
     'elif [[ "$method" = POST && "$url" == */api/v1/vibes ]]; then',
     '  if [ "$VIBE_TEST_SCENARIO" = vibecappro ]; then',
-    '    emit \'{"success":false,"error":"Vibe limit reached (25/25). Delete a vibe you no longer need: https://vibe-coded.ai/account.","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":25,"used":25,"plan":"pro","upgradeUrl":"/billing"}\' 403',
+    '    emit \'{"success":false,"error":"Vibe limit reached (25/25). Pro+ is the highest plan; free up room to continue. Delete a vibe you no longer need: https://vibe-coded.ai/account. Tell your agent: \\"delete an unused vibe, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":25,"used":25,"plan":"pro","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
     '  elif [ "$VIBE_TEST_SCENARIO" = vibecapbyov ]; then',
-    '    emit \'{"success":false,"error":"Vibe limit reached (10/10).","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":10,"used":10,"plan":"byov","upgradeUrl":"/billing"}\' 403',
+    '    emit \'{"success":false,"error":"Vibe limit reached (10/10). Pro+ ($20/mo) supports up to 25 vibes. Upgrade at https://vibe-coded.ai/billing. Tell your agent: \\"upgrade my vibe-coded.ai plan or delete an unused vibe, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":10,"used":10,"plan":"byov","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
     '  elif [ "$VIBE_TEST_SCENARIO" = vibecap ]; then',
-    '    emit \'{"success":false,"error":"Vibe limit reached (5/5). Pro ($9/mo) supports up to 10 vibes; Pro+ ($20/mo) supports up to 25 vibes. Or delete a vibe you no longer need: https://vibe-coded.ai/account. Tell your agent: \\"upgrade my vibe-coded.ai plan or delete an unused vibe, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":5,"used":5,"plan":"free","upgradeUrl":"/billing"}\' 403',
+    '    emit \'{"success":false,"error":"Vibe limit reached (5/5). Pro ($9/mo) supports up to 10 vibes; Pro+ ($20/mo) supports up to 25 vibes. Upgrade at https://vibe-coded.ai/billing. Or delete a vibe you no longer need: https://vibe-coded.ai/account. Tell your agent: \\"upgrade my vibe-coded.ai plan or delete an unused vibe, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":5,"used":5,"plan":"free","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
     '  else',
     '    printf \'%s\\n\' \'{"success":true,"vibe":{"id":1}}\'',
     '  fi',
@@ -340,7 +345,7 @@ function setupDevRuntime() {
   }));
   writeFileSync(join(project, 'worker.js'), 'export default { fetch() { return new Response("ok"); } };');
 
-  for (const file of ['dev-server.mjs', 'mcp-tools.mjs', 'sql-statements.mjs', 'platform-shim.js', 'dispatch-header-policy.mjs']) {
+  for (const file of ['dev-server.mjs', 'mcp-tools.mjs', 'sql-statements.mjs', 'platform-shim.js', 'dispatch-header-policy.mjs', 'static-content-types.mjs']) {
     copyFileSync(join(RUNTIME_DIR, file), join(runtimeDir, file));
   }
   // esbuild stub: without bun on PATH the dev server bundles via esbuild; the stub
@@ -352,7 +357,32 @@ function setupDevRuntime() {
   }
   writeFileSync(join(skillDir, 'node_modules', 'miniflare', 'index.js'), `
     export class Miniflare {
-      async dispatchFetch() { return new Response('not found', { status: 404 }); }
+      async dispatchFetch(url) {
+        return new URL(url).pathname.startsWith('/files')
+          ? new Response('worker files route') : new Response('not found', { status: 404 });
+      }
+      async getR2Bucket(name) {
+        if (name !== 'VIBE_R2') throw new Error('Wrong bucket');
+        const objects = {
+          'vibes/1/uploads/logo.png': { body: 'image bytes', type: 'image/png' },
+          'vibes/1/page.html': { body: '<script>alert(1)</script>' },
+          'vibes/1/drawing.svg': { body: '<svg/>', type: 'image/svg+xml; charset=utf-8' },
+          'vibes/1/data.xml': { body: '<data/>', type: 'application/custom+xml' },
+          'vibes/1/archive.zip': { body: 'archive bytes', type: 'application/zip' },
+          'vibes/1/song.mp3': { body: 'audio bytes', type: 'audio/mpeg' },
+          'vibes/1/movie.mp4': { body: 'video bytes', type: 'video/mp4' },
+          'vibes/1/document.pdf': { body: 'pdf bytes', type: 'application/pdf' },
+          'vibes/1/note.txt': { body: 'plain bytes', type: 'TEXT/PLAIN; charset=utf-8' },
+          'vibes/1/font.woff2': { body: 'font bytes', type: 'font/woff2' },
+        };
+        const get = async key => {
+          const item = objects[key];
+          return item ? { size: Buffer.byteLength(item.body), httpEtag: '\"local-etag\"',
+            httpMetadata: { contentType: item.type },
+            async arrayBuffer() { return Buffer.from(item.body); } } : null;
+        };
+        return { get, head: get };
+      }
       async dispose() {}
       async setOptions() {}
     }
@@ -436,6 +466,55 @@ test('vibe dev --reset starts the server and honours ignore rules for serving an
   writeFileSync(join(project, 'index.html'), 'private index');
   assert.equal((await fetch(local + '/')).status, 404);
   assert.equal((await fetch(local + '/missing')).status, 404);
+
+  mkdirSync(join(project, 'files', 'uploads'), { recursive: true });
+  writeFileSync(join(project, 'files', 'uploads', 'logo.png'), 'static shadow');
+  writeFileSync(join(project, 'index.html'), 'SPA fallback');
+  writeFileSync(join(project, '.vibeignore'), 'files/\n');
+  await t.test('/files serves local R2 before static, worker and SPA routes', async () => {
+    const image = await fetch(local + '/files/uploads/logo.png');
+    assert.equal(image.status, 200);
+    assert.equal(image.headers.get('content-type'), 'image/png');
+    assert.equal(image.headers.get('content-disposition'), null);
+    assert.equal(image.headers.get('content-security-policy'), 'sandbox');
+    assert.equal(await image.text(), 'image bytes');
+    for (const key of ['song.mp3', 'movie.mp4', 'document.pdf', 'note.txt', 'font.woff2']) {
+      const response = await fetch(local + '/files/' + key);
+      assert.equal(response.status, 200, key);
+      assert.equal(response.headers.get('content-disposition'), null, key);
+      await response.text();
+    }
+  });
+  await t.test('/files serves HTML, SVG and XML as plain text attachments', async () => {
+    for (const key of ['page.html', 'drawing.svg', 'data.xml']) {
+      const response = await fetch(local + '/files/' + key);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('content-type'), 'text/plain');
+      assert.equal(response.headers.get('content-disposition'), `attachment; filename="${key}"`);
+      assert.equal(response.headers.get('content-security-policy'), 'sandbox');
+      assert.ok((await response.text()).startsWith('<'));
+    }
+    const archive = await fetch(local + '/files/archive.zip');
+    assert.equal(archive.headers.get('content-disposition'), 'attachment');
+    assert.equal(archive.headers.get('content-type'), 'application/zip');
+    await archive.text();
+  });
+  await t.test('/files returns the production missing-key response without a fallback', async () => {
+    for (const key of ['/files', '/files/', '/files/missing.png', '/files/%252e%252e%252fpage.html', '/files/bad%5ckey']) {
+      const response = await fetch(local + key);
+      assert.equal(response.status, 404, key);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      assert.deepEqual(await response.json(), { success: false, error: 'File not found' });
+    }
+    const head = await fetch(local + '/files/page.html', { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get('content-type'), 'text/plain');
+    assert.equal(await head.text(), '');
+    const post = await fetch(local + '/files/page.html', { method: 'POST' });
+    assert.equal(post.status, 405);
+    assert.equal(post.headers.get('allow'), 'GET, HEAD');
+    await post.text();
+  });
 
   assert.equal(existsSync(staleFile), false);
   assert.equal(existsSync(join(devDir, 'worker.js')), true);
@@ -741,8 +820,18 @@ test('vendored dispatch-header-policy.mjs is byte-identical to the platform copy
     'skills/vibe-coded-ai/runtime/dispatch-header-policy.mjs drifted from src/services/; cp the platform copy over it');
 });
 
+test('local R2 fallback content types match production', async () => {
+  const { getContentType } = await import('../static-content-types.mjs');
+  const canonical = resolve(RUNTIME_DIR, '../../../src/utils/static-content-types.ts');
+  if (!existsSync(canonical)) return;
+  const entries = [...readFileSync(canonical, 'utf8').matchAll(/'([^']+)': '([^']+)'/g)];
+  for (const [, extension, contentType] of entries) {
+    assert.equal(getContentType(`file.${extension}`), contentType);
+  }
+});
+
 test('vibe preview prunes remote files absent from the upload manifest', () => {
-  const result = runPreview();
+  const result = runPreview([], 'uploaded');
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Removed remote file: stale\.html/);
@@ -750,6 +839,16 @@ test('vibe preview prunes remote files absent from the upload manifest', () => {
   assert.doesNotMatch(result.calls, /^DELETE\t[^\n]*\/source\t/m);
   assert.equal((result.calls.match(/^POST\t[^\n]*\/source\t/gm) || []).length, 1);
   assert.doesNotMatch(result.calls, /state\.json/);
+});
+
+test('vibe preview without upload history keeps remote files missing locally', () => {
+  const result = runPreview();
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /No upload history in this manifest/);
+  assert.match(result.stdout, /Kept 1 remote file\(s\).*stale\.html/);
+  assert.match(result.calls, /POST\t[^\n]*\/source\t.*"deletePaths":\[\]/);
+  assert.doesNotMatch(result.stdout, /Removed remote file:/);
 });
 
 test('vibe preview never uploads a .git file (worktree / submodule)', () => {
@@ -764,7 +863,7 @@ test('vibe preview excludes .gitignore and lists every uploaded filename for a s
   const result = runPreview([], 'uploadnames');
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.calls, /"(?:assets\/)?\.gitignore":/);
-  assert.match(result.stdout, /Uploaded 3 files\. With no build step/);
+  assert.match(result.stdout, /Uploaded 3 files \(3 publicly readable at their paths\)\. With no build step/);
   for (const path of ['index.html', 'assets/style.css', 'file with spaces.txt']) {
     assert.ok(result.stdout.includes(`  ${path}\n`), result.stdout);
   }
@@ -829,11 +928,11 @@ test('vibe preview does not list never-served files as readable', () => {
   assert.ok(listed.includes('sub/package.json'), result.stdout);
 });
 
-test('vibe preview without dist/ says every uploaded file is publicly readable', () => {
+test('vibe preview without a build step describes which uploaded paths can be served', () => {
   const result = runPreview([], 'uploadnames');
 
   assert.equal(result.status, 0, result.stderr);
-  assert.ok(result.stdout.includes('Uploaded 3 files. With no build step, the files below are publicly readable at their paths (any the worker imports are bundled and not served):\n'), result.stdout);
+  assert.ok(result.stdout.includes('Uploaded 3 files (3 publicly readable at their paths). With no build step, the paths below can be served (any the worker imports are bundled and not served):\n'), result.stdout);
   assert.doesNotMatch(result.stdout, /only dist\/ is served/);
   assert.equal(result.stderr.includes('Warning'), false, result.stderr);
 });
@@ -847,7 +946,7 @@ test('vibe preview describes file access using the vibe visibility and reuses th
       const access = visibility === 'private'
         ? 'readable at their paths by anyone who can open this vibe'
         : 'publicly readable at their paths';
-      assert.ok(result.stdout.includes(`the files below are ${access} (any the worker imports are bundled and not served):`), result.stdout);
+      assert.ok(result.stdout.includes(`Uploaded 3 files (3 ${access}). With no build step, the paths below can be served`), result.stdout);
       if (visibility === 'private') assert.doesNotMatch(result.stdout, /publicly readable/);
       assert.equal((result.calls.match(/^GET\thttps:\/\/stub\.invalid\/api\/v1\/vibes\/tester\/demo\t/gm) || []).length, 1);
     }
@@ -871,7 +970,7 @@ test('vibe preview with a build step says only the built dist/ is served and nev
   const result = runPreview([], 'withdist');
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /the platform runs your build and serves only its dist\/ output/);
+  assert.match(result.stdout, /The platform runs your build and serves only its dist\/ output/);
   assert.doesNotMatch(result.stdout, /With no build step/);
   assert.doesNotMatch(result.calls, /"dist\//);
 });
@@ -959,13 +1058,13 @@ test('vibe-cap guidance only names plans that raise the limit', () => {
   assert.equal(pro.status, 1);
   assert.doesNotMatch(pro.stderr, /Pro \(\$9|upgrade/i);
   assert.match(pro.stderr, /Pro\+ is the highest plan/);
-  assert.match(pro.stderr, /Tell your agent:.*free up room/);
+  assert.match(pro.stderr, /Tell your agent:.*delete an unused vibe/);
 
   const byov = runCli('init', ['fresh-vibe'], 'vibecapbyov');
   assert.equal(byov.status, 1);
   assert.doesNotMatch(byov.stderr, /Pro \(\$9/);
-  assert.match(byov.stderr, /billing\?plan=pro/);
-  assert.match(byov.stderr, /upgrade my vibe-coded.ai plan to Pro\+/);
+  assert.match(byov.stderr, /https:\/\/vibe-coded\.ai\/billing/);
+  assert.match(byov.stderr, /Pro\+ \(\$20\/mo\)/);
 });
 
 test('vibe init rejects platform-invalid slugs before making an API call', () => {
@@ -1016,7 +1115,8 @@ test('vibe call --preview targets the preview host; tool errors and unknown tool
   assert.match(runCli('call', ['list_notes', '--preview']).calls, /https:\/\/p--tester--demo\.vibe-coded\.ai\/mcp/);
   const failing = runCli('call', ['failing_tool']);
   assert.equal(failing.status, 1);
-  assert.match(failing.stdout, /bad input/);
+  assert.match(failing.stderr, /bad input/);
+  assert.equal(failing.stdout, '');
   const unknown = runCli('call', ['no_such_tool']);
   assert.equal(unknown.status, 1);
   assert.match(unknown.stderr, /Tool not found/);
@@ -1219,17 +1319,15 @@ test('ipv6PortTaken detects another program on the same port over IPv6 (localhos
   assert.equal(await ipv6PortTaken(port), false);
 });
 
-test('vibe call on a vibe that was never published says so and how to fix it', () => {
-  const prod = runCli('call', ['unbuilt_tool']);
-  assert.equal(prod.status, 1);
-  assert.match(prod.stderr, /Not published yet — run: vibe preview, then vibe publish/);
-  const prev = runCli('call', ['unbuilt_tool', '--preview']);
-  assert.match(prev.stderr, /No preview build yet — run: vibe preview/);
-  // The platform's real shape: JSON-RPC error object.
-  const rpc = runCli('call', ['unbuilt_rpc']);
-  assert.equal(rpc.status, 1);
-  assert.match(rpc.stderr, /Error: Vibe not found/);
-  assert.match(rpc.stderr, /Not published yet/);
+test('vibe call identifies the target and relays missing-vibe errors', () => {
+  for (const tool of ['unbuilt_tool', 'unbuilt_rpc']) {
+    for (const preview of [false, true]) {
+      const result = runCli('call', [tool, ...(preview ? ['--preview'] : [])]);
+      assert.equal(result.status, 1);
+      assert.equal(result.stderr, `→ tester/demo (${preview ? 'preview' : 'production'})\nError: Vibe not found\n`);
+      assert.equal(result.stdout, '');
+    }
+  }
 });
 
 test('vibe fetch reads a private deployed path with the owner token transport', () => {
@@ -1302,7 +1400,7 @@ test('vibe connect --print preserves an existing Claude Code token and records t
   assert.equal(r.status, 0, r.stderr);
   assert.doesNotMatch(r.calls, /^DELETE\t|^claude\t/m);
   assert.match(r.stdout, /claude mcp add --transport http -s user new-name /);
-  assert.ok(r.stdout.includes("Your existing Claude Code connection 'demo' keeps working with its current token; run the command above to switch it, then `vibe connect --revoke` removes the old one."));
+  assert.ok(r.stdout.includes("Your existing Claude Code connection 'demo' keeps working with its current token. 'vibe connect --revoke' revokes both tokens."));
   assert.deepEqual(r.connections['tester--demo'], {
     jti: 'old-jti', expiresAt: '2026-10-01T00:00:00.000Z', name: 'demo', additionalJtis: ['new-jti'],
   });
@@ -1493,7 +1591,8 @@ test('an expired login during upload is not reported as a network failure', () =
 test('the preview file list leaves out the root worker, which is never served', () => {
   const result = runPreview([], 'withworker');
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /the files below are/);
+  assert.match(result.stdout, /Uploaded 2 files \(1 publicly readable at their paths\)/);
+  assert.match(result.stdout, /^ {2}index\.html$/m);
   assert.doesNotMatch(result.stdout, /^ {2}worker\.js$/m);
   assert.match(result.calls, /"worker\.js":/);
 });

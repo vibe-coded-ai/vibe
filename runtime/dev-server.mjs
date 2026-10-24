@@ -29,6 +29,8 @@ import { randomBytes } from 'node:crypto';
 import { splitSqlStatements } from './sql-statements.mjs';
 import { isForwardableHeader } from './dispatch-header-policy.mjs';
 import { extractToolsWithWarnings } from './mcp-tools.mjs';
+import { _r2GetKey } from './platform-shim.js';
+import { getContentType } from './static-content-types.mjs';
 
 export { extractTools, extractToolsWithWarnings } from './mcp-tools.mjs';
 
@@ -335,6 +337,54 @@ function sendFile(target, res) {
   res.end(buf);
 }
 
+// Mirror src/services/r2-files.ts: stored files are inert on the vibe's origin.
+async function serveR2File(req, pathname, res, mf, manifest) {
+  const refuse = (status, error, headers = {}) => {
+    res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...headers });
+    res.end(JSON.stringify({ success: false, error }));
+  };
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    refuse(405, 'Method not allowed', { Allow: 'GET, HEAD' });
+    return;
+  }
+  const key = pathname.slice('/files/'.length);
+  let fullKey;
+  try {
+    if (!key || !/^[1-9]\d*$/.test(manifest.vibeId)) throw new Error('Invalid key');
+    // The local shim has no VIBE_ENV binding, so its R2 writes use vibes/<id>/.
+    fullKey = _r2GetKey(`vibes/${manifest.vibeId}/`, key);
+  } catch {
+    refuse(404, 'File not found');
+    return;
+  }
+  const bucket = await mf.getR2Bucket('VIBE_R2');
+  const object = req.method === 'HEAD' ? await bucket.head(fullKey) : await bucket.get(fullKey);
+  if (!object) {
+    refuse(404, 'File not found');
+    return;
+  }
+  const contentType = object.httpMetadata?.contentType || getContentType(pathname);
+  const type = contentType.split(';')[0].trim().toLowerCase();
+  const headers = {
+    'Content-Type': contentType,
+    'Content-Security-Policy': 'sandbox',
+    'Content-Length': String(object.size),
+    'ETag': object.httpEtag,
+    'Cache-Control': 'no-store',
+  };
+  if (object.httpMetadata?.contentEncoding) headers['Content-Encoding'] = object.httpMetadata.contentEncoding;
+  if (!/^(image\/(?!svg)|video\/|audio\/|font\/|application\/pdf$|text\/plain$)/.test(type)) {
+    headers['Content-Disposition'] = 'attachment';
+    if (['text/html', 'image/svg+xml', 'application/xhtml+xml', 'text/xml', 'application/xml', 'text/xsl'].includes(type) || type.endsWith('+xml')) {
+      headers['Content-Type'] = 'text/plain';
+      const filename = (pathname.split('/').pop() || 'download').replace(/["\\\r\n]/g, '_');
+      headers['Content-Disposition'] = `attachment; filename="${filename}"`;
+    }
+  }
+  res.writeHead(200, headers);
+  res.end(req.method === 'HEAD' ? undefined : Buffer.from(await object.arrayBuffer()));
+}
+
 // Serve an exact static file if one exists for this path. Returns true if served.
 // `/` resolves to index.html so a static frontend is authoritative for the root,
 // matching production (platform serves the frontend; the worker serves /api).
@@ -434,10 +484,14 @@ async function main() {
     return;
   }
 
-  // Single local origin: /api + /mcp → worker, everything else → static frontend.
+  // Single local origin: /files → local R2, /api + /mcp → worker, then frontend.
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, `http://localhost:${opts.port}`);
+      if (url.pathname === '/files' || url.pathname.startsWith('/files/')) {
+        await serveR2File(req, url.pathname, res, mf, manifest);
+        return;
+      }
       const path = decodeURIComponent(url.pathname);
       if (path === '/mcp' || path === '/mcp/' || path.startsWith('/mcp/messages')) {
         const body = (await readBody(req)) || Buffer.from('');

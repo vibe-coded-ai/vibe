@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.6.0
+version: 4.7.0
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -42,7 +42,9 @@ Ask (with `AskUserQuestion`) only if the request doesn't make it obvious:
 | A **web app with a build step** (Vue) | **B. Web app** | `vibe init --template vue <slug>` |
 | To **host a project that already exists** | **C. Existing app** | `vibe init <slug>` in the project folder |
 
-`vibe templates` lists every template; prefer one over hand-written files.
+`vibe templates` lists every template from the platform; `vibe init --template <name>`
+downloads its files. These commands need a network connection. Prefer a template
+over hand-written files.
 `vibe status --plan` shows the plan (SQL, R2 and secrets need Pro).
 
 ## 2. Path A — your AI's data
@@ -192,7 +194,7 @@ for Google and GitHub accounts too. A person at a terminal can just run
 ask the user to paste one into chat.
 
 **`vibe dev` vs production:** locally there are no access checks, R2 signed URLs
-don't work, `/files/<key>` isn't served, and `/mcp` supports only `initialize`,
+don't work, and `/mcp` supports only `initialize`,
 `tools/list` and `tools/call`.
 Check those on preview. Local secrets go in `.dev.vars`.
 

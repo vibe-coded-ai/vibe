@@ -19,9 +19,11 @@ curl -fsSL https://vibe-coded.ai/install.sh | sh
 | `SKILL.md` | The skill your coding agent reads: how to build, run, publish and connect a vibe |
 | `bin/vibe` | The CLI (bash) |
 | `runtime/` | The local dev server and the helpers it uses (Node) |
-| `templates/` | Starting points: `tools`, `tools-sql`, `site` |
 | `references/` | Platform patterns the skill points the agent at |
 | `install.sh` | The installer served at `https://vibe-coded.ai/install.sh` |
+
+Templates are served by the platform: `vibe templates` lists them, and
+`vibe init --template <name> <slug>` downloads the starter files.
 
 ## Use
 

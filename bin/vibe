@@ -187,64 +187,25 @@ _api() {
 # and the sentence to give the agent.
 _entitlement_hint() {
   local result="$1" doing="${2:-this}"
-  local err plan limit used ltype url
+  local err
   err=$(echo "$result" | jq -r '.error // "This feature is not included in your plan"')
-  if [[ "$err" == *"Tell your agent:"* ]]; then
-    # Keep the server's gate guidance, filling in its generic retry instruction.
-    err="${err//then retry./then retry $doing.}"
-    err="${err//retry the previous command/retry $doing}"
-    printf '%s\n' "$err" >&2
-    return
-  fi
-  plan=$(echo "$result" | jq -r '.plan // empty')
-  limit=$(echo "$result" | jq -r '.limit // empty')
-  used=$(echo "$result" | jq -r '.used // empty')
-  ltype=$(echo "$result" | jq -r '.limitType // empty')
-  echo "$err" >&2
-  # Only name plans that would actually raise this account's limit.
-  case "$plan" in
-    pro)
-      if [ -n "$limit" ] && [ -n "$used" ]; then
-        echo "Limit reached on the Pro+ plan: $used/$limit${ltype:+ ($ltype)}. Pro+ is the highest plan; free up room to continue." >&2
-        echo "Tell your agent: \"free up room on my vibe-coded.ai account (for example delete a vibe I no longer need), then retry $doing\"" >&2
-      else
-        echo "Your plan: Pro+." >&2
-      fi
-      return
-      ;;
-    byov)
-      url="$WEB_BASE/billing?plan=pro"
-      if [ -n "$limit" ] && [ -n "$used" ]; then
-        echo "Limit reached on the Pro plan: $used/$limit${ltype:+ ($ltype)}. Pro+ (\$20/mo) raises it: $url" >&2
-      else
-        echo "Your plan: Pro. Included with Pro+ (\$20/mo): $url" >&2
-      fi
-      echo "Tell your agent: \"upgrade my vibe-coded.ai plan to Pro+, then retry $doing\"" >&2
-      return
-      ;;
-  esac
-  url="$WEB_BASE/billing?plan=byov"
-  if [ -n "$limit" ] && [ -n "$used" ]; then
-    echo "Limit reached${plan:+ on the Free plan}: $used/$limit${ltype:+ ($ltype)}. Pro (\$9/mo) or Pro+ (\$20/mo) raise it: $url" >&2
-  else
-    echo "${plan:+Your plan: Free. }Included with Pro (\$9/mo) or Pro+ (\$20/mo): $url" >&2
-  fi
-  echo "Tell your agent: \"upgrade my vibe-coded.ai plan to Pro, then retry $doing\"" >&2
+  err="${err//then retry./then retry $doing.}"
+  err="${err//retry the previous command/retry $doing}"
+  printf '%s\n' "$err" >&2
 }
 
-# One line of monthly usage when a plan lookup result carries a budget, e.g.
-# "Monthly usage: $0.12 of $4.50 (resets 1 Nov)". Silent otherwise.
+# One line of monthly calls when the ledger is available. Silent otherwise.
 _print_budget_line() {
-  local fields spent budget reset_day reset_month
+  local fields used limit reset_day reset_month
   fields=$(echo "$1" | jq -r '
-    .budget as $b
-    | if ($b | type) == "object" and ($b.spentMicro | type) == "number"
-         and ($b.budgetMicro | type) == "number" and ($b.resetsAt | type) == "string"
-      then "\($b.spentMicro / 1000000) \($b.budgetMicro / 1000000) \($b.resetsAt[0:19] | strptime("%Y-%m-%dT%H:%M:%S") | strftime("%d %b"))"
+    def commas: tostring | split("") | reverse | join("") | gsub("(?<n>[0-9]{3})(?=[0-9])"; "\(.n),") | split("") | reverse | join("");
+    if (.monthlyCallsUsed | type) == "number" and (.monthlyCalls | type) == "number"
+         and (.budget.resetsAt | type) == "string"
+      then "\(.monthlyCallsUsed | commas) \(.monthlyCalls | commas) \(.budget.resetsAt[0:19] | strptime("%Y-%m-%dT%H:%M:%S") | strftime("%d %b"))"
       else empty end' 2>/dev/null) || return 0
   [ -n "$fields" ] || return 0
-  read -r spent budget reset_day reset_month <<<"$fields"
-  printf 'Monthly usage: $%.2f of $%.2f (resets %d %s)\n' "$spent" "$budget" "$((10#$reset_day))" "$reset_month"
+  read -r used limit reset_day reset_month <<<"$fields"
+  printf 'Monthly calls: %s of %s (resets %d %s)\n' "$used" "$limit" "$((10#$reset_day))" "$reset_month"
 }
 
 # Plan lookup: prints the raw GET /api/v1/vibes result once it carries a plan.
@@ -487,65 +448,56 @@ _resolve_skill_dir() {
   dirname "$dir"
 }
 
-_templates_dir() {
-  local skill_dir
-  skill_dir="$(_resolve_skill_dir)"
-  printf '%s/templates\n' "$skill_dir"
+_template_api() {
+  local path="${1:-}" base="${API_URL:-$API_BASE}" result status
+  # Listing templates needs no sign-in, but uses the saved platform URL when present.
+  if [ -z "${API_URL:-}" ] && [ -f "$CREDS" ]; then
+    base=$(jq -r '.apiUrl // empty' "$CREDS" 2>/dev/null) || base=""
+    base="${base:-$API_BASE}"
+  fi
+  base="${base%/}"
+  if ! result=$(curl -s --max-time 30 "$base/api/v1/templates$path" -w $'\n%{http_code}' 2>/dev/null); then
+    echo "Error: could not fetch templates from $base (network error). Check your connection and retry." >&2
+    return 1
+  fi
+  status="${result##*$'\n'}"
+  if [ "$status" != "200" ]; then
+    echo "Error: Template request failed (HTTP $status). Run 'vibe templates' to list templates." >&2
+    return 1
+  fi
+  printf '%s' "${result%$'\n'*}"
 }
 
 _print_templates() {
-  local templates_dir template_dir name description found=false
-  templates_dir="$(_templates_dir)"
-
+  local result name description
+  result=$(_template_api)
+  if ! printf '%s' "$result" | jq -e '.success == true and (.templates | type == "array")' >/dev/null 2>&1; then
+    echo "Error: Invalid template list from the platform." >&2
+    return 1
+  fi
   echo "Available templates:"
-  if [ -d "$templates_dir" ]; then
-    for template_dir in "$templates_dir"/*; do
-      [ -d "$template_dir" ] || continue
-      [ -f "$template_dir/template.json" ] || continue
-      name=$(jq -r '.name // empty' "$template_dir/template.json")
-      description=$(jq -r '.description // empty' "$template_dir/template.json")
-      [ -n "$name" ] || continue
-      printf "  %-12s %s\n" "$name" "$description"
-      found=true
-    done
-  fi
-
-  if [ "$found" = false ]; then
-    echo "  (none found)"
-  fi
-}
-
-_resolve_template_dir() {
-  local template_name="$1" templates_dir template_dir
-  templates_dir="$(_templates_dir)"
-
-  [ -d "$templates_dir" ] || return 1
-  for template_dir in "$templates_dir"/*; do
-    [ -d "$template_dir" ] || continue
-    if [ "$(basename "$template_dir")" = "$template_name" ] && [ -f "$template_dir/template.json" ]; then
-      printf '%s\n' "$template_dir"
-      return 0
-    fi
-  done
-  return 1
+  while IFS=$'\t' read -r name description; do
+    printf "  %-12s %s\n" "$name" "$description"
+  done < <(printf '%s' "$result" | jq -r '.templates[] | [.name, .description] | @tsv')
 }
 
 _check_template_targets() {
-  local template_dir="$1" source target
-  while IFS= read -r -d '' source; do
-    target="./$(basename "$source")"
+  local template_json="$1" path target
+  while IFS= read -r path; do
+    target="./${path%%/*}"
     if [ -e "$target" ] || [ -L "$target" ]; then
       echo "Error: Cannot apply template: $target already exists; refusing to overwrite it." >&2
       return 1
     fi
-  done < <(find "$template_dir" -mindepth 1 -maxdepth 1 ! -name template.json -print0)
+  done < <(printf '%s' "$template_json" | jq -r '.files[].path')
 }
 
 _copy_template_files() {
-  local template_dir="$1" source
-  while IFS= read -r -d '' source; do
-    cp -R "$source" .
-  done < <(find "$template_dir" -mindepth 1 -maxdepth 1 ! -name template.json -print0)
+  local template_json="$1" path
+  while IFS= read -r path; do
+    mkdir -p -- "$(dirname "./$path")"
+    printf '%s' "$template_json" | jq -j --arg path "$path" '.files[] | select(.path == $path) | .content' > "./$path"
+  done < <(printf '%s' "$template_json" | jq -r '.files[].path')
 }
 
 # ── Commands ─────────────────────────────────────────────────────────────────
@@ -559,7 +511,7 @@ cmd_init() {
   local storage="kv"
   local visibility="private"
   local template=""
-  local template_dir=""
+  local template_json=""
   local storage_flag=""
   local adopt=""
 
@@ -624,15 +576,26 @@ cmd_init() {
   [ -n "$title" ] || title="$slug"
 
   if [ -n "$template" ]; then
-    if ! template_dir="$(_resolve_template_dir "$template")"; then
-      echo "Error: Unknown template '$template'." >&2
-      _print_templates >&2
+    if [[ ! "$template" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || [ "${#template}" -gt 63 ]; then
+      echo "Error: Invalid template name. Run 'vibe templates' to list templates." >&2
       exit 1
     fi
-    if ! storage=$(jq -er '.storage | select(. == "kv" or . == "d1")' "$template_dir/template.json"); then
-      echo "Error: Template '$template' has invalid storage metadata." >&2
+    template_json=$(_template_api "/$template")
+    # Validate the remote tree before creating the vibe or writing any files.
+    if ! printf '%s' "$template_json" | jq -e --arg name "$template" '
+      .name == $name and (.storage == "kv" or .storage == "d1") and
+      (.type == "static" or .type == "fullstack") and
+      (.files | type == "array" and length > 0) and
+      ([.files[].path] | length == (unique | length)) and
+      all(.files[]; (.content | type == "string") and (.path | type == "string") and
+        (.path | length > 0) and (.path | explode | all(. >= 32 and . != 127)) and
+        (.path | split("/") | all(. != "" and . != "." and . != "..")) and
+        (.path | split("/")[0] | . != ".vibe-coded.json" and . != ".vibe-coded" and . != ".git"))
+      ' >/dev/null 2>&1; then
+      echo "Error: Invalid template files or metadata from the platform." >&2
       exit 1
     fi
+    storage=$(printf '%s' "$template_json" | jq -r '.storage')
     # The template decides storage; say so instead of silently ignoring the flag
     if [ -n "$storage_flag" ] && [ "$storage_flag" != "$storage" ]; then
       local want="$storage_flag" have="$storage"
@@ -644,7 +607,7 @@ cmd_init() {
         echo "Tell your agent: \"convert $slug to SQL (D1) storage\" once you are on Pro or Pro+." >&2
       fi
     fi
-    _check_template_targets "$template_dir"
+    _check_template_targets "$template_json"
   fi
 
   _load_creds
@@ -729,7 +692,7 @@ cmd_init() {
   # Write manifest
   local vibe_type="fullstack"
   if [ -n "$template" ]; then
-    vibe_type=$(jq -r '.type // "fullstack"' "$template_dir/template.json")
+    vibe_type=$(printf '%s' "$template_json" | jq -r '.type')
   fi
   jq -n --arg u "$USER_SLUG" --arg v "$slug" --arg st "$storage" --arg ty "$vibe_type" \
     '{userSlug: $u, vibeSlug: $v, type: $ty, storage: $st}' > .vibe-coded.json
@@ -737,7 +700,7 @@ cmd_init() {
 
   echo "Wrote .vibe-coded.json"
   if [ -n "$template" ]; then
-    _copy_template_files "$template_dir"
+    _copy_template_files "$template_json"
     echo "Copied template: $template"
   fi
   echo ""
@@ -766,6 +729,7 @@ cmd_list() {
   fi
   result=$(_api GET "/api/v1/vibes")
   _check_success "$result" "List"
+  echo "OWNER/SLUG  TITLE  VISIBILITY/POLICY  STORAGE  STATE"
   printf '%s' "$result" | jq -r --arg owner "$USER_SLUG" --arg current "$current" '
     .vibes[] | "\($owner)/\(.slug)  \(.title)  \(.visibility)/\(.interactionPolicy)  \(if .storageType == "d1" then "sql" else .storageType end)  \(if .productionBuildId != null then "published" else "preview-only" end)\(if .slug == $current then "  * current" else "" end)"'
 }
@@ -1084,7 +1048,7 @@ cmd_preview() {
   fi
 
   # Use tempfile + --data-binary @file so payload bypasses ARG_MAX (macOS: 1MB)
-  TMP_PAYLOAD=$(mktemp -t vibe-upload)
+  TMP_PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/vibe-upload.XXXXXX")
   printf '%s' "$PAYLOAD" > "$TMP_PAYLOAD"
   if ! UPLOAD=$(_api_wait_for_build POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/source" --data-binary "@$TMP_PAYLOAD"); then
     rm -f "$TMP_PAYLOAD"
@@ -1163,7 +1127,9 @@ cmd_preview() {
       jq --argjson id "$BUILD_ID" '.lastBuildId = $id' .vibe-coded.json > "$manifest_tmp"
       mv "$manifest_tmp" .vibe-coded.json
     fi
-    printf "  [%3ds] %s\n" "$elapsed" "$STATUS"
+    local waiting_reason
+    waiting_reason=$(echo "$BUILD" | jq -r '.builds[0].waitingReason // empty')
+    printf "  [%3ds] %s%s\n" "$elapsed" "$STATUS" "${waiting_reason:+ — $waiting_reason}"
     if [ "$STATUS" = "succeeded" ]; then
       echo ""
       echo "Build succeeded!"
@@ -1227,7 +1193,8 @@ cmd_publish() {
   pending_msg=$(echo "$RESULT" | jq -r 'select((.success // false) != true) | .error // empty' 2>/dev/null) || pending_msg=""
   if [[ "$pending_msg" =~ ^Production\ promotion\ ([0-9]+)\ is\ still\ in\ progress ]]; then
     promotion_id="${BASH_REMATCH[1]}"
-    echo "Promotion $promotion_id is still running; waiting (up to 10 minutes)..."
+    echo "Your promotion $promotion_id is still running; waiting…"
+    printf "  [%3ds] publishing\n" 0
     local elapsed=0 interval=5 max_wait=600 build status
     while :; do
       if [ "$elapsed" -ge "$max_wait" ]; then
@@ -1278,6 +1245,7 @@ cmd_publish() {
   else
     echo "Warning: got HTTP $HTTP — may not be live yet"
   fi
+  echo "Visitors may see the previous build for up to a minute while caches expire."
   _print_urls production
   if [ "$open_after" = "1" ]; then
     _open_in_browser "$open_url" || echo "Open this in your browser: $open_url"
@@ -1311,8 +1279,8 @@ cmd_status() {
     plan=$(echo "$lookup" | jq -r '.plan')
     case "$plan" in
       pro)  echo "Plan: Pro+"; echo "Pro+ is the highest plan. Billing: $WEB_BASE/billing" ;;
-      byov) echo "Plan: Pro"; echo "Upgrade: Pro+ (\$20/mo) at $WEB_BASE/billing" ;;
-      *)    echo "Plan: Free"; echo "Upgrade: Pro (\$9/mo) or Pro+ (\$20/mo) at $WEB_BASE/billing" ;;
+      byov) echo "Plan: Pro"; echo "Upgrade: Pro+ at $WEB_BASE/billing" ;;
+      *)    echo "Plan: Free"; echo "Upgrade: Pro or Pro+ at $WEB_BASE/billing" ;;
     esac
     _print_budget_line "$lookup"
     echo "Plans and limits: $WEB_BASE/pricing"
@@ -1478,15 +1446,38 @@ cmd_call() {
 # platform Bearer token as the management API, so this lets agents verify pages
 # and assets without weakening visibility or requiring a browser session.
 cmd_fetch() {
-  local path="" env="production" show_headers=0
+  local path="" env="production" show_headers=0 method="GET" header
+  local -a request_args=(-sS)
   while [ $# -gt 0 ]; do
     case "$1" in
       --preview) env="preview" ;;
       --headers|-i) show_headers=1 ;;
+      --method)
+        [ $# -ge 2 ] && [[ "$2" =~ ^[A-Za-z]+$ ]] || { echo "Error: --method requires an HTTP method." >&2; exit 1; }
+        method=$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]')
+        shift ;;
+      --header)
+        [ $# -ge 2 ] || { echo "Error: --header requires 'K: V'." >&2; exit 1; }
+        header="$2"
+        if [[ "$header" != *:* || "$header" == *$'\n'* || "$header" == *$'\r'* ]]; then
+          echo "Error: --header requires 'K: V' without newlines." >&2; exit 1
+        fi
+        if [ "$(printf '%s' "${header%%:*}" | tr '[:upper:]' '[:lower:]')" = "authorization" ]; then
+          echo "Error: fetch supplies owner authentication; Authorization cannot be overridden." >&2; exit 1
+        fi
+        request_args+=(-H "$header")
+        shift ;;
+      --data)
+        [ $# -ge 2 ] || { echo "Error: --data requires a string or @file." >&2; exit 1; }
+        if [[ "$2" == @* ]] && [ ! -r "${2#@}" ]; then
+          echo "Error: cannot read data file: ${2#@}" >&2; exit 1
+        fi
+        request_args+=(--data-binary "$2")
+        shift ;;
       --)
         shift
         if [ $# -ne 1 ]; then
-          echo "Usage: vibe fetch <path> [--preview] [--headers|-i]" >&2
+          echo "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
           exit 1
         fi
         path="$1"
@@ -1495,7 +1486,7 @@ cmd_fetch() {
       -*) echo "Error: Unknown fetch option: $1" >&2; exit 1 ;;
       *)
         if [ -n "$path" ]; then
-          echo "Usage: vibe fetch <path> [--preview] [--headers|-i]" >&2
+          echo "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
           exit 1
         fi
         path="$1"
@@ -1504,7 +1495,7 @@ cmd_fetch() {
     shift
   done
   if [ -z "$path" ]; then
-    echo "Usage: vibe fetch <path> [--preview] [--headers|-i]" >&2
+    echo "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
     exit 1
   fi
   if [[ "$path" == *$'\n'* || "$path" == *$'\r'* ]]; then
@@ -1537,29 +1528,10 @@ cmd_fetch() {
   local out headers http_status
   out=$(mktemp)
   headers=$(mktemp)
-  http_status=$(curl -sS -K - -D "$headers" -o "$out" -w '%{http_code}' "$url" \
+  http_status=$(curl -K - -X "$method" "${request_args[@]}" -D "$headers" -o "$out" -w '%{http_code}' "$url" \
     -H "User-Agent: vibe-cli/1.0" \
     <<<"header = \"Authorization: Bearer ${TOKEN}\"") \
     || { rm -f "$out" "$headers"; echo "Error: request to $url failed" >&2; exit 1; }
-  if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
-    if [ "$http_status" = "401" ]; then _login_expired || true; fi
-    echo "Error: request to $url failed (HTTP $http_status)" >&2
-    local content_type body_size
-    content_type=$(awk '
-      /^HTTP\// { type = "" }
-      tolower($0) ~ /^content-type:/ { type = tolower($0); sub(/^[^:]*:[ \t]*/, "", type); sub(/[;\r].*$/, "", type) }
-      END { print type }
-    ' "$headers")
-    case "$content_type" in
-      text/*|application/json|application/*+json|application/xml|application/*+xml|application/javascript)
-        head -c 2048 "$out" >&2 ;;
-      *)
-        body_size=$(wc -c < "$out")
-        echo "(binary body, $((body_size)) bytes)" >&2 ;;
-    esac
-    rm -f "$out" "$headers"
-    exit 1
-  fi
   if [ "$show_headers" = "1" ]; then
     awk '
       { sub(/\r$/, "") }
@@ -1569,7 +1541,31 @@ cmd_fetch() {
       END { printf "%s\n", headers }
     ' "$headers"
   fi
+  local content_type
+  content_type=$(awk '
+    /^HTTP\// { type = "" }
+    tolower($0) ~ /^content-type:/ { type = tolower($0); sub(/^[^:]*:[ \t]*/, "", type); sub(/[;\r].*$/, "", type) }
+    END { print type }
+  ' "$headers")
+  if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+    if [ "$http_status" = "401" ]; then _login_expired || true; fi
+    echo "Error: request to $url failed (HTTP $http_status)" >&2
+    local body_size
+    case "$content_type" in
+      text/*|application/json|application/*+json|application/xml|application/*+xml|application/javascript)
+        head -c 2048 "$out" >&2; echo >&2 ;;
+      *)
+        body_size=$(wc -c < "$out")
+        echo "(binary body, $((body_size)) bytes)" >&2 ;;
+    esac
+    rm -f "$out" "$headers"
+    exit 1
+  fi
   cat "$out"
+  case "$content_type" in
+    ''|text/*|application/json|application/*+json|application/xml|application/*+xml|application/javascript)
+      [ -s "$out" ] && [ -n "$(tail -c 1 "$out")" ] && echo ;;
+  esac
   rm -f "$out" "$headers"
 }
 
@@ -2186,16 +2182,9 @@ cmd_secrets() {
       local usage_type="custom"
       [ "${1:-}" = "--type" ] && usage_type="${2:-custom}"
 
-      # Check the plan before asking for sensitive input. Unknown/unavailable
-      # plan state fails closed via _current_plan and the explicit allow-list.
-      local current_plan
-      if ! current_plan=$(_current_plan); then
-        exit 1
-      fi
-      if [ "$current_plan" != "byov" ] && [ "$current_plan" != "pro" ]; then
-        _entitlement_hint "$(jq -n --arg plan "$current_plan" --arg error "Encrypted secrets are not included in your plan." '{plan: $plan, error: $error}')" "vibe secrets create $name"
-        exit 1
-      fi
+      # Check the server's entitlement gate before asking for sensitive input.
+      RESULT=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/secrets")
+      _check_success "$RESULT" "vibe secrets create $name"
 
       echo -n "Secret value: " && read -s SECRET_VAL && echo ""
       local body
@@ -2237,7 +2226,7 @@ cmd_secrets() {
       echo "Secret $name deleted. A running worker can still read it for up to ~30 seconds."
       ;;
     audit)
-      _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/secrets/_audit" | jq '.audit'
+      _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/secrets/_audit" | jq '.audit | map(del(.userId))'
       ;;
     *)
       echo "Usage: vibe secrets list|create|update|delete|audit [NAME]" >&2
@@ -2344,9 +2333,10 @@ USAGE
     exit 1
   fi
   if [ "$current_plan" = "free" ]; then
-    echo "R2 file storage is not included in the free plan." >&2
-    echo "Your plan: free. Included with Pro (\$9/mo) or Pro+ (\$20/mo): $WEB_BASE/billing?plan=byov" >&2
-    echo "Tell your agent: \"upgrade my vibe-coded.ai plan to Pro, then retry vibe r2 $sub\"" >&2
+    # Reads stay open on Free; the write gate is rendered by the upload-url
+    # endpoint before it validates the body, so an empty request returns it.
+    RESULT=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/upload-url" -d '{}')
+    _check_success "$RESULT" "vibe r2 $sub"
     exit 1
   fi
 
@@ -2627,7 +2617,7 @@ _print_command_help() {
       printf '%s\n' "Usage: vibe dev seed <file.sql>" "Apply a SQL seed file to local D1 without starting the dev server."
       return ;;
     secrets:create)
-      printf '%s\n' "Usage: vibe secrets create <NAME> [--type custom]" "Create a write-only secret (Pro); the value is read securely from the terminal."
+      printf '%s\n' "Usage: vibe secrets create <NAME> [--type custom]" "Create a write-only secret (Pro); value read from the terminal, or from stdin when piped."
       return ;;
     secrets:update)
       printf '%s\n' "Usage: vibe secrets update <NAME>" "Replace a write-only secret value, read securely from the terminal."
@@ -2668,7 +2658,7 @@ _print_command_help() {
     login) printf '%s\n' "Usage: vibe login [email] [--start|--finish]" "Sign in through the browser flow, or use the password fallback with an email." ;;
     logout) printf '%s\n' "Usage: vibe logout" "Remove local CLI credentials and attempt best-effort revocation." ;;
     init) printf '%s\n' "Usage: vibe init [--template <name>] <slug> [--title \"My App\"] [--storage kv|sql] [--visibility private] [--adopt]" "Create or adopt a vibe you own and write .vibe-coded.json." "For a vibe someone shared with you, vibe init <owner>/<slug> points you to: vibe connect <owner>/<slug>" ;;
-    templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates bundled with the skill." ;;
+    templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates served by the platform." ;;
     list) printf '%s\n' "Usage: vibe list" "List your vibes; * marks the current folder's vibe. No manifest needed." ;;
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
     dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] | vibe dev seed <file.sql>" "Run the worker and local storage offline; --reset clears local state." "On first run, installs miniflare, esbuild and chokidar with npm in the skill directory." ;;
@@ -2676,10 +2666,10 @@ _print_command_help() {
     publish) printf '%s\n' "Usage: vibe publish [--open]" "Promote the live preview build to production. --open opens the app, or its sharing page while it is private, in your browser." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." ;;
     urls) printf '%s\n' "Usage: vibe urls" "Print preview and production app/MCP endpoints." ;;
-    fetch) printf '%s\n' "Usage: vibe fetch <path> [--preview] [--headers|-i]" "Fetch a deployed page or asset as the owner, including from a private vibe." "GET only; to POST to /api/<tool> as the owner use vibe call <tool>." "--headers (-i) prints the status line and all response headers except cookies before the body." ;;
+    fetch) printf '%s\n' "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" "Fetch a deployed route as the owner, including from a private vibe. GET by default; --header is repeatable. The platform's header allowlist still applies." "--headers (-i) prints the status line and all response headers except cookies before the body." ;;
     call) printf '%s\n' "Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--preview]" "Call one live MCP tool as the owner and print its text result." ;;
     connect) printf '%s\n' "Usage: vibe connect [<owner>/<slug>] [--name N] [--print|--revoke]" "Register or revoke a scoped MCP connection in Claude Code: this vibe, or <owner>/<slug> for a vibe shared with you." "--print creates a real connection token and prints its command. Revoke it with: vibe connect [<owner>/<slug>] --revoke" ;;
-    logs) printf '%s\n' "Usage: vibe logs [build-id]" "Show build logs; defaults to the latest build." ;;
+    logs) printf '%s\n' "Usage: vibe logs [build-id]" "Show build logs; defaults to the last build started from this machine; vibe logs <id> for another." ;;
     settings) printf '%s\n' "Usage: vibe settings [--title T] [--visibility private|unlisted|public] [--interaction public|public_read|authenticated|invite_only]" "View settings or update the title; exposure changes are web-only and exit non-zero." ;;
     access) printf '%s\n' "Usage: vibe access list|grant|update|revoke|revoke-all [args]" "List access in the CLI; owner-only mutations are completed on the website." ;;
     secrets) printf '%s\n' "Usage: vibe secrets list|create|update|delete|audit [NAME]" "Manage write-only worker secrets (Pro)." ;;

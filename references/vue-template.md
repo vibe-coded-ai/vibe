@@ -1,6 +1,6 @@
 # Vue 3 + Vite template
 
-Start from the bundled [`vue` template](../templates/vue/). Through the CLI,
+Start from the platform's `vue` template. Through the CLI,
 run `vibe init --template vue <slug>` in an empty folder. Through MCP, read
 `vibe-coded://templates/vue`, then call `create_vibe` with `template: "vue"`.
 The starter files below are included; no manual copying is needed. The platform

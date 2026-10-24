@@ -17,8 +17,8 @@ function bump(version, part) {
   return v.join('.');
 }
 
-// Runs `vibe templates` (no network, no credentials) with a stub curl that
-// serves `published` for skill-version.txt and counts its calls.
+// Runs `vibe templates` with stubbed public API and version responses;
+// counts only the version checks.
 function run({ published, cached, cacheAgeDays = 0, env = {}, cmd = 'templates', installed }) {
   const root = mkdtempSync(join(tmpdir(), 'vibe-update-'));
   const home = join(root, 'home');
@@ -28,6 +28,7 @@ function run({ published, cached, cacheAgeDays = 0, env = {}, cmd = 'templates',
   const log = join(root, 'curl.log');
   writeFileSync(join(bin, 'curl'), [
     '#!/usr/bin/env bash',
+    'if [[ "$*" == */api/v1/templates* ]]; then printf \'%s\\n200\' \'{"success":true,"templates":[]}\'; exit 0; fi',
     'echo "$*" >> "$STUB_LOG"',
     'if [ -z "$STUB_PUBLISHED" ]; then exit 22; fi',
     'printf "%s\\n" "$STUB_PUBLISHED"',
@@ -160,7 +161,6 @@ test('installer only suggests login when signed out and PATH edits when needed',
   }
 });
 
-test('the patch version is bumped together in package.json and skill frontmatter', () => {
-  assert.equal(CURRENT, '4.5.6');
-  assert.match(readFileSync(join(SKILL_DIR, 'SKILL.md'), 'utf8'), /^version: 4\.5\.6$/m);
+test('package.json and skill frontmatter report the same version', () => {
+  assert.match(readFileSync(join(SKILL_DIR, 'SKILL.md'), 'utf8'), new RegExp(`^version: ${CURRENT.replaceAll('.', '\\.')}[ \\t]*$`, 'm'));
 });
