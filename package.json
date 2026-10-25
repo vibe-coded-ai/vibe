@@ -1,6 +1,6 @@
 {
   "name": "vibe-coded-ai-skill",
-  "version": "4.7.0",
+  "version": "4.7.1",
   "private": true,
   "type": "module",
   "description": "Local dev runtime for the vibe-coded.ai CLI skill (vibe dev).",

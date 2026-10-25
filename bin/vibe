@@ -1432,6 +1432,17 @@ cmd_call() {
   if echo "$payload" | jq -e '.error' >/dev/null 2>&1; then
     local msg
     msg=$(echo "$payload" | jq -r '.error | if type == "object" then (.message // tostring) else tostring end')
+    # The production host answers "Vibe not found" both for a vibe that does
+    # not exist and for one that has no production build yet. Only the
+    # second case gets the publish hint, so the vibe is looked up first.
+    if [ "$env" = "production" ] && [ "$msg" = "Vibe not found" ]; then
+      local info
+      info=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) || info=""
+      if printf '%s' "$info" | jq -e '.success == true and ((.vibe.productionBuildId // .productionBuildId) == null)' >/dev/null 2>&1; then
+        echo "Error: $USER_SLUG/$VIBE_SLUG has no production build yet. Run: vibe publish — or add --preview to call the preview build." >&2
+        exit 1
+      fi
+    fi
     echo "Error: $msg" >&2
     exit 1
   fi
