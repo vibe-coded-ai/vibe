@@ -83,7 +83,8 @@ over hand-written files.
   they'll use), `get_x`, `update_x`, and a narrow `delete_x(id)` so verification can
   clean up. Skip tools nobody will ask for.
 - **Descriptions are for the AI.** `@description` and `@param` are what it reads;
-  say what the tool does and give example values. Nullable params: `{?number}`.
+  say what the tool does and give example values. Optional params: `@param {number} [limit]`
+  (square brackets); `{?number}` means nullable, not optional.
 - **Return what the next step needs:** writes return the saved record with its
   `id`; lists return newest first; errors are `{ success: false, error }` with a
   sentence the AI can act on.

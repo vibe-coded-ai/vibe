@@ -172,6 +172,15 @@ _api() {
       return 1
     fi
     if _is_build_limit_error "$body" 2>/dev/null; then _build_limit_hint "$body"; fi
+    # A per-minute bucket refilling within seconds is worth one pause; a build
+    # cap or a long Retry-After is the caller's to report.
+    if [ "${_API_RETRIED:-0}" = 0 ] && [ "${WAIT_FOR_BUILD_LIMIT:-0}" != 1 ] && [ "${_API_NO_RETRY:-0}" != 1 ] \
+       && [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -le 5 ] && ! _is_build_limit_error "$body" 2>/dev/null; then
+      echo "Too many requests; retrying in $retry_after seconds…" >&2
+      sleep "$retry_after"
+      _API_RETRIED=1 _api "$method" "$path" "$@"
+      return
+    fi
     if [[ "$retry_after" =~ ^[0-9]+$ ]]; then
       echo "Too many requests; try again in $retry_after seconds.$error_suffix" >&2
     else
@@ -261,7 +270,8 @@ _build_limit_hint() {
   fi
   case "$(echo "$result" | jq -r '.reason // empty')" in
     hourly_limit|daily_limit)
-      echo "No files were saved; no build was started." >&2
+      # The platform's sentence already says so when it carries one.
+      echo "$result" | jq -e '.error | test("no build was started")' >/dev/null 2>&1 || echo "No files were saved; no build was started." >&2
       echo 'Keep iterating with `vibe dev`, which has no build limit.' >&2 ;;
   esac
 }
@@ -288,7 +298,7 @@ _api_wait_for_build() {
     id=$(echo "$result" | jq -r '.blockingBuild.id // empty')
     slug=$(echo "$result" | jq -r '.blockingBuild.vibeSlug // empty')
     if [[ "$id" =~ ^[0-9]+$ ]] && [[ "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] && [ "${#slug}" -le 63 ]; then
-      echo "Waiting for build $id of $slug to finish…" >&2
+      echo "Waiting for build $id of $slug (another vibe on this account) to finish…" >&2
       while [ "$elapsed" -lt "$max_wait" ]; do
         [ "$elapsed" -ge "$((SECONDS - started))" ] || elapsed=$((SECONDS - started))
         [ "$elapsed" -lt "$max_wait" ] || break
@@ -297,7 +307,7 @@ _api_wait_for_build() {
         sleep "$delay"
         elapsed=$((elapsed + delay))
         [ "$elapsed" -lt "$max_wait" ] || break
-        if ! build=$(_api GET "/api/v1/vibes/$USER_SLUG/$slug/builds/$id" 2>/dev/null); then
+        if ! build=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$slug/builds/$id" 2>/dev/null); then
           if _api_was_rate_limited "$build" "$((max_wait - elapsed))"; then
             elapsed=$((elapsed + API_RATE_LIMIT_WAIT))
             continue
@@ -337,7 +347,7 @@ _display_policy() {
 }
 
 _print_settings() {
-  jq '.vibe // . | {title, visibility, interactionPolicy: (.interactionPolicy + (if .visibility == "private" then " — not in effect while private" else "" end))}'
+  jq '.vibe // . | {title, visibility, interactionPolicy} + (if .visibility == "private" then {interactionPolicyNote: "not in effect while private: only you and people you invite can open a private vibe"} else {} end)'
 }
 
 _print_private_access() {
@@ -392,6 +402,8 @@ _check_success() {
       echo "$msg failed for these files:" >&2
       echo "$result" | jq -r '.errors[] | "  \(.path): \(.error // "rejected")"' >&2
       echo "Remove them from the project folder (or rename them to an accepted type), then run it again." >&2
+    elif [ "$(echo "$result" | jq -r '._originalError // .error // empty')" = "Vibe not found" ] && [ -n "${USER_SLUG:-}" ] && [ -n "${VIBE_SLUG:-}" ]; then
+      echo "$msg failed: vibe $USER_SLUG/$VIBE_SLUG not found or not shared with you (vibe list shows yours)." >&2
     else
       echo "$msg failed: $(echo "$result" | jq -r '.error // "unknown"')" >&2
     fi
@@ -513,7 +525,7 @@ cmd_init() {
   local template=""
   local template_json=""
   local storage_flag=""
-  local adopt=""
+  local adopt="" title_given=0
 
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -524,7 +536,7 @@ cmd_init() {
           exit 1
         fi
         case "$1" in
-          --title) title="$2" ;;
+          --title) title="$2"; title_given=1 ;;
           --storage) storage="$2"; [ "$storage" = "sql" ] && storage="d1"; storage_flag="$storage" ;;
           --visibility)
             visibility="$2"
@@ -573,7 +585,8 @@ cmd_init() {
     exit 1
   fi
 
-  [ -n "$title" ] || title="$slug"
+  local title_defaulted=0
+  [ -n "$title" ] || { title="$slug"; title_defaulted=1; }
 
   if [ -n "$template" ]; then
     if [[ ! "$template" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || [ "${#template}" -gt 63 ]; then
@@ -603,8 +616,8 @@ cmd_init() {
       [ "$want" = "kv" ] && want="KV"; [ "$have" = "kv" ] && have="KV"
       echo "Note: template '$template' uses $have storage, so --storage ${storage_flag/d1/sql} was ignored." >&2
       if [ "$storage_flag" = "d1" ]; then
-        echo "For SQL use: vibe init --template tools-sql $slug (needs Pro)." >&2
-        echo "Tell your agent: \"convert $slug to SQL (D1) storage\" once you are on Pro or Pro+." >&2
+        echo "For SQL from the start use: vibe init --template tools-sql $slug (SQL storage is included from Pro)." >&2
+        echo "To keep this template and switch later, tell your agent: \"convert $slug to SQL (D1) storage\"." >&2
       fi
     fi
     _check_template_targets "$template_json"
@@ -631,6 +644,12 @@ cmd_init() {
         exit 1
       fi
       _check_success "$existing" "Adopt"
+    fi
+    if [ "${title_given:-0}" = 1 ]; then
+      local retitled
+      retitled=$(_api PATCH "/api/v1/vibes/$USER_SLUG/$slug" -d "$(jq -n --arg t "$title" '{title: $t}')") || exit 1
+      _check_success "$retitled" "Title update"
+      echo "Title set to: $title"
     fi
     existing_storage=$(echo "$existing" | jq -r '(.vibe // .).storageType // "kv"')
     if [ -n "$template" ] && [ "$existing_storage" != "$storage" ]; then
@@ -699,6 +718,8 @@ cmd_init() {
   _ensure_gitignore
 
   echo "Wrote .vibe-coded.json"
+  # Only a vibe created here took the slug as its title; an adopted one keeps its own.
+  [ "$title_defaulted" = 1 ] && [ -z "$adopt" ] && echo "Title: $title (the slug; change it with: vibe settings --title \"My App\")"
   if [ -n "$template" ]; then
     _copy_template_files "$template_json"
     echo "Copied template: $template"
@@ -774,6 +795,10 @@ cmd_source() {
     if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
       result=$(jq -r '.error // "Source request failed"' "$out" 2>/dev/null) || result="Source request failed (HTTP $http_status)"
       rm -f "$out"
+      case "$result" in
+        "File not found") result="$USER_SLUG/$VIBE_SLUG has no file $1 (vibe source, with no path, lists what exists)" ;;
+        "Vibe not found") result="vibe $USER_SLUG/$VIBE_SLUG not found or not shared with you (vibe list shows yours)" ;;
+      esac
       echo "Error: $result" >&2
       exit 1
     fi
@@ -781,9 +806,11 @@ cmd_source() {
     rm -f "$out"
     return
   fi
+  local listed_any=0
   while true; do
     result=$(_api GET "${endpoint}${cursor:+?cursor=$cursor}")
     _check_success "$result" "Source listing"
+    [ "$(printf '%s' "$result" | jq -r '.files | length')" = "0" ] || listed_any=1
     printf '%s' "$result" | jq -r '.files[] | "\(.path)\t\(.size)\t\(.etag)"'
     [ "$(printf '%s' "$result" | jq -r '.truncated')" = "true" ] || break
     encoded=$(printf '%s' "$result" | jq -r '.cursor // empty')
@@ -793,6 +820,7 @@ cmd_source() {
     fi
     cursor=$(printf '%s' "$encoded" | jq -sRr @uri)
   done
+  [ "$listed_any" = 1 ] || echo "No source uploaded yet; vibe preview uploads this folder." >&2
 }
 
 _no_vibe_argument() {
@@ -835,6 +863,33 @@ _vibeignore_regex() {
     i=$((i + 1))
   done
   if [ "$directory" = 1 ]; then VIBE_IGNORE_REGEX+='/'; else VIBE_IGNORE_REGEX+='(/|$)'; fi
+}
+
+# sha256 hex of stdin, with whichever tool the machine has; fails (no output)
+# when none can, so a caller never records an empty digest.
+_sha256() {
+  local out
+  if command -v shasum >/dev/null 2>&1; then out=$(shasum -a 256 | cut -c1-64)
+  elif command -v sha256sum >/dev/null 2>&1; then out=$(sha256sum | cut -c1-64)
+  elif command -v openssl >/dev/null 2>&1; then out=$(openssl dgst -sha256 -r | cut -c1-64)
+  else return 1; fi
+  [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s' "$out"
+}
+
+# JSON map of every file preview would upload to the sha256 of its content on
+# disk now: what publish compares with the digests the last preview recorded.
+_local_file_hashes() {
+  local file rel digest
+  _vibeignore_load
+  while IFS= read -r -d '' file; do
+    rel="${file#./}"
+    case "$rel" in .vibe-coded.json|.vibe-coded.json.*) continue ;; esac
+    _vibeignore_is_ignored "$rel" && continue
+    digest=$(_sha256 < "$file") || { echo "Error: cannot compute a sha256 digest of $rel (no shasum, sha256sum or openssl)." >&2; return 1; }
+    printf '%s\t%s\n' "$rel" "$digest"
+  done < <(find . \( -path './node_modules' -o -path './dist' -o -path './.git' -o -path './.vibe-coded' \) -prune -o -type f -print0) \
+    | jq -Rn '[inputs | split("\t") | {key: .[0], value: .[1]}] | from_entries'
 }
 
 _vibeignore_load() {
@@ -934,7 +989,7 @@ cmd_preview() {
   # Build JSON payload with base64-encoded files
   PAYLOAD='{"files":{'
   FIRST=true
-  local count=0 ignored_count=0 ignored_names=""
+  local count=0 ignored_count=0 ignored_names="" uploaded_hashes='{' digest
   _vibeignore_load
   while IFS= read -r -d '' FILE; do
     REL="${FILE#./}"
@@ -950,9 +1005,13 @@ cmd_preview() {
       *) CT="application/octet-stream" ;;
     esac
     B64=$(base64 < "$FILE" | tr -d '\n')
-    if [ "$FIRST" = true ]; then FIRST=false; else PAYLOAD+=','; fi
+    # The digest is of the bytes going into the payload, so an edit made while
+    # the upload is prepared or sent still reads as a change at publish time.
+    digest=$(printf '%s' "$B64" | base64 --decode | _sha256) || { echo "Error: cannot compute a sha256 digest of $REL (no shasum, sha256sum or openssl)." >&2; exit 1; }
+    if [ "$FIRST" = true ]; then FIRST=false; else PAYLOAD+=','; uploaded_hashes+=','; fi
     KEY=$(printf '%s' "$REL" | jq -Rs '.')
     PAYLOAD+="$KEY:{\"content\":\"$B64\",\"contentType\":\"$CT\"}"
+    uploaded_hashes+="$KEY:\"$digest\""
     count=$((count + 1))
   done < <(find . \( -path './node_modules' -o -path './dist' -o -path './.git' -o -path './.vibe-coded' \) -prune -o -type f -print0)
   if [ "$ignored_count" -gt 0 ]; then
@@ -961,6 +1020,7 @@ cmd_preview() {
     echo "Ignored $ignored_count file(s) (.vibeignore or defaults): $ignored_names"
   fi
   PAYLOAD+='}}'
+  uploaded_hashes+='}'
   LOCAL_PATHS=$(printf '%s' "$PAYLOAD" | jq -c '.files | keys')
 
   # Mirror the local source tree remotely. The local manifest comes from the
@@ -1052,7 +1112,19 @@ cmd_preview() {
   printf '%s' "$PAYLOAD" > "$TMP_PAYLOAD"
   if ! UPLOAD=$(_api_wait_for_build POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/source" --data-binary "@$TMP_PAYLOAD"); then
     rm -f "$TMP_PAYLOAD"
-    # _api has already said why (network error or expired login).
+    # _api has already said why (network error or expired login). A refused
+    # upload is the hourly upload allowance, separate from the build cap.
+    if [[ "$UPLOAD" == __rate_limited* ]]; then
+      # Two buckets answer 429 here: the per-minute request limit (seconds
+      # to wait) and the hourly upload allowance (minutes). Name the one the
+      # wait time implies.
+      local wait_s="${UPLOAD#__rate_limited }"
+      if [[ "$wait_s" =~ ^[0-9]+$ ]] && [ "$wait_s" -gt 60 ]; then
+        echo "That is the source-upload allowance (30 uploads an hour per account and address), separate from the build allowance. No files were saved; no build was started. Keep iterating with \`vibe dev\` meanwhile." >&2
+      else
+        echo "That is the per-minute request limit, not the build or upload allowance. No files were saved; no build was started. Run vibe preview again after the wait." >&2
+      fi
+    fi
     exit 1
   fi
   rm -f "$TMP_PAYLOAD"
@@ -1061,7 +1133,7 @@ cmd_preview() {
   # are deliberately excluded so future previews keep protecting them.
   local manifest_tmp
   manifest_tmp=$(mktemp .vibe-coded.json.XXXXXX)
-  jq --argjson paths "$LOCAL_PATHS" '.uploadedPaths = $paths' .vibe-coded.json > "$manifest_tmp"
+  jq --argjson paths "$LOCAL_PATHS" --argjson hashes "$uploaded_hashes" '.uploadedPaths = $paths | .uploadedHashes = $hashes' .vibe-coded.json > "$manifest_tmp"
   mv "$manifest_tmp" .vibe-coded.json
   # The upload contract (SKILL.md "What gets uploaded and served"): a local
   # dist/ is never uploaded; when the project has a build step, the platform
@@ -1111,7 +1183,7 @@ cmd_preview() {
     sleep "$interval"
     elapsed=$((elapsed + interval))
     [ "$elapsed" -ge 60 ] && interval=10
-    if ! BUILD=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds?limit=1" 2>/dev/null); then
+    if ! BUILD=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds?limit=1" 2>/dev/null); then
       if _api_was_rate_limited "$BUILD"; then printf "  [%3ds] waiting (rate limited; retrying)\n" "$elapsed"; continue; fi
       echo "Error: could not read the build status. Run 'vibe status' to check the build." >&2
       exit 1
@@ -1133,6 +1205,7 @@ cmd_preview() {
     if [ "$STATUS" = "succeeded" ]; then
       echo ""
       echo "Build succeeded!"
+      echo "The preview reaches every edge within about ten seconds; a fetch in that window may still show the previous build."
       _print_urls preview
       # Surface the tool count here, not only in 'vibe status'.
       vibe_info=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG")
@@ -1151,10 +1224,11 @@ cmd_preview() {
 }
 
 cmd_publish() {
-  local open_after=0
+  local open_after=0 force=0
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --open) open_after=1 ;;
+      --force) force=1 ;;
       -*) echo "Error: Unknown publish option: $1" >&2; exit 1 ;;
       *) _no_vibe_argument publish ;;
     esac
@@ -1162,6 +1236,22 @@ cmd_publish() {
   done
   _load_creds
   _load_manifest
+
+  # Publish promotes the last preview build, so a local edit that never
+  # reached a preview would be left out silently. Compare the files with what
+  # the last preview uploaded; a manifest without that record skips the check.
+  if [ "$force" = 0 ] && jq -e 'has("uploadedHashes")' .vibe-coded.json >/dev/null; then
+    local changed changed_count
+    local now_hashes
+    now_hashes=$(_local_file_hashes) || exit 1
+    changed=$(jq -cn --argjson was "$(jq -c .uploadedHashes .vibe-coded.json)" --argjson now "$now_hashes" \
+      '[($now | keys[]) as $p | select($was[$p] != $now[$p]) | $p] + [($was | keys[]) as $p | select($now[$p] == null) | $p] | unique')
+    changed_count=$(printf '%s' "$changed" | jq 'length')
+    if [ "$changed_count" -gt 0 ]; then
+      echo "Publish stopped: $(printf '%s' "$changed" | jq -r '.[0:5] | map(gsub("[\u0000-\u001f\u007f]"; "?")) | join(", ")')$([ "$changed_count" -gt 5 ] && echo " and $((changed_count - 5)) more") changed since the last vibe preview, so production would not include it. Run vibe preview first, or vibe publish --force to promote the last preview build anyway." >&2
+      exit 1
+    fi
+  fi
 
   # A build still in flight would make the platform wait on it; say so up front.
   # A failed build is the platform's call: it refuses only while the failed
@@ -1177,6 +1267,20 @@ cmd_publish() {
         exit 1
         ;;
     esac
+  fi
+  # Nothing new since the last publish: say so instead of promoting the same
+  # build again. Only when the newest build is that promotion (or the succeeded
+  # preview it serves): a newer failed preview is the platform's refusal to give.
+  local info preview_id production_id
+  if [ "$force" = 0 ] && info=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) && printf '%s' "$info" | jq -e '.success == true' >/dev/null 2>&1; then
+    preview_id=$(printf '%s' "$info" | jq -r '.vibe.previewBuildId // .previewBuildId // empty')
+    production_id=$(printf '%s' "$info" | jq -r '.vibe.productionBuildId // .productionBuildId // empty')
+    if [ -n "$production_id" ] && [ "$production_id" = "$preview_id" ] \
+       && { [ "$latest_env" = "production" ] || { [ "$latest_id" = "$preview_id" ] && [ "$latest_status" = "succeeded" ]; }; }; then
+      echo "Production already serves build $production_id; nothing new to publish. Edit, vibe preview, then vibe publish (or vibe publish --force to promote it again)."
+      _print_urls production
+      exit 0
+    fi
   fi
 
   echo "Publishing $USER_SLUG/$VIBE_SLUG to production..."
@@ -1204,7 +1308,7 @@ cmd_publish() {
       sleep "$interval"
       elapsed=$((elapsed + interval))
       [ "$elapsed" -ge 60 ] && interval=10
-      if ! build=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds/$promotion_id" 2>/dev/null); then
+      if ! build=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds/$promotion_id" 2>/dev/null); then
         _api_was_rate_limited "$build" && printf "  [%3ds] waiting (rate limited; retrying)\n" "$elapsed"
         continue
       fi
@@ -1232,10 +1336,15 @@ cmd_publish() {
   if [ "$HTTP" = "200" ] || [ "$HTTP" = "401" ]; then
     echo "Published!"
     local current visibility policy
-    current=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG") || current=""
-    visibility=$(echo "$current" | jq -r '(.vibe.visibility // .visibility) // empty')
-    policy=$(echo "$current" | jq -r '(.vibe.interactionPolicy // .interactionPolicy) // "unknown"')
-    if [ "$visibility" = "private" ]; then
+    # Reading the sharing settings is best effort: a refused lookup must not
+    # make a finished publish look failed.
+    current=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) || current=""
+    visibility=$(echo "$current" | jq -r '(.vibe.visibility // .visibility) // empty' 2>/dev/null) || visibility=""
+    policy=$(echo "$current" | jq -r '(.vibe.interactionPolicy // .interactionPolicy) // "unknown"' 2>/dev/null) || policy="unknown"
+    if [ -z "$visibility" ]; then
+      echo "Who can open it: the sharing settings could not be read just now; see $manage_url (private by default: anonymous requests get 401)."
+      [ "$HTTP" = "401" ] && open_url="$manage_url"
+    elif [ "$visibility" = "private" ]; then
       _print_private_access "$open_url" "$policy" "$manage_url"
       open_url="$manage_url"
     elif [ "$HTTP" = "401" ]; then
@@ -1245,7 +1354,7 @@ cmd_publish() {
   else
     echo "Warning: got HTTP $HTTP — may not be live yet"
   fi
-  echo "Visitors may see the previous build for up to a minute while caches expire."
+  echo "The new build reaches every edge within about ten seconds; a fetch in that window may still show the previous one."
   _print_urls production
   if [ "$open_after" = "1" ]; then
     _open_in_browser "$open_url" || echo "Open this in your browser: $open_url"
@@ -1374,6 +1483,7 @@ _status_fetch() {
   if [ "$(printf '%s' "$STATUS_BODY" | jq -r '.success // false' 2>/dev/null)" != "true" ]; then
     error=$(printf '%s' "$STATUS_BODY" | jq -r '.error // empty' 2>/dev/null) || error=""
     [ -n "$error" ] || error="invalid response from the API"
+    [ "$error" = "Vibe not found" ] && error="vibe $USER_SLUG/$VIBE_SLUG not found or not shared with you (vibe list shows yours)."
     echo "Status failed: $error" >&2
     exit 1
   fi
@@ -1513,6 +1623,20 @@ cmd_fetch() {
     echo "Error: fetch path cannot contain a newline." >&2
     exit 1
   fi
+  # An absolute URL is accepted only for this vibe's own hosts (checked once
+  # the manifest names them); any other host or scheme is refused, never
+  # silently fetched as "/" here.
+  local abs_host=""
+  if [[ "$path" =~ ^([Hh][Tt][Tt][Pp][Ss]?:)?//([^/?#]*)(.*)$ ]]; then
+    abs_host=$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')
+    path="${BASH_REMATCH[3]:-/}"
+    # The authority is already taken off, so leading slashes are path, not another host.
+    while [[ "$path" == //* ]]; do path="${path#/}"; done
+    [ -n "$abs_host" ] || { echo "Error: vibe fetch takes a path on this vibe, such as /api/items, not $1" >&2; exit 1; }
+  elif [[ "$path" =~ ^[A-Za-z][A-Za-z0-9+.-]*: ]]; then
+    echo "Error: vibe fetch takes a path on this vibe, such as /api/items, not a $path URL." >&2
+    exit 1
+  fi
   # Keep the request on this host and resolve dot segments before displaying it.
   # Only the pathname is normalized; the query is sent as typed. Interior empty
   # segments are kept so /api//items still names that route.
@@ -1532,6 +1656,15 @@ cmd_fetch() {
 
   _load_creds
   _load_manifest
+  if [ -n "$abs_host" ]; then
+    case "$abs_host" in
+      "${USER_SLUG}--${VIBE_SLUG}.vibe-coded.ai") env="production" ;;
+      "p--${USER_SLUG}--${VIBE_SLUG}.vibe-coded.ai") env="preview" ;;
+      *)
+        echo "Error: vibe fetch reaches only this vibe (https://${USER_SLUG}--${VIBE_SLUG}.vibe-coded.ai or https://p--${USER_SLUG}--${VIBE_SLUG}.vibe-coded.ai); $abs_host is another site. Use curl for it." >&2
+        exit 1 ;;
+    esac
+  fi
   local prefix=""
   echo "→ $USER_SLUG/$VIBE_SLUG ($env)" >&2
   [ "$env" = "preview" ] && prefix="p--"
@@ -1559,7 +1692,12 @@ cmd_fetch() {
     END { print type }
   ' "$headers")
   if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
-    if [ "$http_status" = "401" ]; then _login_expired || true; fi
+    # The platform's own gate answers 401 as {"error":"Authentication required"}
+    # (on /mcp as the JSON-RPC envelope {"error":{"message":"Authentication required"}},
+    # to a browser as its "Authentication Required" sign-in page); any other 401
+    # is the vibe's worker refusing the request on its own terms.
+    if [ "$http_status" = "401" ] && { jq -e '(.error | if type == "object" then .message else . end) == "Authentication required"' "$out" >/dev/null 2>&1 \
+        || { [[ "$content_type" == text/html ]] && grep -q '<title>Authentication Required</title>' "$out" && grep -q 'https://vibe-coded.ai/login?redirect=' "$out"; }; }; then _login_expired || true; fi
     echo "Error: request to $url failed (HTTP $http_status)" >&2
     local body_size
     case "$content_type" in
@@ -1750,6 +1888,7 @@ cmd_connect() {
 
   if [ "$print_only" = "1" ] || [ "$has_claude" = "0" ]; then
     echo "Created a connection token for $CONNECT_OWNER/$VIBE_SLUG. Revoke it with: $again --revoke"
+    echo "The token below is a secret: it acts as you on this vibe until it expires. Keep it out of files you share." >&2
     [ "$has_claude" = "0" ] && echo "Claude Code ('claude') is not on PATH. Run this where it is:"
     echo ""
     echo "  claude mcp add --transport http -s user $name $url --header \"Authorization: Bearer $token\""
@@ -1822,7 +1961,7 @@ cmd_logs() {
       machine_build=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds/$machine_id") || exit 1
       if printf '%s' "$machine_build" | jq -e --argjson id "$machine_id" '.success == true and .build.id == $id' >/dev/null; then
         build_id="$machine_id"
-        echo "showing build $build_id (the last one started from this machine); vibe logs <id> for another"
+        echo "showing build $build_id, the last preview build started from this machine (a publish promotes it; promotions have no lines of their own); vibe logs <id> for another"
       elif ! printf '%s' "$machine_build" | jq -e '(._originalError // .error) == "Build not found"' >/dev/null; then
         _check_success "$machine_build" "Build lookup"
         exit 1
@@ -1830,7 +1969,8 @@ cmd_logs() {
     fi
   fi
   if [ -z "$build_id" ]; then
-    latest=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds?limit=1")
+    latest=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds?limit=1") || exit 1
+    _check_success "$latest" "Logs"
     build_id=$(echo "$latest" | jq -r '.builds[0].id // empty')
     if [ -z "$build_id" ]; then
       echo "No builds found." >&2
@@ -1854,10 +1994,16 @@ cmd_logs() {
     [ "$latest_env" = "production" ] && latest_id="$build_id"
   fi
   # A production promotion has no lines of its own; the lines live on the
-  # preview build it promoted, which is the newest preview.
+  # preview build it promoted. The promotion row copies that build's
+  # sourceHash, which picks it out among the previews that predate it.
   if [ -n "${latest_id:-}" ] && [ "$latest_env" = "production" ] && [ "$(echo "$result" | jq '.lines | length')" = "0" ]; then
-    candidate=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds?environment=preview&limit=1" | jq -r '.builds[0].id // empty')
-    if [ -n "$candidate" ]; then
+    local promo_hash
+    promo_hash=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds/$latest_id" 2>/dev/null | jq -r '.build.sourceHash // empty' 2>/dev/null) || promo_hash=""
+    candidate=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds?environment=preview&limit=100" \
+      | jq -r --arg h "$promo_hash" --argjson id "$latest_id" '[.builds[] | select(.status == "succeeded" and .id < $id and $h != "" and .sourceHash == $h)] | .[0].id // empty')
+    if [ -z "$candidate" ]; then
+      echo "Build $latest_id is a production promotion (no lines of its own); vibe logs <preview build id> shows the build it promoted (vibe status lists them)."
+    else
       candidate_result=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds/$candidate/logs")
       if echo "$candidate_result" | jq -e '.success == true and (.lines | type == "array")' >/dev/null; then
         build_id="$candidate"
@@ -1882,8 +2028,10 @@ cmd_settings() {
   local manage_url="$WEB_BASE/account?vibe=$VIBE_SLUG&panel=settings"
 
   if [ $# -eq 0 ]; then
-    _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" \
-      | _print_settings
+    local info
+    info=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG") || exit 1
+    _check_success "$info" "Settings"
+    printf '%s' "$info" | _print_settings
     echo "Visibility, interaction policy, sharing and delete: $manage_url"
     return
   fi
@@ -2432,7 +2580,7 @@ USAGE
       fi
       local body; body=$(jq -n --arg k "$key" --arg environment "$environment" --argjson ttl "${ttl:-120}" '{key: $k, ttl: $ttl, environment: $environment}')
       local mint; mint=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/download-url" -d "$body")
-      _check_success "$mint" "R2 download-url mint"
+      _check_success "$mint" "R2 download"
       local url; url=$(echo "$mint" | jq -r '.url')
       local http_code; http_code=$(curl -s -o "$to" -w "%{http_code}" "$url")
       if [ "$http_code" != "200" ]; then
@@ -2460,13 +2608,16 @@ USAGE
       fi
       local body; body=$(jq -n --arg k "$key" --arg environment "$environment" --argjson ttl "${ttl:-120}" '{key: $k, ttl: $ttl, environment: $environment}')
       local mint; mint=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/download-url" -d "$body")
-      _check_success "$mint" "R2 url mint"
+      _check_success "$mint" "R2 url"
       echo "$mint" | jq -r '.url'
-      echo "$mint" | jq -r '"Expires at: \(.expiresAt)"'
+      local expires_at expires_iso
+      expires_at=$(echo "$mint" | jq -r '.expiresAt')
+      expires_iso=$(date -u -r "$expires_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$expires_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || expires_iso=""
+      echo "Expires at: ${expires_iso:-$expires_at} (in $((expires_at - $(date +%s))) seconds)"
       ;;
 
     ls|list)
-      # vibe r2 ls [--prefix <p>] [--limit <n>]  — paginates via cursor to list ALL objects
+      # vibe r2 ls [prefix] [--prefix <p>] [--limit <n>]  — paginates via cursor to list ALL objects
       local prefix="" limit=""
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -2474,7 +2625,10 @@ USAGE
             [ $# -ge 2 ] || { echo "Error: $1 requires a value" >&2; exit 1; }
             case "$1" in --prefix) prefix="$2" ;; --limit) limit="$2" ;; esac
             shift 2 ;;
-          *) echo "Unknown flag: $1" >&2; exit 1 ;;
+          -*) echo "Unknown flag: $1" >&2; exit 1 ;;
+          *)
+            [ -z "$prefix" ] || { echo "Error: one prefix only (got '$prefix' and '$1')." >&2; exit 1; }
+            prefix="$1"; shift ;;
         esac
       done
       if [ -n "$limit" ] && ! printf '%s' "$limit" | grep -Eq '^[1-9][0-9]*$'; then
@@ -2618,7 +2772,9 @@ NODE
       || { echo "Error: npm install failed in $skill_dir." >&2; exit 1; }
   fi
 
-  exec node "$skill_dir/runtime/dev-server.mjs" "$@"
+  # The process keeps "vibe dev <args>" as its name, so pkill -f "vibe dev"
+  # and pkill -f "vibe dev --port N" both find it.
+  exec -a "vibe dev${*:+ $*}" node "$skill_dir/runtime/dev-server.mjs" "$@"
 }
 
 _print_command_help() {
@@ -2674,7 +2830,7 @@ _print_command_help() {
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
     dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] | vibe dev seed <file.sql>" "Run the worker and local storage offline; --reset clears local state." "On first run, installs miniflare, esbuild and chokidar with npm in the skill directory." ;;
     preview|deploy) printf '%s\n' "Usage: vibe preview [--prune|--no-prune]" "Mirror local source to preview and wait for its build." ;;
-    publish) printf '%s\n' "Usage: vibe publish [--open]" "Promote the live preview build to production. --open opens the app, or its sharing page while it is private, in your browser." ;;
+    publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." ;;
     urls) printf '%s\n' "Usage: vibe urls" "Print preview and production app/MCP endpoints." ;;
     fetch) printf '%s\n' "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" "Fetch a deployed route as the owner, including from a private vibe. GET by default; --header is repeatable. The platform's header allowlist still applies." "--headers (-i) prints the status line and all response headers except cookies before the body." ;;
@@ -2725,6 +2881,12 @@ _update_notice() {
   latest="${latest%%[[:space:]]*}"
   [[ "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 0
   if _version_newer "$latest" "$current"; then
+    # Once a day per version: the stamp names the version it announced.
+    local stamp="$HOME/.vibe-coded/update-notified"
+    if [ -f "$stamp" ] && [ "$(head -c 32 "$stamp" 2>/dev/null)" = "$latest" ] && [ -n "$(find "$stamp" -mtime -1 2>/dev/null)" ]; then
+      return 0
+    fi
+    mkdir -p "$HOME/.vibe-coded" 2>/dev/null && printf '%s' "$latest" > "$stamp" 2>/dev/null || true
     echo "vibe $latest is available (you have $current). Update: curl -fsSL $WEB_BASE/install.sh | sh" >&2
   fi
   return 0
@@ -2794,7 +2956,7 @@ case "${1:-help}" in
     echo "  publish [--open]             Promote preview to production (--open: app or sharing page in the browser)"
     echo "  status [--plan]              Show vibe info + recent builds"
     echo "  urls                         Show all endpoints (app, MCP)"
-    echo "  fetch <path> [--preview] [--headers|-i]  Fetch a live page/asset as the owner"
+    echo "  fetch <path> [--preview] [-i] [--method M] [--header 'K: V'] [--data D]  Fetch a live route as the owner"
     echo "  call <tool> [json] [--preview]  Call one MCP tool on the live vibe as you"
     echo "  connect [<owner>/<slug>] [--name N] [--print|--revoke]  Connect Claude Code to a vibe's tools (yours or shared)"
     echo "  logs [build-id]              Show build logs (latest if omitted)"

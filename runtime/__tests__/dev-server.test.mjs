@@ -234,6 +234,7 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     'elif [[ "$method" = GET && "$url" == https://*"tester--demo.vibe-coded.ai"* ]]; then',
     '  code=200; body="<h1>private owner view</h1>"',
     '  [ "$VIBE_TEST_SCENARIO" = fetch401 ] && { code=401; body="{\\"error\\":\\"Authentication required\\"}"; }',
+    '  [ "$VIBE_TEST_SCENARIO" = fetch401worker ] && { code=401; body="{\\"success\\":false,\\"error\\":\\"invalid or missing X-Webhook-Token\\"}"; }',
     '  [ "$VIBE_TEST_SCENARIO" = fetch404 ] && { code=404; body="Not found"; }',
     '  if [ -n "$outfile" ]; then printf "%s\\n" "$body" > "$outfile"; else printf "%s\\n" "$body"; fi',
     '  if [ -n "$writeout" ]; then printf "%s" "$code"; fi',
@@ -1352,6 +1353,34 @@ test('vibe fetch says the login expired on 401 and reports other HTTP errors', (
   assert.equal(missing.status, 1);
   assert.match(missing.stderr, /HTTP 404/);
   assert.equal(missing.stdout, '');
+
+  // The worker's own 401 is the vibe refusing the request, not a lost login.
+  const worker = runCli('fetch', ['/webhook', '--header', 'X-Webhook-Token: wrong'], 'fetch401worker');
+  assert.equal(worker.status, 1);
+  assert.match(worker.stderr, /HTTP 401/);
+  assert.doesNotMatch(worker.stderr, /login expired/);
+});
+
+test('vibe fetch accepts an absolute URL only on this vibe\'s own hosts', () => {
+  const own = runCli('fetch', ['https://tester--demo.vibe-coded.ai/api/items?x=1']);
+  assert.equal(own.status, 0, own.stderr);
+  assert.match(own.calls, /^GET\thttps:\/\/tester--demo\.vibe-coded\.ai\/api\/items\?x=1\t/m);
+
+  const preview = runCli('fetch', ['https://p--tester--demo.vibe-coded.ai/']);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stderr, /\(preview\)/);
+  assert.match(preview.calls, /^GET\thttps:\/\/p--tester--demo\.vibe-coded\.ai\/\t/m);
+
+  const other = runCli('fetch', ['https://someone--else.vibe-coded.ai/']);
+  assert.equal(other.status, 1);
+  assert.match(other.stderr, /reaches only this vibe/);
+  assert.match(other.stderr, /someone--else\.vibe-coded\.ai is another site/);
+  assert.equal(other.calls, '');
+
+  const scheme = runCli('fetch', ['javascript:alert(1)']);
+  assert.equal(scheme.status, 1);
+  assert.match(scheme.stderr, /takes a path on this vibe/);
+  assert.equal(scheme.calls, '');
 });
 
 test('vibe preview names each rejected file instead of "unknown"', () => {
@@ -1562,7 +1591,7 @@ test('vibe r2 url warns about the 120s cap and prints the actual expiry', () => 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stderr, /TTL is capped at 120 seconds/);
   assert.match(result.stdout, /https:\/\/signed\.invalid\/object/);
-  assert.match(result.stdout, /Expires at: 1770000120/);
+  assert.match(result.stdout, /Expires at: 2026-02-02T02:42:00Z \(in -?\d+ seconds\)/);
   assert.match(result.calls, /"ttl": 3600/);
 });
 
