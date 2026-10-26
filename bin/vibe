@@ -1041,6 +1041,12 @@ cmd_preview() {
         echo "Error: Remote source listing failed; no files were pruned." >&2
         exit 1
       fi
+      # A refused or failed request (5xx, timeout) is an error to report as
+      # such and retry, not a malformed listing.
+      if printf '%s' "$list_result" | jq -e '(.success == false) or (.error != null)' >/dev/null 2>&1; then
+        echo "Error: could not read the remote file list ($(printf '%s' "$list_result" | jq -r '.error // "server error"' | head -c 200)). Nothing was uploaded; run vibe preview again." >&2
+        exit 1
+      fi
       if ! printf '%s' "$list_result" | jq -e '
         (.success == true) and
         ((.files | type) == "array") and
@@ -1207,9 +1213,11 @@ cmd_preview() {
       echo "Build succeeded!"
       echo "The preview reaches every edge within about ten seconds; a fetch in that window may still show the previous build."
       _print_urls preview
-      # Surface the tool count here, not only in 'vibe status'.
-      vibe_info=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG")
-      _print_tool_count "$vibe_info" 1 preview
+      # Surface the tool count here, not only in 'vibe status'. The lookup is
+      # best effort: the build already succeeded, so a failed read stays quiet.
+      if vibe_info=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null); then
+        _print_tool_count "$vibe_info" 1 preview
+      fi
       echo "  Run 'vibe publish' to go live."
       exit 0
     elif [ "$STATUS" = "failed" ]; then
@@ -1297,7 +1305,7 @@ cmd_publish() {
   pending_msg=$(echo "$RESULT" | jq -r 'select((.success // false) != true) | .error // empty' 2>/dev/null) || pending_msg=""
   if [[ "$pending_msg" =~ ^Production\ promotion\ ([0-9]+)\ is\ still\ in\ progress ]]; then
     promotion_id="${BASH_REMATCH[1]}"
-    echo "Your promotion $promotion_id is still running; waiting…"
+    echo "Promotion $promotion_id is taking longer than 25 seconds; still waiting…"
     printf "  [%3ds] publishing\n" 0
     local elapsed=0 interval=5 max_wait=600 build status
     while :; do
@@ -1542,15 +1550,22 @@ cmd_call() {
   if echo "$payload" | jq -e '.error' >/dev/null 2>&1; then
     local msg
     msg=$(echo "$payload" | jq -r '.error | if type == "object" then (.message // tostring) else tostring end')
-    # The production host answers "Vibe not found" both for a vibe that does
-    # not exist and for one that has no production build yet. Only the
-    # second case gets the publish hint, so the vibe is looked up first.
-    if [ "$env" = "production" ] && [ "$msg" = "Vibe not found" ]; then
-      local info
-      info=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) || info=""
-      if printf '%s' "$info" | jq -e '.success == true and ((.vibe.productionBuildId // .productionBuildId) == null)' >/dev/null 2>&1; then
-        echo "Error: $USER_SLUG/$VIBE_SLUG has no production build yet. Run: vibe publish — or add --preview to call the preview build." >&2
+    # Both hosts answer "Vibe not found" for a vibe that does not exist and
+    # for one with no build in that environment yet, so the vibe is looked up
+    # to tell the two apart.
+    if [ "$msg" = "Vibe not found" ]; then
+      local info build_field
+      [ "$env" = "production" ] && build_field=productionBuildId || build_field=previewBuildId
+      info=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) || info=""
+      if printf '%s' "$info" | jq -e --arg f "$build_field" '.success == true and ((.vibe[$f] // .[$f]) == null)' >/dev/null 2>&1; then
+        if [ "$env" = "production" ]; then
+          echo "Error: $USER_SLUG/$VIBE_SLUG has no production build yet. Run: vibe publish — or add --preview to call the preview build." >&2
+        else
+          echo "Error: $USER_SLUG/$VIBE_SLUG has no preview build yet. Run: vibe preview" >&2
+        fi
         exit 1
+      elif printf '%s' "$info" | jq -e '.success == false' >/dev/null 2>&1; then
+        msg="vibe $USER_SLUG/$VIBE_SLUG not found or not shared with you (vibe list shows yours)."
       fi
     fi
     echo "Error: $msg" >&2

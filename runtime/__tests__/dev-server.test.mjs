@@ -198,7 +198,9 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     '    printf \'%s\\n\' \'{"success":true,"buildSkipped":true}\'',
     '  fi',
     'elif [[ "$method" = GET && "$url" == *"/source?limit=1000"* ]]; then',
-    '  if [ "$VIBE_TEST_SCENARIO" = invalid ]; then',
+    '  if [ "$VIBE_TEST_SCENARIO" = listtimeout ]; then',
+    '    printf \'%s\\n\' \'{"success":false,"error":"Request timeout"}\'',
+    '  elif [ "$VIBE_TEST_SCENARIO" = invalid ]; then',
     '    printf \'not-json\\n\'',
     '  else',
     '    printf \'%s\\n\' "$VIBE_TEST_LIST_RESPONSE"',
@@ -1285,6 +1287,14 @@ test('vibe preview requires --prune when more than 20 remote files would be remo
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Pruning would remove 21 of 47 remote source files/);
   assert.doesNotMatch(result.calls, /^DELETE\t/m);
+});
+
+test('vibe preview reports a failed listing request as an error to retry, not an invalid listing', () => {
+  const result = runPreview([], 'listtimeout');
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /could not read the remote file list \(Request timeout\)\. Nothing was uploaded; run vibe preview again\./);
+  assert.doesNotMatch(result.stderr, /listing was invalid/);
+  assert.doesNotMatch(result.calls, /^(DELETE|POST)\t/m);
 });
 
 test('vibe preview fails closed when the remote source listing is invalid', () => {
