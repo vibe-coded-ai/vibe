@@ -216,6 +216,7 @@ Details and examples (including running SQL against a live vibe):
 - Worker responses are `{ success: true, data }` or `{ success: false, error }`.
 - The frontend calls the worker with relative `/api/` paths, never absolute URLs.
 - Create SQL tables in code (`CREATE TABLE IF NOT EXISTS`); preview starts empty.
+  Any Pro vibe can switch to SQL: use `env.VIBE_D1` and rebuild.
 - **KV `list()` lags new writes by up to a minute.** Don't build a list tool on
   `list()` alone; use the pattern in `references/platform-patterns.md` (the
   templates do), or use SQL.

@@ -654,6 +654,8 @@ cmd_init() {
     existing_storage=$(echo "$existing" | jq -r '(.vibe // .).storageType // "kv"')
     if [ -n "$template" ] && [ "$existing_storage" != "$storage" ]; then
       echo "Note: $slug uses $existing_storage storage; template '$template' expects $storage." >&2
+    elif [ -n "$storage_flag" ] && [ "$storage_flag" != "$existing_storage" ]; then
+      echo "Note: --storage ${storage_flag/d1/sql} was ignored; $slug keeps its recorded storage (${existing_storage/d1/sql}). On Pro, a worker that uses env.VIBE_D1 gets SQL on its next vibe preview." >&2
     fi
     storage="$existing_storage"
     echo "Using your existing vibe: $USER_SLUG/$slug"

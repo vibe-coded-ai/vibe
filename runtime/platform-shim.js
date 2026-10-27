@@ -146,7 +146,7 @@ const als = new AsyncLocalStorage();
 let _userWorker;
 
 const WRITE_ACCESS_DENIED = 'Write access denied: this connection has read-only access to this vibe';
-const D1_ENTITLEMENT_REQUIRED = 'SQL storage (env.VIBE_D1) is unavailable for this vibe. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use KV storage, or configure this vibe for SQL after upgrading."';
+const D1_ENTITLEMENT_REQUIRED = 'SQL storage (env.VIBE_D1) is unavailable for this vibe. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use KV storage", or after upgrading edit any file and build again (vibe preview or push_source); a build of unchanged source is skipped.';
 
 class D1EntitlementError extends Error {
   constructor() {
