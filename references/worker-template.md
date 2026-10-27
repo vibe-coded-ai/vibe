@@ -56,8 +56,9 @@ export default {
 
 ## Rules
 
-`@param` types are checked by the platform before the worker runs; a wrong type
-is refused with `Argument 'x' must be ...`.
+On MCP and `vibe call`, `@param` types are checked by the platform before the
+worker runs; a wrong type is refused with `Argument 'x' must be ...`. A direct
+HTTP request to `/api/<name>` reaches the worker unchecked.
 
 - One root file, `./worker.js` or `./worker.ts`. Local modules and npm packages
   that run on Cloudflare Workers are fine; Node-only modules (`fs`,

@@ -1306,8 +1306,8 @@ cmd_publish() {
   if [[ "$pending_msg" =~ ^Production\ promotion\ ([0-9]+)\ is\ still\ in\ progress ]]; then
     promotion_id="${BASH_REMATCH[1]}"
     echo "Promotion $promotion_id is taking longer than 25 seconds; still waiting…"
-    printf "  [%3ds] publishing\n" 0
-    local elapsed=0 interval=5 max_wait=600 build status
+    printf "  [%3ds] publishing\n" 25
+    local elapsed=25 interval=5 max_wait=600 build status
     while :; do
       if [ "$elapsed" -ge "$max_wait" ]; then
         echo "Still publishing (promotion $promotion_id). Production switches when it finishes; run 'vibe status' in a minute." >&2
@@ -2711,7 +2711,8 @@ cmd_dev() {
   type=$(jq -r '.type // "fullstack"' .vibe-coded.json)
   storage=$(jq -r '.storage // "kv"' .vibe-coded.json)
 
-  if [ "$type" = "static" ]; then
+  # Templates record "static", but a root worker added later still needs the server.
+  if [ "$type" = "static" ] && [ ! -f worker.js ] && [ ! -f worker.ts ]; then
     echo "Static vibe — open directly in your browser (no server needed):"
     echo "  file://$(pwd)/index.html"
     return
