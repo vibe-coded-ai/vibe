@@ -106,6 +106,8 @@ no subqueries or `WITH`. Vibes on the older shared database name tables
 
 ## Files (`env.VIBE_R2`, Pro or Pro+)
 
+On Free, `env.VIBE_R2` is undefined; a worker that may run on Free checks it before use.
+
 Static/source uploads accept only web asset extensions (html, htm, css, js, mjs, ts/tsx/jsx, vue, svelte, json/xml/yaml/yml/toml/csv/tsv, images, fonts, md/txt/pdf, gitignore/npmrc/nvmrc, lock/map) and named extensionless project files; any other file type goes to R2 and is served from `/files/<key>`.
 
 In the worker:
@@ -160,7 +162,8 @@ invoke them with call_tool. For an operation the worker does not expose, add an
 From a terminal with the CLI installed and signed in, use `vibe r2 upload|download|ls|rm|url` (MCP: expose a worker tool and invoke it with call_tool).
 These default to production's files; add `--preview` for the preview tree.
 The preview host serves the preview tree and the production host the production tree; upload to both when a page needs the file in both.
-`vibe r2 usage` (MCP: usage) reports storage usage shared across both trees.
+`vibe r2 usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; `usage` storage counts KV only.
+Signed uploads count at once; files the worker writes with `put()` count within the hour.
 
 **Check a private vibe with curl:** the token in `~/.vibe-coded/credentials.json`
 works on the vibe host as `Authorization: Bearer <token>`, the same as the API.

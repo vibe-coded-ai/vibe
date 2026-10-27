@@ -176,7 +176,7 @@ _api() {
     # cap or a long Retry-After is the caller's to report.
     if [ "${_API_RETRIED:-0}" = 0 ] && [ "${WAIT_FOR_BUILD_LIMIT:-0}" != 1 ] && [ "${_API_NO_RETRY:-0}" != 1 ] \
        && [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -le 5 ] && ! _is_build_limit_error "$body" 2>/dev/null; then
-      echo "Too many requests; retrying in $retry_after seconds…" >&2
+      echo "Too many requests; retrying in $retry_after second$([ "$retry_after" = 1 ] || echo s)…" >&2
       sleep "$retry_after"
       _API_RETRIED=1 _api "$method" "$path" "$@"
       return
@@ -790,7 +790,7 @@ cmd_source() {
     if [ "$http_status" = "429" ]; then
       local retry_after; retry_after=$(awk 'tolower($1) == "retry-after:" { value = $2; sub(/\r$/, "", value) } END { print value }' "$hdrs")
       rm -f "$out" "$hdrs"
-      if [[ "$retry_after" =~ ^[0-9]+$ ]]; then echo "Too many requests; try again in $retry_after seconds." >&2; else echo "Too many requests; try again later." >&2; fi
+      if [[ "$retry_after" =~ ^[0-9]+$ ]]; then echo "Too many requests; try again in $retry_after second$([ "$retry_after" = 1 ] || echo s)." >&2; else echo "Too many requests; try again later." >&2; fi
       exit 1
     fi
     rm -f "$hdrs"
@@ -1164,7 +1164,7 @@ cmd_preview() {
   listed_count=$(printf '%s' "$listed" | jq 'length')
   if jq -e '(.scripts.build // empty) | type == "string"' package.json >/dev/null 2>&1 \
      || jq -e '(.build // empty) | type == "string"' vibe.json >/dev/null 2>&1; then
-    echo "Uploaded $count files ($listed_count $file_access if the build writes no dist/). The platform runs your build and serves only its dist/ output:"
+    echo "Uploaded $count files. The platform runs your build and serves only its dist/ output; if the build writes no dist/, these $listed_count are $file_access:"
   else
     echo "Uploaded $count files ($listed_count $file_access). With no build step, the paths below can be served (any the worker imports are bundled and not served):"
   fi
@@ -1454,7 +1454,7 @@ cmd_status() {
     echo "  (none — run 'vibe preview' to deploy)"
   fi
   echo ""
-  if [ -n "$has_preview" ]; then echo "Preview:" && _print_urls preview; fi
+  if [ -n "$has_preview" ]; then _print_urls preview; fi
   if [ -n "$has_prod" ]; then echo "Production:" && _print_urls production; fi
   if [ -z "$has_preview" ] && [ -z "$has_prod" ]; then echo "  (no deployments yet — run 'vibe preview' to deploy)"; fi
 }
@@ -1513,6 +1513,7 @@ cmd_call() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --preview) env="preview"; shift ;;
+      -*) echo "Unknown flag: $1. Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--preview]" >&2; exit 1 ;;
       *)
         if [ -z "$tool" ]; then tool="$1"; else args="$1"; fi
         shift ;;
@@ -1523,7 +1524,7 @@ cmd_call() {
     exit 1
   fi
   if ! echo "$args" | jq -e 'type == "object"' >/dev/null 2>&1; then
-    echo "Error: arguments must be a JSON object, e.g. '{\"text\":\"hello\"}'" >&2
+    echo "Error: arguments must be one JSON object of the tool's parameters, e.g. '{\"name\":\"value\"}'" >&2
     exit 1
   fi
   _load_creds
@@ -1959,7 +1960,6 @@ cmd_urls() {
   _check_success "$info" "URLs"
   production_build=$(echo "$info" | jq -r '.vibe.productionBuildId // .productionBuildId // empty')
 
-  echo "Preview:"
   _print_urls preview
   if [ -n "$production_build" ]; then
     echo "Production:"
@@ -2507,15 +2507,15 @@ USAGE
   _load_creds
   _load_manifest
 
-  # R2 is paid-plan only (Pro, Pro+). The API lets Free list an empty bucket but rejects every
-  # write, so a Free user only finds out after writing R2 code. Say it first.
-  # Fail closed if the plan cannot be verified; continuing would treat an
-  # unknown entitlement as paid and defer to a less clear R2 API failure.
+  # R2 writes are paid-plan only (Pro, Pro+); reads and deletes stay open so a
+  # downgraded owner can retrieve or remove files. Say the write gate before
+  # an upload. Fail closed if the plan cannot be verified; continuing would
+  # treat an unknown entitlement as paid and defer to a less clear R2 API failure.
   local current_plan
-  if ! current_plan=$(_current_plan); then
+  if [ "$sub" = "upload" ] && ! current_plan=$(_current_plan); then
     exit 1
   fi
-  if [ "$current_plan" = "free" ]; then
+  if [ "$sub" = "upload" ] && [ "$current_plan" = "free" ]; then
     # Reads stay open on Free; the write gate is rendered by the upload-url
     # endpoint before it validates the body, so an empty request returns it.
     RESULT=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/upload-url" -d '{}')
@@ -2865,7 +2865,7 @@ _print_command_help() {
     settings) printf '%s\n' "Usage: vibe settings [--title T] [--visibility private|unlisted|public] [--interaction public|public_read|authenticated|invite_only]" "View settings or update the title; exposure changes are web-only and exit non-zero." ;;
     access) printf '%s\n' "Usage: vibe access list|grant|update|revoke|revoke-all [args]" "List access in the CLI; owner-only mutations are completed on the website." ;;
     secrets) printf '%s\n' "Usage: vibe secrets list|create|update|delete|audit [NAME]" "Manage write-only worker secrets (Pro)." ;;
-    r2) printf '%s\n' "Usage: vibe r2 upload|download|url|ls|rm|usage [args]" "Manage files in the current vibe's R2 namespace (Pro)." \
+    r2) printf '%s\n' "Usage: vibe r2 upload|download|url|ls|rm|usage [args]" "Manage files in the current vibe's R2 namespace. Uploading needs Pro; on Free you can still list, download and delete kept files." \
           "  upload <path> --key <key>     download <key> --to <path>     url <key>" \
           "  ls [prefix]                   rm <key>                       usage" \
           "--preview selects the preview tree; the preview host serves the preview tree, the production host the production tree; upload to both when a page needs the file in both." \
@@ -2988,7 +2988,7 @@ case "${1:-help}" in
     echo "  settings [--title T] ...     View or update vibe settings"
     echo "  access list                  List collaborators (changes on the website)"
     echo "  secrets list|create|update|delete|audit [NAME]  Manage secrets (Pro)"
-    echo "  r2 upload|download|ls|...    Manage R2 file storage (Pro)"
+    echo "  r2 upload|download|ls|...    Manage R2 file storage (upload: Pro)"
     echo "  delete                       Link to delete on the website"
     echo "  --version                    Print the CLI version"
     echo ""

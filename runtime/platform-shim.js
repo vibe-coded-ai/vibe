@@ -690,7 +690,8 @@ export function createPrefixedR2(bucket, vibeId, env) {
 // Enforcement is applied ONLY when the DB is dedicated (D1_DEDICATED === '1');
 // the shared-DB path stays platform-metered. Reads and recovery verbs
 // (DELETE/DROP/VACUUM) are always allowed so an over-cap vibe can shrink back
-// under. Growth verbs (INSERT/UPDATE/CREATE/…) are rejected when over cap.
+// under, and idempotent schema DDL is a no-op over cap. Growth verbs
+// (INSERT/UPDATE/CREATE/…) are rejected when over cap.
 
 /**
  * Leading D1/SQLite keywords that CANNOT grow storage — reads + the recovery
@@ -898,12 +899,16 @@ export function createMeteredD1(db, opts) {
     return overQuotaFlag;
   }
 
+  async function isOverCap() {
+    await ensureSizeKnown();
+    const localOver = lastKnownBytes !== null && lastKnownBytes >= cap;
+    return localOver || await isOverQuotaFlag();
+  }
+
   // Throw if we're over either cap. No classification — callers decide whether
   // the operation can grow storage before invoking this.
   async function enforceIfOverCap() {
-    await ensureSizeKnown();
-    const localOver = lastKnownBytes !== null && lastKnownBytes >= cap;
-    if (localOver || await isOverQuotaFlag()) {
+    if (await isOverCap()) {
       throw new Error('D1 storage quota exceeded for this vibe');
     }
   }
@@ -936,33 +941,39 @@ export function createMeteredD1(db, opts) {
       denyReadOnlyWrite();
       return false;
     };
+    // Quota gate for a growth statement. Over cap, idempotent schema DDL is a
+    // no-op rather than a refusal, for the same reason as in read mode: tools
+    // call _ensureTable() before a DELETE, and the DELETE is how an over-cap
+    // vibe shrinks. Returns true when the caller should return the no-op result.
+    const overCapNoop = async () => {
+      if (!isGrowth) return false;
+      if (isIdempotentDdl) return isOverCap();
+      await enforceIfOverCap();
+      return false;
+    };
     const wrapped = {
       _sql: sql, // for debugging/tests only — NOT trusted for classification
       bind(...args) {
         return wrapStatement(realStmt.bind(...args), sql, { isRead, isGrowth, isIdempotentDdl });
       },
       async run() {
-        if (readModeNoop()) return _readModeDdlNoopResult();
-        if (isGrowth) await enforceIfOverCap();
+        if (readModeNoop() || await overCapNoop()) return _readModeDdlNoopResult();
         const r = await realStmt.run();
         absorb(r, true); // write: refresh size + maybe report to platform
         return r;
       },
       async all() {
-        if (readModeNoop()) return _readModeDdlNoopResult();
-        if (isGrowth) await enforceIfOverCap();
+        if (readModeNoop() || await overCapNoop()) return _readModeDdlNoopResult();
         const r = await realStmt.all();
         absorb(r, false); // .all() is typically a read; don't trigger a report
         return r;
       },
       async first(colName) {
-        if (readModeNoop()) return null;
-        if (isGrowth) await enforceIfOverCap();
+        if (readModeNoop() || await overCapNoop()) return null;
         return realStmt.first(colName);
       },
       async raw(rawOpts) {
-        if (readModeNoop()) return [];
-        if (isGrowth) await enforceIfOverCap();
+        if (readModeNoop() || await overCapNoop()) return [];
         return realStmt.raw(rawOpts);
       },
     };
@@ -1007,8 +1018,24 @@ export function createMeteredD1(db, opts) {
         if (metas.some(function (meta) { return !meta || !meta.isRead; })) {
           denyReadOnlyWrite();
         }
-        if (metas.some(function (meta) { return !meta || meta.isGrowth; })) {
+        if (metas.some(function (meta) { return !meta || (meta.isGrowth && !meta.isIdempotentDdl); })) {
           await enforceIfOverCap();
+        }
+        // Over cap, idempotent DDL slots get the no-op result, as for a single
+        // statement; the rest of the batch runs in order.
+        const skipDdl = metas.some(function (meta) { return meta && meta.isIdempotentDdl; }) && await isOverCap();
+        const runIdx = [];
+        list.forEach(function (_s, i) {
+          if (!(skipDdl && metas[i].isIdempotentDdl)) runIdx.push(i);
+        });
+        if (runIdx.length < list.length) {
+          const out = list.map(function () { return _readModeDdlNoopResult(); });
+          if (runIdx.length) {
+            const ran = await target.batch(runIdx.map(function (i) { return metas[i].realStmt; }));
+            runIdx.forEach(function (i, j) { out[i] = ran[j]; });
+            absorb(ran[ran.length - 1], true);
+          }
+          return out;
         }
         const reals = list.map(function (s, i) {
           return metas[i] ? metas[i].realStmt : s;

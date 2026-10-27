@@ -96,7 +96,8 @@ over hand-written files.
 ## 3. Path B — a site or a web app
 
 - **Site:** `vibe init --template site <slug>`, edit `index.html`, `vibe preview`,
-  check it with `vibe fetch / --preview`, then `vibe publish`.
+  check it with `vibe fetch / --preview`, then `vibe publish`. For `/api`
+  endpoints, add a root `worker.js` from `references/worker-template.md`.
 - **Web app (Vue/Vite):** `vibe init --template vue <slug>`, edit the starter
   (see `references/vue-template.md`), and add a root `worker.ts` from
   `references/worker-template.md` if it needs a backend. `vibe dev` runs the worker
