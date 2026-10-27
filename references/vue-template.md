@@ -159,12 +159,12 @@ which also waits for the build; check pages with `fetch_page` and any backend
 tools with `call_tool`, then publish when the user asks. The platform installs
 dependencies and runs the build.
 
-Through the CLI, after `vibe init --template vue <slug>`, run these commands
-from the project root:
+Through the CLI, after `vibe init --template vue <slug>`, a local `npm install`
+and `npm run build` are an optional check that the build passes; the platform
+installs and builds on its own when you run `vibe preview`:
 
 ```bash
-npm install
-npm run build
+npm install && npm run build   # optional
 vibe preview
 ```
 

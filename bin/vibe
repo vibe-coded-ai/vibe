@@ -182,7 +182,7 @@ _api() {
       return
     fi
     if [[ "$retry_after" =~ ^[0-9]+$ ]]; then
-      echo "Too many requests; try again in $retry_after seconds.$error_suffix" >&2
+      echo "Too many requests; try again in $retry_after second$([ "$retry_after" = 1 ] || echo s).$error_suffix" >&2
     else
       echo "Too many requests; try again later.$error_suffix" >&2
     fi
@@ -1346,7 +1346,14 @@ cmd_publish() {
     local current visibility policy
     # Reading the sharing settings is best effort: a refused lookup must not
     # make a finished publish look failed.
-    current=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) || current=""
+    # A refused lookup waits out a short Retry-After once.
+    if ! current=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null); then
+      if _api_was_rate_limited "$current" 15; then
+        current=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) || current=""
+      else
+        current=""
+      fi
+    fi
     visibility=$(echo "$current" | jq -r '(.vibe.visibility // .visibility) // empty' 2>/dev/null) || visibility=""
     policy=$(echo "$current" | jq -r '(.vibe.interactionPolicy // .interactionPolicy) // "unknown"' 2>/dev/null) || policy="unknown"
     if [ -z "$visibility" ]; then
