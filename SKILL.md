@@ -184,7 +184,7 @@ settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug
 | `settings [--title T]` | View settings, change the title; visibility and interaction are web-only |
 | `access list` | List collaborators; grants and revokes are web-only |
 | `secrets list\|create\|update\|delete NAME` | Write-only secrets (Pro), read in the worker as `env.NAME` |
-| `r2 upload\|download\|ls\|rm\|url` | Files in production R2 (Pro) |
+| `files upload\|download\|ls\|rm\|url` | Stored files (upload: Pro); `r2` is an alias |
 | `delete` | Prints the web link to delete the vibe |
 
 **Login:** run `vibe login --start`; it prints a link and a code. Give both to the

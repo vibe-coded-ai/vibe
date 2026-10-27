@@ -1419,6 +1419,7 @@ test('vibe connect mints a vibe-only token, retires the old one, and registers i
   assert.match(r.calls, /^claude\tmcp add --transport http -s user demo https:\/\/tester--demo\.vibe-coded\.ai\/mcp --header Authorization: Bearer conn-tok$/m);
   assert.match(r.stdout, /Connected 'demo'/);
   assert.match(r.calls, /^claude\tmcp get demo$/m);
+  assert.match(r.stdout, /Expires 2026-12-26T00:00:00\.000Z \(no later than your CLI login does\)\. To renew after that: vibe login, then vibe connect\./);
   assert.match(r.stdout, /Check: ✔ Connected/);
   assert.doesNotMatch(r.stdout, /conn-tok/);
   assert.deepEqual(r.connections, { 'tester--demo': { jti: 'new-jti', expiresAt: '2026-12-26T00:00:00.000Z', name: 'demo' } });
@@ -1551,7 +1552,8 @@ test('nested CLI help never runs the subcommand', () => {
   for (const [command, args, usage] of [
     ['secrets', ['create', '--help'], 'vibe secrets create'],
     ['access', ['grant', '-h'], 'vibe access grant'],
-    ['r2', ['upload', '--help'], 'vibe r2 upload'],
+    ['r2', ['upload', '--help'], 'vibe files upload'],
+    ['files', ['upload', '--help'], 'vibe files upload'],
     ['dev', ['seed', '--help'], 'vibe dev seed'],
   ]) {
     const result = runCli(command, args);

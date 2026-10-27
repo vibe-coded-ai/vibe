@@ -629,8 +629,10 @@ cmd_init() {
       [ "$want" = "kv" ] && want="KV"; [ "$have" = "kv" ] && have="KV"
       echo "Note: template '$template' uses $have storage, so --storage ${storage_flag/d1/sql} was ignored." >&2
       if [ "$storage_flag" = "d1" ]; then
-        echo "For SQL from the start use: vibe init --template tools-sql $slug (SQL storage is included from Pro)." >&2
-        echo "To keep this template and switch later, tell your agent: \"convert $slug to SQL (D1) storage\"." >&2
+        local sql_plan_note=""
+        [ "$( (_load_creds && _current_plan) 2>/dev/null)" = "free" ] && sql_plan_note=" SQL storage needs Pro or Pro+."
+        echo "No '$template' template uses SQL; tools-sql is the only SQL template. For SQL from the start: vibe init --template tools-sql $slug.$sql_plan_note" >&2
+        echo "To keep '$template' and use SQL, tell your agent: \"switch $slug's storage to SQL\"." >&2
       fi
     fi
     _check_template_targets "$template_json"
@@ -1321,7 +1323,6 @@ cmd_publish() {
   if [[ "$pending_msg" =~ ^Production\ promotion\ ([0-9]+)\ is\ still\ in\ progress ]]; then
     promotion_id="${BASH_REMATCH[1]}"
     echo "Promotion $promotion_id is taking longer than 25 seconds; still waiting…"
-    printf "  [%3ds] publishing\n" 25
     local elapsed=25 interval=5 max_wait=600 build status
     while :; do
       if [ "$elapsed" -ge "$max_wait" ]; then
@@ -1469,7 +1470,6 @@ cmd_status() {
   echo ""
   if [ -n "$has_preview" ]; then _print_urls preview; fi
   if [ -n "$has_prod" ]; then echo "Production:" && _print_urls production; fi
-  if [ -z "$has_preview" ] && [ -z "$has_prod" ]; then echo "  (no deployments yet — run 'vibe preview' to deploy)"; fi
 }
 
 # Publish promotes a preview build: the production pointer holds the preview
@@ -1581,7 +1581,9 @@ cmd_call() {
       [ "$env" = "production" ] && build_field=productionBuildId || build_field=previewBuildId
       info=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) || info=""
       if printf '%s' "$info" | jq -e --arg f "$build_field" '.success == true and ((.vibe[$f] // .[$f]) == null)' >/dev/null 2>&1; then
-        if [ "$env" = "production" ]; then
+        if [ "$env" = "production" ] && printf '%s' "$info" | jq -e '(.vibe.previewBuildId // .previewBuildId) == null' >/dev/null 2>&1; then
+          echo "Error: $USER_SLUG/$VIBE_SLUG has no build yet. Run: vibe preview, then vibe publish (or vibe preview, then add --preview to call the preview build)." >&2
+        elif [ "$env" = "production" ]; then
           echo "Error: $USER_SLUG/$VIBE_SLUG has no production build yet. Run: vibe publish — or add --preview to call the preview build." >&2
         else
           echo "Error: $USER_SLUG/$VIBE_SLUG has no preview build yet. Run: vibe preview" >&2
@@ -1805,7 +1807,10 @@ cmd_connect() {
         shift 2 ;;
       -*|"") echo "Usage: vibe connect [<owner>/<slug>] [--name N] [--print] [--revoke]" >&2; exit 1 ;;
       *)
-        if [ -n "$target" ] || [[ "$1" != */* ]]; then
+        if [ -z "$target" ] && [[ "$1" != */* ]]; then
+          echo "Error: vibe connect takes <owner>/<slug> (e.g. <owner>/$1). For your own vibe, run vibe connect with no slug in its project folder." >&2; exit 1
+        fi
+        if [ -n "$target" ]; then
           echo "Usage: vibe connect [<owner>/<slug>] [--name N] [--print] [--revoke]" >&2; exit 1
         fi
         target="$1"; shift ;;
@@ -1960,7 +1965,7 @@ cmd_connect() {
       exit 1
     fi
   fi
-  echo "The token can only call this vibe's tools, as you, with your current role. Expires $expires — run '$again' again to renew."
+  echo "The token can only call this vibe's tools, as you, with your current role. Expires $expires (no later than your CLI login does). To renew after that: vibe login, then $again."
   echo "Revoke: $again --revoke"
 }
 
@@ -2473,30 +2478,30 @@ cmd_r2() {
   case "$sub" in
     ""|help|--help|-h)
       cat <<'USAGE' >&2
-Usage: vibe r2 <subcommand> [args]
+Usage: vibe files <subcommand> [args]   (alias: vibe r2)
 
 Subcommands:
-  upload <path> --key <r2-key> [--content-type ct] [--ttl 300] [--preview]
-      Upload a local file to R2 (browser-direct via signed URL).
+  upload <path> --key <key> [--content-type ct] [--ttl 300] [--preview]
+      Upload a local file (sent straight to storage through a signed URL).
 
-  download <r2-key> [--to <local-path>] [--ttl 120] [--preview]
-      Download an R2 object to a local path (defaults to basename).
+  download <key> [--to <local-path>] [--ttl 120] [--preview]
+      Download a stored file to a local path (defaults to basename).
 
-  url <r2-key> [--ttl 120] [--preview]
+  url <key> [--ttl 120] [--preview]
       Print a signed download URL and its actual expiry (120s maximum).
 
   ls [--prefix <p>] [--preview]
-      List objects under your vibe's prefix.
+      List your vibe's stored files.
 
-  rm <r2-key> [--preview]
-      Delete an object.
+  rm <key> [--preview]
+      Delete a stored file.
 
   usage
       Show storage used / plan limit / remaining.
 
 Notes:
   - All keys are auto-namespaced to your vibe (vibes/<id>/<key>).
-  - R2 access requires a paid plan (Pro or Pro+).
+  - Uploading needs Pro or Pro+; listing, downloading and deleting work on any plan.
   - --preview selects the preview tree; the preview host serves the preview tree, the production host the production tree; upload to both when a page needs the file in both.
   - A stored file is served at
     /files/<key> on the vibe, under its access settings; use that address in
@@ -2520,6 +2525,9 @@ USAGE
 
   _load_creds
   _load_manifest
+  case "$sub" in
+    upload|download|url|ls|list|rm|delete|usage) echo "→ $USER_SLUG/$VIBE_SLUG (files, $environment)" >&2 ;;
+  esac
 
   # R2 writes are paid-plan only (Pro, Pro+); reads and deletes stay open so a
   # downgraded owner can retrieve or remove files. Say the write gate before
@@ -2533,7 +2541,7 @@ USAGE
     # Reads stay open on Free; the write gate is rendered by the upload-url
     # endpoint before it validates the body, so an empty request returns it.
     RESULT=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/upload-url" -d '{}')
-    _check_success "$RESULT" "vibe r2 $sub"
+    _check_success "$RESULT" "vibe files $sub"
     exit 1
   fi
 
@@ -2541,7 +2549,7 @@ USAGE
     upload)
       # vibe r2 upload <local-path> --key <r2-key> [--content-type <ct>] [--max-size <bytes>] [--ttl <secs>]
       local local_path="${1:-}" key="" content_type="" max_size="" ttl=""
-      [ -z "$local_path" ] && { echo "Usage: vibe r2 upload <local-path> --key <r2-key>" >&2; exit 1; }
+      [ -z "$local_path" ] && { echo "Usage: vibe files upload <local-path> --key <key>" >&2; exit 1; }
       shift
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -2582,7 +2590,7 @@ USAGE
         --argjson ttl "${ttl:-300}" \
         '{key: $k, contentType: $ct, maxSize: $ms, ttl: $ttl, environment: $environment}')
       local mint; mint=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/upload-url" -d "$body")
-      _check_success "$mint" "R2 upload-url mint"
+      _check_success "$mint" "File upload"
       local url; url=$(echo "$mint" | jq -r '.url')
 
       # PUT file directly to R2 via signed URL (no tempfile games needed — curl reads from disk)
@@ -2601,7 +2609,7 @@ USAGE
     download)
       # vibe r2 download <r2-key> [--to <local-path>] [--ttl <secs>]
       local key="${1:-}" to="" ttl=""
-      [ -z "$key" ] && { echo "Usage: vibe r2 download <r2-key> [--to <path>]" >&2; exit 1; }
+      [ -z "$key" ] && { echo "Usage: vibe files download <key> [--to <path>]" >&2; exit 1; }
       shift
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -2618,7 +2626,7 @@ USAGE
       fi
       local body; body=$(jq -n --arg k "$key" --arg environment "$environment" --argjson ttl "${ttl:-120}" '{key: $k, ttl: $ttl, environment: $environment}')
       local mint; mint=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/download-url" -d "$body")
-      _check_success "$mint" "R2 download"
+      _check_success "$mint" "File download"
       local url; url=$(echo "$mint" | jq -r '.url')
       local http_code; http_code=$(curl -s -o "$to" -w "%{http_code}" "$url")
       if [ "$http_code" != "200" ]; then
@@ -2631,7 +2639,7 @@ USAGE
     url)
       # vibe r2 url <r2-key> [--ttl <secs>]   — print signed download URL only
       local key="${1:-}" ttl=""
-      [ -z "$key" ] && { echo "Usage: vibe r2 url <r2-key> [--ttl <secs>]" >&2; exit 1; }
+      [ -z "$key" ] && { echo "Usage: vibe files url <key> [--ttl <secs>]" >&2; exit 1; }
       shift
       while [ $# -gt 0 ]; do
         case "$1" in
@@ -2646,7 +2654,7 @@ USAGE
       fi
       local body; body=$(jq -n --arg k "$key" --arg environment "$environment" --argjson ttl "${ttl:-120}" '{key: $k, ttl: $ttl, environment: $environment}')
       local mint; mint=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/download-url" -d "$body")
-      _check_success "$mint" "R2 url"
+      _check_success "$mint" "File URL"
       echo "$mint" | jq -r '.url'
       local expires_at expires_iso
       expires_at=$(echo "$mint" | jq -r '.expiresAt')
@@ -2686,7 +2694,7 @@ USAGE
         [ -n "$cursor" ] && query="${query}&cursor=$(printf '%s' "$cursor" | jq -sRr @uri)"
 
         local resp; resp=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/list${query}")
-        _check_success "$resp" "R2 list"
+        _check_success "$resp" "File list"
 
         local page; page=$(echo "$resp" | jq -r '.objects[] | "\(.size)\t\(.key)"')
         [ -n "$page" ] && all_lines="${all_lines}${all_lines:+$nl}${page}"
@@ -2710,10 +2718,10 @@ USAGE
 
     rm|delete)
       local key="${1:-}"
-      [ -z "$key" ] && { echo "Usage: vibe r2 rm <r2-key> [--preview]" >&2; exit 1; }
-      [ $# -eq 1 ] || { echo "Usage: vibe r2 rm <r2-key> [--preview]" >&2; exit 1; }
+      [ -z "$key" ] && { echo "Usage: vibe files rm <key> [--preview]" >&2; exit 1; }
+      [ $# -eq 1 ] || { echo "Usage: vibe files rm <key> [--preview]" >&2; exit 1; }
       RESULT=$(_api DELETE "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/$(printf '%s' "$key" | jq -sRr @uri)${environment_query}")
-      _check_success "$RESULT" "R2 delete"
+      _check_success "$RESULT" "File delete"
       echo "Deleted $key"
       ;;
 
@@ -2722,7 +2730,7 @@ USAGE
         | jq -r '"Used: \(.bytesUsed / 1024 / 1024 | floor)MB  Limit: \(.limitBytes / 1024 / 1024 | floor)MB  Remaining: \(.remainingBytes / 1024 / 1024 | floor)MB"'
       ;;
 
-    *) echo "Unknown r2 subcommand: $sub. Run 'vibe r2 help' for usage." >&2; exit 1 ;;
+    *) echo "Unknown files subcommand: $sub. Run 'vibe files help' for usage." >&2; exit 1 ;;
   esac
 }
 
@@ -2818,9 +2826,10 @@ NODE
 
 _print_command_help() {
   local command="$1" sub="${2:-}"
+  [ "$command" = files ] && command=r2
   case "$command:$sub" in
     dev:seed)
-      printf '%s\n' "Usage: vibe dev seed <file.sql>" "Apply a SQL seed file to local D1 without starting the dev server."
+      printf '%s\n' "Usage: vibe dev seed <file.sql>" "Apply a SQL seed file to the local SQL database without starting the dev server."
       return ;;
     secrets:create)
       printf '%s\n' "Usage: vibe secrets create <NAME> [--type custom]" "Create a write-only secret (Pro); value read from the terminal, or from stdin when piped."
@@ -2841,22 +2850,22 @@ _print_command_help() {
       printf '%s\n' "Usage: vibe access $sub" "Access changes are owner-only and completed in the web dashboard; this command exits non-zero."
       return ;;
     r2:upload)
-      printf '%s\n' "Usage: vibe r2 upload <path> --key <r2-key> [--content-type ct] [--ttl 300] [--preview]" "Upload a local file through a signed R2 URL (Pro)."
+      printf '%s\n' "Usage: vibe files upload <path> --key <key> [--content-type ct] [--ttl 300] [--preview]" "Upload a local file through a signed upload URL (Pro)."
       return ;;
     r2:download)
-      printf '%s\n' "Usage: vibe r2 download <r2-key> [--to <local-path>] [--ttl 120] [--preview]" "Download an R2 object to a local file. A page shows a stored file from /files/<key> on the vibe instead."
+      printf '%s\n' "Usage: vibe files download <key> [--to <local-path>] [--ttl 120] [--preview]" "Download a stored file to a local file. A page shows a stored file from /files/<key> on the vibe instead."
       return ;;
     r2:url)
-      printf '%s\n' "Usage: vibe r2 url <r2-key> [--ttl 120] [--preview]" "Print a short-lived signed download URL, for fetching a file outside a page. A page shows a stored file from /files/<key> on the vibe instead."
+      printf '%s\n' "Usage: vibe files url <key> [--ttl 120] [--preview]" "Print a short-lived signed download URL, for fetching a file outside a page. A page shows a stored file from /files/<key> on the vibe instead."
       return ;;
     r2:ls|r2:list)
-      printf '%s\n' "Usage: vibe r2 ls [--prefix <p>] [--limit <n>] [--preview]" "List objects in the current vibe's R2 namespace."
+      printf '%s\n' "Usage: vibe files ls [--prefix <p>] [--limit <n>] [--preview]" "List the current vibe's stored files."
       return ;;
     r2:rm|r2:delete)
-      printf '%s\n' "Usage: vibe r2 rm <r2-key> [--preview]" "Delete an R2 object."
+      printf '%s\n' "Usage: vibe files rm <key> [--preview]" "Delete a stored file."
       return ;;
     r2:usage)
-      printf '%s\n' "Usage: vibe r2 usage" "Show R2 storage usage and the plan limit."
+      printf '%s\n' "Usage: vibe files usage" "Show file storage usage and the plan limit."
       return ;;
   esac
 
@@ -2879,11 +2888,11 @@ _print_command_help() {
     settings) printf '%s\n' "Usage: vibe settings [--title T] [--visibility private|unlisted|public] [--interaction public|public_read|authenticated|invite_only]" "View settings or update the title; exposure changes are web-only and exit non-zero." ;;
     access) printf '%s\n' "Usage: vibe access list|grant|update|revoke|revoke-all [args]" "List access in the CLI; owner-only mutations are completed on the website." ;;
     secrets) printf '%s\n' "Usage: vibe secrets list|create|update|delete|audit [NAME]" "Manage write-only worker secrets (Pro)." ;;
-    r2) printf '%s\n' "Usage: vibe r2 upload|download|url|ls|rm|usage [args]" "Manage files in the current vibe's R2 namespace. Uploading needs Pro; on Free you can still list, download and delete kept files." \
+    r2) printf '%s\n' "Usage: vibe files upload|download|url|ls|rm|usage [args]   (alias: vibe r2)" "Manage the current vibe's stored files. Uploading needs Pro; on Free you can still list, download and delete kept files." \
           "  upload <path> --key <key>     download <key> --to <path>     url <key>" \
           "  ls [prefix]                   rm <key>                       usage" \
           "--preview selects the preview tree; the preview host serves the preview tree, the production host the production tree; upload to both when a page needs the file in both." \
-          "A stored file is served at /files/<key> on the vibe. Run vibe help r2 <subcommand> for details, e.g. vibe help r2 upload." ;;
+          "A stored file is served at /files/<key> on the vibe. Run vibe help files <subcommand> for details, e.g. vibe help files upload." ;;
     delete) printf '%s\n' "Usage: vibe delete" "Print the owner-only web deletion link and exit non-zero." ;;
     *) return 1 ;;
   esac
@@ -2976,7 +2985,7 @@ case "${1:-help}" in
   logout)          cmd_logout ;;
   secrets)         shift 2>/dev/null || true; cmd_secrets "$@" ;;
   access)          shift 2>/dev/null || true; cmd_access "$@" ;;
-  r2)              shift 2>/dev/null || true; cmd_r2 "$@" ;;
+  files|r2)        shift 2>/dev/null || true; cmd_r2 "$@" ;;
   help|--help|-h)
     echo "vibe — CLI for vibe-coded.ai"
     echo ""
@@ -2989,8 +2998,8 @@ case "${1:-help}" in
     echo "  templates                    List runnable starter templates"
     echo "  list                         List your vibes (marks the current folder's vibe)"
     echo "  source [path]                List deployed source or read a file's exact bytes"
-    echo "  dev [--port N] [--reset]     Run the worker locally (D1+KV+R2; reloads on save)"
-    echo "  dev seed <file.sql>          Apply SQL to local D1"
+    echo "  dev [--port N] [--reset]     Run the worker locally (SQL, key-value and file storage; reloads on save)"
+    echo "  dev seed <file.sql>          Apply SQL to the local database"
     echo "  preview [--prune|--no-prune] Upload source, prune stale files, and build (alias: deploy)"
     echo "  publish [--open]             Promote preview to production (--open: app or sharing page in the browser)"
     echo "  status [--plan]              Show vibe info + recent builds"
@@ -3002,13 +3011,13 @@ case "${1:-help}" in
     echo "  settings [--title T] ...     View or update vibe settings"
     echo "  access list                  List collaborators (changes on the website)"
     echo "  secrets list|create|update|delete|audit [NAME]  Manage secrets (Pro)"
-    echo "  r2 upload|download|ls|...    Manage R2 file storage (upload: Pro)"
+    echo "  files upload|download|ls|... Manage stored files (upload: Pro; alias: r2)"
     echo "  delete                       Link to delete on the website"
     echo "  --version                    Print the CLI version"
     echo ""
-    echo "Help: vibe help <command> or vibe help <command> <subcommand> (e.g. vibe help r2 upload)"
+    echo "Help: vibe help <command> or vibe help <command> <subcommand> (e.g. vibe help files upload)"
     echo ""
-    echo "Develop locally with 'vibe dev' (local worker + D1/KV/R2) — preview/publish when ready."
+    echo "Develop locally with 'vibe dev' (local worker with SQL, key-value and file storage) — preview/publish when ready."
     echo ""
     echo "Credentials: ~/.vibe-coded/credentials.json (run 'vibe login')"
     echo "Manifest:    .vibe-coded.json (created by init)"

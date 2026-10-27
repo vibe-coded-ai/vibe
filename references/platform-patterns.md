@@ -7,7 +7,7 @@ On private vibes, anonymous requests receive 401 before the worker runs, includi
 Visibility (private, unlisted, public) and interaction policy (public, public_read, authenticated, invite_only) change only on the website.
 Through MCP, get_vibe returns the manageUrl to give the owner; through the CLI, vibe settings prints the page.
 Check private vibes as the owner with call_tool / fetch_page through MCP, or vibe call / vibe fetch through the CLI.
-MCP clients use worker tools for SQL and files; they do not need a CLI, a local credentials file or vibe r2.
+MCP clients use worker tools for SQL and files; they do not need a CLI, a local credentials file or vibe files.
 
 ## KV (`env.VIBE_STORAGE`, every plan)
 
@@ -159,10 +159,10 @@ invoke them with call_tool. For an operation the worker does not expose, add an
 
 ### CLI only: file commands
 
-From a terminal with the CLI installed and signed in, use `vibe r2 upload|download|ls|rm|url` (MCP: expose a worker tool and invoke it with call_tool).
+From a terminal with the CLI installed and signed in, use `vibe files upload|download|ls|rm|url` (alias `vibe r2`) (MCP: expose a worker tool and invoke it with call_tool).
 These default to production's files; add `--preview` for the preview tree.
 The preview host serves the preview tree and the production host the production tree; upload to both when a page needs the file in both.
-`vibe r2 usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; `usage` storage counts KV only.
+`vibe files usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; `usage` storage counts KV only.
 Signed uploads count at once; files the worker writes with `put()` count within the hour.
 
 **Check a private vibe with curl:** the token in `~/.vibe-coded/credentials.json`
