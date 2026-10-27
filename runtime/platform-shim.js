@@ -36,7 +36,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 // denial; preview KV/R2 data is isolated from production, and a missing or
 // unknown VIBE_ENV is treated as production. The meaning of each version
 // number is documented beside SHIM_VERSION.
-const PLATFORM_SHIM_VERSION = 6;
+const PLATFORM_SHIM_VERSION = 7;
 void PLATFORM_SHIM_VERSION;
 
 // Capture these before any user module code executes. Invoking the captured
@@ -148,9 +148,12 @@ let _userWorker;
 const WRITE_ACCESS_DENIED = 'Write access denied: this connection has read-only access to this vibe';
 const D1_ENTITLEMENT_REQUIRED = 'SQL storage (env.VIBE_D1) is unavailable for this vibe. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use KV storage", or after upgrading edit any file and build again (vibe preview or push_source); a build of unchanged source is skipped.';
 
+const D1_READ_ONLY_TRIGGERS = 'This vibe\'s SQL data is read-only on the Free plan, and its database has triggers, so only SELECT and DROP TRIGGER run (drop the triggers first to delete rows). Writes need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing.';
+const D1_READ_ONLY_PLAN = 'This vibe\'s SQL data is read-only on the Free plan: reads and deletes work, writes need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "keep new data in KV storage", or upgrade and edit any file and build again.';
+
 class D1EntitlementError extends Error {
-  constructor() {
-    super(D1_ENTITLEMENT_REQUIRED);
+  constructor(message = D1_ENTITLEMENT_REQUIRED) {
+    super(message);
     this.code = 'ENTITLEMENT_EXCEEDED';
   }
 }
@@ -158,10 +161,10 @@ class D1EntitlementError extends Error {
 // An uncaught D1EntitlementError would reach the platform as a generic
 // "Worker execution failed", so answer it here with the platform's standard
 // plan-gate body (same shape as entitlementErrorResponse).
-function d1EntitlementResponse() {
+function d1EntitlementResponse(message) {
   return new Response(JSON.stringify({
     success: false,
-    error: D1_ENTITLEMENT_REQUIRED,
+    error: message,
     code: 'ENTITLEMENT_EXCEEDED',
     limitType: 'd1_storage',
     upgradeUrl: 'https://vibe-coded.ai/pricing',
@@ -823,6 +826,13 @@ export function createMeteredD1(db, opts) {
     : Infinity;
   const vibeId = String(options.vibeId);
   const capturedEnv = options.env;
+  // A database kept from a paid plan: every growth statement is refused with
+  // the plan gate, whatever the size; reads and recovery verbs still run. A
+  // trigger created on the paid plan can turn an allowed DELETE (or a DROP
+  // TABLE, through a cascading foreign key) into growth, so while the database
+  // has any trigger only SELECT and DROP TRIGGER run.
+  const readOnly = options.readOnly === true;
+  let hasTriggers; // per-request memo; undefined = not yet checked
   // Execution context — used for fire-and-forget usage reports via waitUntil so
   // they never add latency to (or get cancelled with) the vibe's request.
   const ctx = options.ctx;
@@ -900,14 +910,32 @@ export function createMeteredD1(db, opts) {
   }
 
   async function isOverCap() {
+    if (readOnly) return true;
     await ensureSizeKnown();
     const localOver = lastKnownBytes !== null && lastKnownBytes >= cap;
     return localOver || await isOverQuotaFlag();
   }
 
+  // Read-only mode: a recovery verb other than DROP TRIGGER is refused while the
+  // database has triggers. Fails closed if the check itself fails. Foreign-key
+  // actions are not triggers: ON DELETE SET DEFAULT can rewrite existing child
+  // rows once, but read-only mode adds no rows, so that growth cannot repeat.
+  async function enforceNoTriggers() {
+    if (hasTriggers === undefined) {
+      try {
+        const r = await db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' LIMIT 1").all();
+        hasTriggers = !!(r && Array.isArray(r.results) && r.results.length);
+      } catch (_e) {
+        hasTriggers = true;
+      }
+    }
+    if (hasTriggers) throw new D1EntitlementError(D1_READ_ONLY_TRIGGERS);
+  }
+
   // Throw if we're over either cap. No classification — callers decide whether
   // the operation can grow storage before invoking this.
   async function enforceIfOverCap() {
+    if (readOnly) throw new D1EntitlementError(D1_READ_ONLY_PLAN);
     if (await isOverCap()) {
       throw new Error('D1 storage quota exceeded for this vibe');
     }
@@ -927,10 +955,11 @@ export function createMeteredD1(db, opts) {
     // Classify the immutable SQL ONCE at wrap time (it can't change after
     // prepare()); only the access MODE is call-time state, checked inside
     // denyReadOnlyWrite() via ALS on every invocation.
-    const { isRead, isGrowth, isIdempotentDdl } = flags || {
+    const { isRead, isGrowth, isIdempotentDdl, isDropTrigger } = flags || {
       isRead: _isD1ReadStatement(sql),
       isGrowth: _isD1GrowthStatement(sql),
       isIdempotentDdl: _isIdempotentSchemaDdl(sql),
+      isDropTrigger: /^DROP\s+TRIGGER\b/i.test(_stripLeadingComments(sql) || ''),
     };
     // Read-mode gate. Idempotent schema DDL short-circuits to a no-op result
     // instead of a denial; everything else non-read is denied.
@@ -946,7 +975,11 @@ export function createMeteredD1(db, opts) {
     // call _ensureTable() before a DELETE, and the DELETE is how an over-cap
     // vibe shrinks. Returns true when the caller should return the no-op result.
     const overCapNoop = async () => {
-      if (!isGrowth) return false;
+      if (!isGrowth) {
+        if (isDropTrigger) hasTriggers = undefined; // the next delete rechecks
+        else if (readOnly && !isRead) await enforceNoTriggers();
+        return false;
+      }
       if (isIdempotentDdl) return isOverCap();
       await enforceIfOverCap();
       return false;
@@ -954,7 +987,7 @@ export function createMeteredD1(db, opts) {
     const wrapped = {
       _sql: sql, // for debugging/tests only — NOT trusted for classification
       bind(...args) {
-        return wrapStatement(realStmt.bind(...args), sql, { isRead, isGrowth, isIdempotentDdl });
+        return wrapStatement(realStmt.bind(...args), sql, { isRead, isGrowth, isIdempotentDdl, isDropTrigger });
       },
       async run() {
         if (readModeNoop() || await overCapNoop()) return _readModeDdlNoopResult();
@@ -977,7 +1010,7 @@ export function createMeteredD1(db, opts) {
         return realStmt.raw(rawOpts);
       },
     };
-    wrapperMeta.set(wrapped, { realStmt, isRead, isGrowth, isIdempotentDdl });
+    wrapperMeta.set(wrapped, { realStmt, isRead, isGrowth, isIdempotentDdl, isDropTrigger });
     return wrapped;
   }
 
@@ -1021,6 +1054,10 @@ export function createMeteredD1(db, opts) {
         if (metas.some(function (meta) { return !meta || (meta.isGrowth && !meta.isIdempotentDdl); })) {
           await enforceIfOverCap();
         }
+        if (readOnly && metas.some(function (meta) { return !meta.isRead && !meta.isGrowth && !meta.isDropTrigger; })) {
+          await enforceNoTriggers();
+        }
+        if (metas.some(function (meta) { return meta && meta.isDropTrigger; })) hasTriggers = undefined;
         // Over cap, idempotent DDL slots get the no-op result, as for a single
         // statement; the rest of the batch runs in order.
         const skipDdl = metas.some(function (meta) { return meta && meta.isIdempotentDdl; }) && await isOverCap();
@@ -1193,6 +1230,7 @@ const READ_ENV_ALLOWLIST = new Set([
   'VIBE_ENV',        // Build-runner environment selector for KV/R2 isolation.
   'D1_DEDICATED',    // Build-runner marker selecting dedicated-D1 metering.
   'D1_MAX_BYTES',    // Build-runner dedicated-D1 byte cap.
+  'D1_READ_ONLY',    // Build-runner marker: a kept database on a plan without SQL.
   'PLATFORM_API_URL', // Platform endpoint override used by signed wrapper calls.
 ]);
 
@@ -1327,6 +1365,7 @@ export default {
       const capBytes = env.D1_MAX_BYTES ? parseInt(env.D1_MAX_BYTES, 10) : NaN;
       wrappedEnv.VIBE_D1 = createMeteredD1(env.VIBE_D1, {
         capBytes: Number.isFinite(capBytes) ? capBytes : undefined,
+        readOnly: env.D1_READ_ONLY === '1',
         vibeId: env.VIBE_ID,
         env,
         ctx,
@@ -1376,7 +1415,7 @@ export default {
     try {
       return await userWorker.fetch(userRequest, wrappedEnv, ctx);
     } catch (err) {
-      if (err instanceof D1EntitlementError) return d1EntitlementResponse();
+      if (err instanceof D1EntitlementError) return d1EntitlementResponse(err.message);
       throw err;
     }
     });

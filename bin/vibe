@@ -150,6 +150,15 @@ _api() {
   fi
   http_status="${result##*$'\n'}"
   body="${result%$'\n'*}"
+  # An error body that is not JSON (an HTML page, Cloudflare's "error code: 1101")
+  # becomes a JSON error, so every caller reports it instead of feeding it to jq.
+  if [[ "$http_status" =~ ^[13-5][0-9][0-9]$ ]] && ! printf '%s' "$body" | jq -e . >/dev/null 2>&1; then
+    local head
+    head=$(printf '%s' "$body" | tr -s '\r\n\t ' ' ' | cut -c1-200 | sed 's/^ //; s/ $//')
+    case "$head" in "<"*) head="" ;; esac
+    body=$(jq -cn --arg s "$http_status" --arg head "$head" \
+      '{success: false, error: ("The platform answered HTTP \($s)" + (if $head == "" then "" else " (\($head))" end) + ". Retry in a minute.")}')
+  fi
   # Add the correlation id once, before any command displays an API error.
   local annotated error_suffix=""
   if annotated=$(printf '%s' "$body" | jq -ce '
@@ -353,7 +362,7 @@ _print_settings() {
 _print_private_access() {
   local url="$1" policy="$2" manage_url="$3" description=" (interaction policy: ${2:-unknown})"
   [ "$policy" = "invite_only" ] && description=" and invite-only"
-  echo "This vibe is private${description}: you and anyone you invite (signed in) can open $url; anonymous requests get 401. To let others in, change visibility and the interaction policy at $manage_url."
+  echo "This vibe is private${description}: you and anyone you invite (signed in) can open $url; once it is built, anonymous requests get 401. To let others in, change visibility and the interaction policy at $manage_url."
 }
 
 # Print a vibe's real visibility + interaction policy (never fatal: init has
@@ -382,6 +391,10 @@ _is_web_only_error() {
 # Check API response success, exit with error message on failure
 _check_success() {
   local result="$1" msg="${2:-Operation}" auth_status auth_error retry_after
+  if ! echo "$result" | jq -e . >/dev/null 2>&1; then
+    echo "$msg failed: the platform's answer was not JSON. Retry in a minute." >&2
+    exit 1
+  fi
   if [ "$(echo "$result" | jq -r '.success // false')" != "true" ]; then
     auth_status=$(echo "$result" | jq -r '.httpStatus // .statusCode // .status // empty' 2>/dev/null) || auth_status=""
     auth_error=$(echo "$result" | jq -r '._originalError // .error // empty' 2>/dev/null) || auth_error=""
@@ -1040,7 +1053,7 @@ cmd_preview() {
       fi
 
       if ! list_result=$(_api GET "$list_path"); then
-        echo "Error: Remote source listing failed; no files were pruned." >&2
+        echo "Error: could not read the remote file list. Nothing was uploaded; run vibe preview again." >&2
         exit 1
       fi
       # A refused or failed request (5xx, timeout) is an error to report as
@@ -1973,7 +1986,7 @@ cmd_logs() {
   _load_creds
   _load_manifest
 
-  local build_id="${1:-}" latest latest_id latest_env result candidate candidate_result
+  local build_id="${1:-}" latest latest_id latest_env from_latest result candidate candidate_result
   if [ -n "$build_id" ] && [[ ! "$build_id" =~ ^[0-9]+$ ]]; then
     echo "Error: build id must be a number (vibe status lists recent builds)." >&2
     exit 1
@@ -2002,6 +2015,7 @@ cmd_logs() {
     fi
     latest_id="$build_id"
     latest_env=$(echo "$latest" | jq -r '.builds[0].environment // empty')
+    from_latest=1
   fi
   result=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds/$build_id/logs")
   if echo "$result" | jq -e '(._originalError // .error) == "Build not found"' >/dev/null; then
@@ -2039,7 +2053,7 @@ cmd_logs() {
   if [ "$(echo "$result" | jq '.lines | length')" = "0" ]; then
     echo "Build $build_id has no log lines yet."
   else
-    if [ -n "${latest_id:-}" ]; then
+    if [ -n "${from_latest:-}" ]; then
       echo "Latest build with logs: $build_id"
     fi
     echo "$result" | jq -r '.lines[] | "\(.ts) [\(.step)] \(.msg)"'
