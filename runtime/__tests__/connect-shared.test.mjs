@@ -101,8 +101,7 @@ test('vibe connect <owner>/<slug> explains a 404 (not shared with you)', () => {
   try {
     const r = run(['connect', 'alice/notes', '--print'], { body: '{"success":false,"error":"Vibe not found"}', code: '404' });
     assert.equal(r.status, 1);
-    assert.match(r.stderr, /Vibe not found/);
-    assert.match(r.stderr, /alice has shared notes with you/);
+    assert.match(r.stderr, /^Error: Vibe alice\/notes not found or not shared with you$/m);
   } finally {
     cleanup();
   }
@@ -178,7 +177,8 @@ test('vibe connect <owner>/<slug> --revoke cleans up locally after the owner rem
     assert.equal(run(['connect', 'alice/notes', '--print'], { body: MINTED }).status, 0);
     const r = run(['connect', 'alice/notes', '--revoke'], { delBody: '{"success":false,"error":"Vibe not found"}', delCode: '404' });
     assert.equal(r.status, 0, r.stderr);
-    assert.match(r.stdout, /token already stopped working/);
+    assert.match(r.stdout, /^Revoked 0 connection token\(s\) for alice\/notes\.$/m);
+    assert.match(r.stdout, /^Your access to alice\/notes was removed, so its remaining tokens already stopped working\.$/m);
     assert.equal(connections()['alice--notes'], undefined);
   } finally {
     cleanup();

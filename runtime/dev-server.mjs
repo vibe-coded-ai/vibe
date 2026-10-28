@@ -164,7 +164,16 @@ async function bundleWorker(entry, outFile) {
 }
 
 // ── Miniflare options ─────────────────────────────────────────────────────────
-export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken) {
+// The shim reaches the platform at PLATFORM_API_URL for signed file URLs. vibe
+// dev points it at this server, which answers with why they are unavailable
+// here instead of the platform rejecting the local token.
+export const DEV_PLATFORM_PREFIX = '/__vibe_dev_platform';
+export const DEV_PLATFORM_REFUSAL = {
+  success: false,
+  error: 'Signed file URLs (createUploadUrl, createDownloadUrl) are not available in vibe dev; env.VIBE_R2 put, get, list and delete work locally. Test signed URLs on the preview: vibe preview.',
+};
+
+export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken, port) {
   return {
     // Explicit module graph (shim entry imports ./worker.js) — avoids Miniflare's
     // acorn-based auto-collection, which mis-parses the bundled worker.
@@ -194,6 +203,7 @@ export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken) {
       USER_SLUG: manifest.userSlug,
       ...secrets,
       PLATFORM_VIBE_TOKEN: vibeAccessToken,
+      PLATFORM_API_URL: `http://127.0.0.1:${port}${DEV_PLATFORM_PREFIX}`,
     },
   };
 }
@@ -464,7 +474,7 @@ async function main() {
 
   const secrets = loadDevVars();
   const vibeAccessToken = randomBytes(32).toString('hex');
-  const mf = new Miniflare(buildMfOptions(devDir, manifest, secrets, vibeAccessToken));
+  const mf = new Miniflare(buildMfOptions(devDir, manifest, secrets, vibeAccessToken, opts.port));
 
   // Forward a request to the worker via Miniflare.
   const dispatch = async (method, url, headers, body, internal) => {
@@ -488,6 +498,11 @@ async function main() {
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url, `http://localhost:${opts.port}`);
+      if (url.pathname.startsWith(DEV_PLATFORM_PREFIX + '/')) {
+        res.writeHead(501, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(DEV_PLATFORM_REFUSAL));
+        return;
+      }
       if (url.pathname === '/files' || url.pathname.startsWith('/files/')) {
         await serveR2File(req, url.pathname, res, mf, manifest);
         return;
@@ -580,7 +595,7 @@ async function main() {
       extraction = extractToolsWithWarnings(readFileSync(workerFile, 'utf8'));
       tools = extraction.tools;
       printDroppedTools(extraction.warnings);
-      await mf.setOptions(buildMfOptions(devDir, manifest, loadDevVars(), vibeAccessToken));
+      await mf.setOptions(buildMfOptions(devDir, manifest, loadDevVars(), vibeAccessToken, opts.port));
       console.log(`↻ reloaded (${new Date().toLocaleTimeString()})`);
     } catch (err) {
       console.error(`✗ reload failed: ${err && err.message || err}`);

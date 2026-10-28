@@ -105,17 +105,17 @@ test('vibe status keeps the plain label when the pointer is itself a production 
   assert.match(result.stdout, /Production: build 1800\n/);
 });
 
-// `vibe status --plan` keeps the bare tier on line 1 and adds the upgrade
-// path, so an agent can answer "how do I upgrade" from the CLI.
-for (const [plan, upgrade] of [
-  ['free', /^Upgrade: Pro \(\$9\/mo\) or Pro\+ \(\$20\/mo\) at https:\/\/vibe-coded\.ai\/billing$/m],
-  ['byov', /^Upgrade: Pro\+ \(\$20\/mo\) at https:\/\/vibe-coded\.ai\/billing$/m],
-  ['pro', /^Pro\+ is the highest plan\. Billing: https:\/\/vibe-coded\.ai\/billing$/m],
+// `vibe status --plan` names the plan on line 1 and adds the upgrade path,
+// so an agent can answer "how do I upgrade" from the CLI.
+for (const [plan, name, upgrade] of [
+  ['free', 'Free', /^Upgrade: Pro or Pro\+ at https:\/\/vibe-coded\.ai\/billing$/m],
+  ['byov', 'Pro', /^Upgrade: Pro\+ at https:\/\/vibe-coded\.ai\/billing$/m],
+  ['pro', 'Pro+', /^Pro\+ is the highest plan\. Billing: https:\/\/vibe-coded\.ai\/billing$/m],
 ]) {
-  test(`vibe status --plan on ${plan} prints the tier, then where to upgrade`, () => {
+  test(`vibe status --plan on ${plan} prints the plan name, then where to upgrade`, () => {
     const result = runStatus([['/api/v1/vibes', { success: true, plan, vibes: [] }]], ['status', '--plan']);
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.split('\n')[0], plan);
+    assert.equal(result.stdout.split('\n')[0], `Plan: ${name}`);
     assert.match(result.stdout, upgrade);
     assert.match(result.stdout, /^Plans and limits: https:\/\/vibe-coded\.ai\/pricing$/m);
   });

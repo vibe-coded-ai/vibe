@@ -3,7 +3,7 @@
 ## Access and owner checks
 
 New vibes start with visibility private and interaction policy invite_only. Publishing does not change these access settings.
-On private vibes, anonymous requests receive 401 before the worker runs, including webhook and cron requests.
+On private vibes, anonymous requests receive 401 before the worker runs, including webhook and cron requests. A host with no build yet answers 404 to everyone (production until the first publish).
 Visibility (private, unlisted, public) and interaction policy (public, public_read, authenticated, invite_only) change only on the website.
 Through MCP, get_vibe returns the manageUrl to give the owner; through the CLI, vibe settings prints the page.
 Check private vibes as the owner with call_tool / fetch_page through MCP, or vibe call / vibe fetch through the CLI.
@@ -46,6 +46,9 @@ Need strictly consistent queries? Use SQL.
 ## SQL (`env.VIBE_D1`, Pro or Pro+)
 
 Preview and production have separate databases; preview starts empty.
+On Free, `env.VIBE_D1` is bound but every call throws an error with
+`code: 'ENTITLEMENT_EXCEEDED'`, so `if (env.VIBE_D1)` does not detect the plan;
+catch that error, or keep Free data in KV.
 
 ```javascript
 async function _ensureTable(env) {            // call from write paths only; no "done" flag
@@ -126,8 +129,10 @@ own origin, under the vibe's visibility and interaction settings, so an
 just works and the browser can seek (range requests) and cache. Images, audio,
 video, PDFs, plain text and fonts display inline; anything else is a download
 (HTML, SVG and XML as plain text). Preview and production have separate files.
-`/files/` is reserved: a `files/` folder in the project is shadowed. Each read
-counts as a request against the vibe's daily and monthly limits.
+`/files/` is reserved on every vibe, Free included: the platform answers it (a
+key with nothing stored is 404 `File not found`), so a `files/` folder in the
+project is never served. Each read counts as a request against the vibe's daily
+and monthly limits.
 
 **Uploading from the browser:** large uploads go straight to R2 with a signed
 URL the worker mints:
@@ -192,6 +197,7 @@ async function create_bookmark(url, title, rating, env) { /* ... */ }
 ## Endpoints for machines (webhooks, cron)
 
 For people, rely on the vibe's visibility, interaction and invites.
+MCP tool calls pass the same gate, so a tool needs no password or token argument; one would land in the client's call log.
 For anonymous webhooks or cron, the owner must choose public or unlisted visibility and public interaction on the website, then protect the endpoint with a dedicated secret.
 A worker token cannot bypass the platform's access gate. Gate the endpoint with
 the token stored as a secret, sent in an

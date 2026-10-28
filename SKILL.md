@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.0
+version: 4.7.32
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -130,7 +130,7 @@ over hand-written files.
 local secret files (`.env*`, `.dev.vars`) and agent/editor folders. If the project
 has a build step (a `build` script in `package.json`) and it writes `dist/`, only
 `dist/` is served. Otherwise, uploaded files are readable at their paths by anyone
-who can open the vibe. `vibe preview` lists what it uploaded and what is readable.
+who can open the vibe; `vibe preview` lists them after a build that serves them.
 `.vibeignore` lists gitignore-style patterns relative to the project root to exclude
 files from preview uploads, local serving and watching, with `!` to re-include.
 Without this file, root README/REPORT/NOTES files and `*.md` are ignored by default.

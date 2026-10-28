@@ -150,6 +150,10 @@ const D1_ENTITLEMENT_REQUIRED = 'SQL storage (env.VIBE_D1) is unavailable for th
 
 const D1_READ_ONLY_TRIGGERS = 'This vibe\'s SQL data is read-only on the Free plan, and its database has triggers, so only SELECT and DROP TRIGGER run (drop the triggers first to delete rows). Writes need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing.';
 const D1_READ_ONLY_PLAN = 'This vibe\'s SQL data is read-only on the Free plan: reads and deletes work, writes need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "keep new data in KV storage", or upgrade and edit any file and build again.';
+// Value of d1:overquota:<vibeId> when the owner's plan has no SQL storage.
+// MUST stay identical to D1_OVERQUOTA_PLAN_FLAG (src/services/d1-usage-accounting.ts);
+// any other present value is a byte cap.
+const D1_OVERQUOTA_PLAN = 'plan';
 
 class D1EntitlementError extends Error {
   constructor(message = D1_ENTITLEMENT_REQUIRED) {
@@ -314,13 +318,22 @@ export function createPrefixedKV(kv, prefix) {
  * @returns {Promise<boolean>} true only if the flag is explicitly present
  */
 export async function readOverQuotaFlag(kv, key, label) {
+  return (await readOverQuotaFlagValue(kv, key, label)) !== null;
+}
+
+/**
+ * The flag's stored value, or null when it is absent or cannot be read (the
+ * same fail-open read as readOverQuotaFlag).
+ * @returns {Promise<string|null>}
+ */
+async function readOverQuotaFlagValue(kv, key, label) {
   try {
-    if (!kv || typeof kv.get !== 'function') return false;
+    if (!kv || typeof kv.get !== 'function') return null;
     const flag = await kv.get(key);
-    return flag !== null && flag !== undefined;
+    return flag === undefined ? null : flag;
   } catch (err) {
     console.warn(label + ' over-quota flag read failed (allowing write)', { error: String(err) });
-    return false;
+    return null;
   }
 }
 
@@ -830,7 +843,9 @@ export function createMeteredD1(db, opts) {
   // the plan gate, whatever the size; reads and recovery verbs still run. A
   // trigger created on the paid plan can turn an allowed DELETE (or a DROP
   // TABLE, through a cascading foreign key) into growth, so while the database
-  // has any trigger only SELECT and DROP TRIGGER run.
+  // has any trigger only SELECT and DROP TRIGGER run. The binding says so on a
+  // rebuilt worker; the platform's plan flag says so on one built before the
+  // downgrade (isReadOnly).
   const readOnly = options.readOnly === true;
   let hasTriggers; // per-request memo; undefined = not yet checked
   // Execution context — used for fire-and-forget usage reports via waitUntil so
@@ -849,7 +864,8 @@ export function createMeteredD1(db, opts) {
   let lastKnownBytes = null;
   // Last size we reported to the platform this request (null = none yet).
   let lastReportedBytes = null;
-  // Per-request memo of the over-quota flag (undefined = not yet read). The
+  // Per-request memo of the over-quota flag's value (undefined = not yet read,
+  // null = absent). The
   // wrapper is request-scoped (rebuilt per fetch), so caching one read spares a
   // chatty write loop N KV round-trips — the flag transitions off→on rarely and
   // the check is fail-open, so per-request granularity is enough.
@@ -902,18 +918,22 @@ export function createMeteredD1(db, opts) {
 
   // Per-user layer: FAIL-OPEN read of the platform-set flag (mirrors R2). Memoized
   // for the request lifetime (see overQuotaFlag above).
-  async function isOverQuotaFlag() {
+  async function overQuotaFlagValue() {
     if (overQuotaFlag === undefined) {
-      overQuotaFlag = await readOverQuotaFlag(capturedEnv && capturedEnv.VIBE_STORAGE, flagKey, 'D1');
+      overQuotaFlag = await readOverQuotaFlagValue(capturedEnv && capturedEnv.VIBE_STORAGE, flagKey, 'D1');
     }
     return overQuotaFlag;
+  }
+
+  async function isReadOnly() {
+    return readOnly || (await overQuotaFlagValue()) === D1_OVERQUOTA_PLAN;
   }
 
   async function isOverCap() {
     if (readOnly) return true;
     await ensureSizeKnown();
     const localOver = lastKnownBytes !== null && lastKnownBytes >= cap;
-    return localOver || await isOverQuotaFlag();
+    return localOver || (await overQuotaFlagValue()) !== null;
   }
 
   // Read-only mode: a recovery verb other than DROP TRIGGER is refused while the
@@ -935,7 +955,7 @@ export function createMeteredD1(db, opts) {
   // Throw if we're over either cap. No classification — callers decide whether
   // the operation can grow storage before invoking this.
   async function enforceIfOverCap() {
-    if (readOnly) throw new D1EntitlementError(D1_READ_ONLY_PLAN);
+    if (await isReadOnly()) throw new D1EntitlementError(D1_READ_ONLY_PLAN);
     if (await isOverCap()) {
       throw new Error('D1 storage quota exceeded for this vibe');
     }
@@ -977,7 +997,7 @@ export function createMeteredD1(db, opts) {
     const overCapNoop = async () => {
       if (!isGrowth) {
         if (isDropTrigger) hasTriggers = undefined; // the next delete rechecks
-        else if (readOnly && !isRead) await enforceNoTriggers();
+        else if (!isRead && await isReadOnly()) await enforceNoTriggers();
         return false;
       }
       if (isIdempotentDdl) return isOverCap();
@@ -1054,7 +1074,7 @@ export function createMeteredD1(db, opts) {
         if (metas.some(function (meta) { return !meta || (meta.isGrowth && !meta.isIdempotentDdl); })) {
           await enforceIfOverCap();
         }
-        if (readOnly && metas.some(function (meta) { return !meta.isRead && !meta.isGrowth && !meta.isDropTrigger; })) {
+        if (metas.some(function (meta) { return meta && !meta.isRead && !meta.isGrowth && !meta.isDropTrigger; }) && await isReadOnly()) {
           await enforceNoTriggers();
         }
         if (metas.some(function (meta) { return meta && meta.isDropTrigger; })) hasTriggers = undefined;

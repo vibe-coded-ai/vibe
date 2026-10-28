@@ -1,5 +1,5 @@
 // `vibe publish` keeps waiting when the promotion is only slow.
-// The platform answers 503 "Production promotion N is still in progress" once
+// The platform answers 202 "Production promotion N is still in progress" once
 // its ~25s wait runs out; the promotion then finishes on its own. Runs the
 // real CLI with a stub curl that answers by URL (a sequence per URL) and a
 // no-op sleep.
@@ -78,7 +78,7 @@ test('a slow promotion keeps waiting and ends in Published!', () => {
   ]);
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.stderr, /failed/i);
-  assert.match(result.stdout, /Promotion 2035 is still running/);
+  assert.match(result.stdout, /Promotion 2035 is taking longer than 25 seconds; still waiting/);
   assert.match(result.stdout, /Published!/);
 });
 

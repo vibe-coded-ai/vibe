@@ -4,7 +4,10 @@ Start from the platform's `vue` template. Through the CLI,
 run `vibe init --template vue <slug>` in an empty folder. Through MCP, read
 `vibe-coded://templates/vue`, then call `create_vibe` with `template: "vue"`.
 The starter files below are included; no manual copying is needed. The platform
-runs the build and serves `dist/`.
+runs the build and serves `dist/`. Creating the vibe sets the `<title>` in
+`index.html` to the vibe's title, and `App.vue` shows it as the heading. The
+starter loads no CSS framework; style components in `<style>` blocks or add
+one as a dependency so it is part of the build.
 
 ## File Structure
 
@@ -94,8 +97,7 @@ export default defineConfig({
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>My Vibe</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <title>Vue app</title>
 </head>
 <body>
   <div id="app"></div>
@@ -128,7 +130,7 @@ app.mount('#app');
 
 ```vue
 <script setup lang="ts">
-const title = 'My Vibe';
+const title = document.title;
 </script>
 
 <template>

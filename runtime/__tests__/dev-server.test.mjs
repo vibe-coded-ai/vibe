@@ -8,7 +8,7 @@ import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpat
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildMfOptions, extractTools, extractToolsWithWarnings, printDroppedTools, withDispatchHeaders, ipv6PortTaken, needsViteBuild } from '../dev-server.mjs';
+import { buildMfOptions, DEV_PLATFORM_PREFIX, DEV_PLATFORM_REFUSAL, extractTools, extractToolsWithWarnings, printDroppedTools, withDispatchHeaders, ipv6PortTaken, needsViteBuild } from '../dev-server.mjs';
 import { splitSqlStatements } from '../sql-statements.mjs';
 
 const VIBE_BIN = resolve(dirname(fileURLToPath(import.meta.url)), '../../bin/vibe');
@@ -229,6 +229,8 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     '  else',
     '    printf \'%s\\n\' \'{"success":true,"token":"conn-tok","jti":"new-jti","expiresAt":"2026-12-26T00:00:00.000Z","url":"https://tester--demo.vibe-coded.ai/mcp"}\'',
     '  fi',
+    'elif [[ "$method" = GET && "$url" == *"/mcp-tokens" ]]; then',
+    '  emit \'{"success":true,"url":"https://alice--demo.vibe-coded.ai/mcp"}\' 200',
     'elif [[ "$method" = DELETE && "$url" == *"/mcp-tokens/"* ]]; then',
     '  printf \'%s\\n\' \'{"success":true,"revoked":true}\'',
     'elif [[ "$method" = POST && "$url" == *"/r2/download-url" ]]; then',
@@ -714,6 +716,18 @@ test('buildMfOptions binds the per-run vibe access token', () => {
   assert.equal(options.bindings.PLATFORM_VIBE_TOKEN, token);
 });
 
+test('buildMfOptions points the shim at the local server for signed file URLs', () => {
+  const options = buildMfOptions('/tmp/vibe-dev-test', {
+    vibeId: '1',
+    vibeSlug: 'app',
+    userSlug: 'alice',
+  }, { PLATFORM_API_URL: 'https://vibe-coded.ai' }, 'c'.repeat(64), 8788);
+
+  assert.equal(options.bindings.PLATFORM_API_URL, `http://127.0.0.1:8788${DEV_PLATFORM_PREFIX}`);
+  assert.match(DEV_PLATFORM_REFUSAL.error, /not available in vibe dev/);
+  assert.match(DEV_PLATFORM_REFUSAL.error, /vibe preview/);
+});
+
 test('withDispatchHeaders proves write mode with the per-run token', () => {
   const token = 'b'.repeat(64);
   const headers = withDispatchHeaders({
@@ -866,7 +880,7 @@ test('vibe preview excludes .gitignore and lists every uploaded filename for a s
   const result = runPreview([], 'uploadnames');
   assert.equal(result.status, 0, result.stderr);
   assert.doesNotMatch(result.calls, /"(?:assets\/)?\.gitignore":/);
-  assert.match(result.stdout, /Uploaded 3 files \(3 publicly readable at their paths\)\. With no build step/);
+  assert.match(result.stdout, /Uploaded 3 files\.\n[\s\S]*With no build step, these 3 are publicly readable at their paths/);
   for (const path of ['index.html', 'assets/style.css', 'file with spaces.txt']) {
     assert.ok(result.stdout.includes(`  ${path}\n`), result.stdout);
   }
@@ -935,7 +949,7 @@ test('vibe preview without a build step describes which uploaded paths can be se
   const result = runPreview([], 'uploadnames');
 
   assert.equal(result.status, 0, result.stderr);
-  assert.ok(result.stdout.includes('Uploaded 3 files (3 publicly readable at their paths). With no build step, the paths below can be served (any the worker imports are bundled and not served):\n'), result.stdout);
+  assert.ok(result.stdout.includes('With no build step, these 3 are publicly readable at their paths (any the worker imports are bundled and not served):\n'), result.stdout);
   assert.doesNotMatch(result.stdout, /only dist\/ is served/);
   assert.equal(result.stderr.includes('Warning'), false, result.stderr);
 });
@@ -949,7 +963,7 @@ test('vibe preview describes file access using the vibe visibility and reuses th
       const access = visibility === 'private'
         ? 'readable at their paths by anyone who can open this vibe'
         : 'publicly readable at their paths';
-      assert.ok(result.stdout.includes(`Uploaded 3 files (3 ${access}). With no build step, the paths below can be served`), result.stdout);
+      assert.ok(result.stdout.includes(`With no build step, these 3 are ${access} (any the worker imports`), result.stdout);
       if (visibility === 'private') assert.doesNotMatch(result.stdout, /publicly readable/);
       assert.equal((result.calls.match(/^GET\thttps:\/\/stub\.invalid\/api\/v1\/vibes\/tester\/demo\t/gm) || []).length, 1);
     }
@@ -982,7 +996,7 @@ test('a local dist/ without a build step does not change the contract (dist/ is 
   const result = runPreview([], 'staledist');
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /publicly readable at their paths/);
+  assert.match(result.stdout, /this 1 is publicly readable at its path /);
 });
 
 test('vibe preview refuses ambiguous root worker.ts + worker.js before any request', () => {
@@ -1079,14 +1093,14 @@ test('vibe init rejects platform-invalid slugs before making an API call', () =>
   }
 });
 
-test('vibe init owner/slug points a collaborator to that vibe\'s MCP URL without an API call', () => {
+test('vibe init owner/slug checks the vibe is shared, then points a collaborator to its MCP URL', () => {
   const result = runCli('init', ['alice/demo', '--adopt']);
 
   assert.equal(result.status, 2);
   assert.match(result.stderr, /vibe init works on vibes you own/);
   assert.match(result.stderr, /https:\/\/alice--demo\.vibe-coded\.ai\/mcp/);
   assert.match(result.stderr, /run: vibe connect alice\/demo/);
-  assert.equal(result.calls, '');
+  assert.equal(result.calls, 'GET\thttps://stub.invalid/api/v1/vibes/alice/demo/mcp-tokens\t\n');
 });
 
 test('vibe init with your own owner/slug behaves like a plain slug', () => {
@@ -1100,7 +1114,7 @@ test('commands without a manifest explain shared-vibe MCP access without inventi
   const result = runCli('preview', [], 'nomanifest');
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /Run 'vibe init <slug>' first/);
+  assert.match(result.stderr, /^Error: No \.vibe-coded\.json in current directory\. Run vibe preview from your vibe's folder \(the one with \.vibe-coded\.json\), or set this folder up with 'vibe init <slug>'/);
   assert.match(result.stderr, /vibe preview works on vibes you own/);
   assert.match(result.stderr, /run: vibe connect <owner>\/<slug>/);
   assert.doesNotMatch(result.stderr, /https:\/\/.*--.*\.vibe-coded\.ai\/mcp/);
@@ -1181,7 +1195,7 @@ test('vibe urls labels preview URLs and only prints production URLs after publis
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /Production: not published yet \(run vibe publish\)/);
     assert.match(result.stdout, /Preview:\s+https:\/\/p--tester--demo\.vibe-coded\.ai/);
-    assert.doesNotMatch(result.stdout, /App:\s+https:\/\/p--|https:\/\/tester--demo\.vibe-coded\.ai|vibe connect/);
+    assert.doesNotMatch(result.stdout, /Production:\s+https:\/\/|https:\/\/tester--demo\.vibe-coded\.ai|vibe connect/);
   }
   for (const detail of [
     { success: true, vibe: { productionBuildId: 40 } },
@@ -1189,9 +1203,11 @@ test('vibe urls labels preview URLs and only prints production URLs after publis
   ]) {
     const result = runCli('urls', [], 'withworker', detail);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.stdout, /App:\s+https:\/\/tester--demo\.vibe-coded\.ai/);
+    assert.match(result.stdout, /\n  Production: https:\/\/tester--demo\.vibe-coded\.ai\n/);
+    // Both blocks are labelled the same way, with no bare heading line.
+    assert.doesNotMatch(result.stdout, /^Production:$/m);
     assert.match(result.stdout, /vibe connect/);
-    assert.doesNotMatch(result.stdout, /not published yet|App:\s+https:\/\/p--/);
+    assert.doesNotMatch(result.stdout, /not published yet|Production:\s+https:\/\/p--/);
   }
 });
 
@@ -1632,7 +1648,7 @@ test('an expired login during upload is not reported as a network failure', () =
 test('the preview file list leaves out the root worker, which is never served', () => {
   const result = runPreview([], 'withworker');
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Uploaded 2 files \(1 publicly readable at their paths\)/);
+  assert.match(result.stdout, /Uploaded 2 files\.\n[\s\S]*this 1 is publicly readable at its path /);
   assert.match(result.stdout, /^ {2}index\.html$/m);
   assert.doesNotMatch(result.stdout, /^ {2}worker\.js$/m);
   assert.match(result.calls, /"worker\.js":/);
