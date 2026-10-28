@@ -21,9 +21,10 @@
 
 import { createServer as createNetServer } from 'node:net';
 import { createServer } from 'node:http';
-import { readFileSync, existsSync, rmSync, mkdirSync, copyFileSync, writeFileSync, statSync } from 'node:fs';
-import { dirname, join, resolve, extname, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { readFileSync, existsSync, rmSync, mkdirSync, copyFileSync, writeFileSync, statSync, realpathSync } from 'node:fs';
+import { dirname, join, resolve, extname, relative, sep } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { splitSqlStatements } from './sql-statements.mjs';
@@ -38,16 +39,34 @@ const SKILL_DIR = dirname(dirname(fileURLToPath(import.meta.url))); // skills/vi
 const VENDORED_SHIM = join(SKILL_DIR, 'runtime', 'platform-shim.js');
 const MCP_PROTOCOL_VERSION = '2025-06-18';
 
-// ── Lazy deps (resolved from the skill's own node_modules) ────────────────────
+// The account plan bin/vibe read at start: free, byov (Pro) or pro (Pro+);
+// anything else is unknown (signed out, offline or a failed read).
+const PLAN = ['free', 'byov', 'pro'].includes(process.env.VIBE_DEV_PLAN) ? process.env.VIBE_DEV_PLAN : 'unknown';
+
+// ── Lazy deps ─────────────────────────────────────────────────────────────────
+// bin/vibe installs the packages in a per-version cache outside the skill and
+// names it in VIBE_DEV_DEPS. A bare import resolves from this file's directory,
+// so each package is resolved from that folder and imported by file URL.
+// Resolution also searches ancestor node_modules folders and NODE_PATH, so a
+// package found anywhere but the folder's own node_modules counts as missing.
+const DEPS_DIR = process.env.VIBE_DEV_DEPS || SKILL_DIR;
+
+async function importDep(name) {
+  const modules = realpathSync(join(DEPS_DIR, 'node_modules'));
+  const resolved = realpathSync(createRequire(join(DEPS_DIR, 'package.json')).resolve(name));
+  if (!resolved.startsWith(modules + sep)) throw new Error(`${name} is not installed in ${modules}`);
+  return import(pathToFileURL(resolved).href);
+}
+
 async function loadDeps() {
   try {
-    const { Miniflare } = await import('miniflare');
-    const chokidar = (await import('chokidar')).default;
+    const { Miniflare } = await importDep('miniflare');
+    const chokidar = (await importDep('chokidar')).default;
     return { Miniflare, chokidar };
   } catch (err) {
     console.error(
-      'Error: local dev dependencies not installed.\n' +
-      `Run:  (cd "${SKILL_DIR}" && npm install)\n` +
+      `Error: local dev dependencies could not be loaded from ${DEPS_DIR}.\n` +
+      (process.env.VIBE_DEV_DEPS ? `Remove ${DEPS_DIR} and run vibe dev again to reinstall them.\n` : 'Start it with vibe dev, which installs them.\n') +
       `Cause: ${err && err.message ? err.message : err}`
     );
     process.exit(1);
@@ -152,9 +171,9 @@ async function bundleWorker(entry, outFile) {
     return;
   }
   let esbuild;
-  try { esbuild = await import('esbuild'); }
+  try { esbuild = await importDep('esbuild'); }
   catch {
-    console.error(`Error: need either 'bun' on PATH or esbuild installed (cd "${SKILL_DIR}" && npm install).`);
+    console.error(`Error: need either 'bun' on PATH or esbuild in ${DEPS_DIR}; vibe dev installs it.`);
     process.exit(1);
   }
   await esbuild.build({
@@ -173,7 +192,13 @@ export const DEV_PLATFORM_REFUSAL = {
   error: 'Signed file URLs (createUploadUrl, createDownloadUrl) are not available in vibe dev; env.VIBE_R2 put, get, list and delete work locally. Test signed URLs on the preview: vibe preview.',
 };
 
-export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken, port) {
+export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken, port, plan = 'unknown') {
+  // A Free deploy has no VIBE_D1 or VIBE_R2 binding (cf-api.ts). Without
+  // VIBE_D1 the shim installs the binding that throws the plan error.
+  const sqlAndFiles = plan === 'free' ? {} : {
+    d1Databases: { VIBE_D1: 'VIBE_D1' },
+    r2Buckets: { VIBE_R2: 'VIBE_R2' },
+  };
   return {
     // Explicit module graph (shim entry imports ./worker.js) — avoids Miniflare's
     // acorn-based auto-collection, which mis-parses the bundled worker.
@@ -192,8 +217,7 @@ export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken, port)
     host: '127.0.0.1',
     port: 0,
     kvNamespaces: { VIBE_STORAGE: 'VIBE_STORAGE' },
-    d1Databases: { VIBE_D1: 'VIBE_D1' },
-    r2Buckets: { VIBE_R2: 'VIBE_R2' },
+    ...sqlAndFiles,
     kvPersist: join(devDir, 'kv'),
     d1Persist: join(devDir, 'd1'),
     r2Persist: join(devDir, 'r2'),
@@ -316,7 +340,7 @@ export function createVibeIgnore(root) {
     if (!path || path === '..' || path.startsWith('../')) return false;
     // Mandatory local-only exclusions cannot be re-included.
     if (/^(node_modules|dist|\.git|\.vibe-coded)\//.test(path)
-      || /(^|\/)(\.git|\.vibeignore|\.vibe-coded\.json|\.DS_Store|\.gitignore|\.env[^/]*|\.dev\.vars|[^/]*\.(map|sql)|\.aider[^/]*)(\/|$)/.test(path)
+      || /(^|\/)(\.git|\.vibeignore|\.vibe-coded\.json(\.[^/]*)?|\.DS_Store|\.gitignore|\.env[^/]*|\.dev\.vars|[^/]*\.(map|sql)|\.aider[^/]*)(\/|$)/.test(path)
       || /(^|\/)(\.claude|\.cursor|\.codex|\.agents|\.gemini|\.windsurf|\.continue|\.aider|\.vscode|\.idea|\.zed)(\/|$)/.test(path)
       || /^(AGENTS|CLAUDE|GEMINI|MODEL|[^/]*-MODEL|OBSERVATIONS|SPEC|TODO|NOTES|README)\.md$/i.test(path)) return true;
     const ignoreFile = join(root, '.vibeignore');
@@ -367,8 +391,9 @@ async function serveR2File(req, pathname, res, mf, manifest) {
     refuse(404, 'File not found');
     return;
   }
-  const bucket = await mf.getR2Bucket('VIBE_R2');
-  const object = req.method === 'HEAD' ? await bucket.head(fullKey) : await bucket.get(fullKey);
+  // Free has no file storage, so every key is missing there.
+  const bucket = PLAN === 'free' ? null : await mf.getR2Bucket('VIBE_R2');
+  const object = !bucket ? null : req.method === 'HEAD' ? await bucket.head(fullKey) : await bucket.get(fullKey);
   if (!object) {
     refuse(404, 'File not found');
     return;
@@ -442,6 +467,10 @@ export function needsViteBuild(dir) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const manifest = loadManifest();
+  if (opts.seed && PLAN === 'free') {
+    console.error('Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use KV storage".');
+    process.exit(1);
+  }
   const isIgnored = createVibeIgnore(process.cwd());
   const devDir = resolve('.vibe-coded', 'dev');
 
@@ -474,7 +503,7 @@ async function main() {
 
   const secrets = loadDevVars();
   const vibeAccessToken = randomBytes(32).toString('hex');
-  const mf = new Miniflare(buildMfOptions(devDir, manifest, secrets, vibeAccessToken, opts.port));
+  const mf = new Miniflare(buildMfOptions(devDir, manifest, secrets, vibeAccessToken, opts.port, PLAN));
 
   // Forward a request to the worker via Miniflare.
   const dispatch = async (method, url, headers, body, internal) => {
@@ -595,7 +624,7 @@ async function main() {
       extraction = extractToolsWithWarnings(readFileSync(workerFile, 'utf8'));
       tools = extraction.tools;
       printDroppedTools(extraction.warnings);
-      await mf.setOptions(buildMfOptions(devDir, manifest, loadDevVars(), vibeAccessToken, opts.port));
+      await mf.setOptions(buildMfOptions(devDir, manifest, loadDevVars(), vibeAccessToken, opts.port, PLAN));
       console.log(`↻ reloaded (${new Date().toLocaleTimeString()})`);
     } catch (err) {
       console.error(`✗ reload failed: ${err && err.message || err}`);
@@ -618,13 +647,23 @@ async function main() {
   process.on('SIGTERM', shutdown);
 }
 
+const PLAN_LINES = {
+  free: ['Free — as deployed, env.VIBE_D1 throws the plan error and there is no env.VIBE_R2.',
+    'SQL and files need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing'],
+  byov: ['Pro — SQL, key-value and files, as deployed.'],
+  pro: ['Pro+ — SQL, key-value and files, as deployed.'],
+  unknown: ['unknown (signed out, offline or the read failed). SQL and files work here,',
+    'but a vibe on the Free plan has neither once deployed.'],
+};
+
 function printBanner(manifest, port, tools) {
   console.log('');
-  console.log(`  vibe dev — ${manifest.userSlug}/${manifest.vibeSlug} (${manifest.storage})`);
+  console.log(`  vibe dev — ${manifest.userSlug}/${manifest.vibeSlug} (${manifest.storage === 'd1' ? 'sql' : manifest.storage})`);
   console.log(`  Local:   http://127.0.0.1:${port}`);
   console.log(`  API:     http://127.0.0.1:${port}/api/<function>`);
   console.log(`  MCP:     http://127.0.0.1:${port}/mcp  (${tools.length} tool${tools.length === 1 ? '' : 's'})`);
-  console.log(`  State:   .vibe-coded/dev/  (D1 + KV + R2, persisted)`);
+  console.log(`  State:   .vibe-coded/dev/  (${PLAN === 'free' ? 'KV' : 'D1 + KV + R2'}, persisted)`);
+  PLAN_LINES[PLAN].forEach((line, i) => console.log(`  ${i ? '        ' : 'Plan:   '} ${line}`));
   console.log('  Watching worker for changes — Ctrl-C to stop.');
   if (needsViteBuild(process.cwd())) {
     console.log('');

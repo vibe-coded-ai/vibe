@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.32
+version: 4.7.33
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash

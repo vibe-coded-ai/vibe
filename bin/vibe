@@ -238,10 +238,11 @@ _print_budget_line() {
 }
 
 # Plan lookup: prints the raw GET /api/v1/vibes result once it carries a plan.
-# An optional query string (e.g. "?budget=1") is appended to the path.
+# An optional query string (e.g. "?budget=1") is appended to the path; further
+# arguments go to curl.
 _plan_lookup() {
   local result success error
-  if ! result=$(_api GET "/api/v1/vibes${1:-}"); then
+  if ! result=$(_api GET "/api/v1/vibes${1:-}" "${@:2}"); then
     return 1
   fi
   if ! success=$(echo "$result" | jq -r '.success // false' 2>/dev/null); then
@@ -388,6 +389,21 @@ STORAGE_IN_USE_JQ='def storage_in_use: . as $v
   | if length > 0 then join(", ") else ($v.storageType // "kv") end;
 def storage_note: if (.storageType // "kv") == "kv" and (storage_in_use | split(", ") | index("kv") == null)
   then " (KV is measured hourly)" else "" end;'
+
+# Set .vibe-coded.json's storage from a vibe-detail result ($1): d1 once the
+# platform records SQL for the vibe, else its recorded type. vibe dev's banner
+# reads the manifest. The file is rewritten only when the storage it implies
+# (absent means kv) differs, so ordinary runs never touch it.
+_sync_manifest_storage() {
+  local recorded manifest_tmp
+  recorded=$(printf '%s' "$1" | jq -r "$STORAGE_IN_USE_JQ"' select(.success == true) | (.vibe // .)
+    | select(.storageType == "kv" or .storageType == "d1")
+    | if storage_in_use | split(", ") | index("sql") then "d1" else "kv" end' 2>/dev/null) || return 0
+  [ -n "$recorded" ] && [ "$recorded" != "$(jq -r '.storage // "kv"' .vibe-coded.json)" ] || return 0
+  manifest_tmp=$(mktemp .vibe-coded.json.XXXXXX)
+  jq --arg storage "$recorded" '.storage = $storage' .vibe-coded.json > "$manifest_tmp"
+  mv "$manifest_tmp" .vibe-coded.json
+}
 
 _print_settings() {
   jq '.vibe // . | {title, visibility, interactionPolicy} + (if .visibility == "private" then {interactionPolicyNote: "applies once the vibe is public or unlisted; while it is private, only you and people you invite can open it"} else {} end)'
@@ -1046,7 +1062,7 @@ _vibeignore_is_ignored() {
   local path="$1" ignored=1 i=0
   # Mandatory local-only exclusions cannot be re-included.
   [[ "$path" =~ ^(node_modules|dist|\.git|\.vibe-coded)/ ]] && return 0
-  [[ "$path" =~ (^|/)(\.git|\.vibeignore|\.vibe-coded\.json|\.DS_Store|\.gitignore|\.env[^/]*|\.dev\.vars|[^/]*\.(map|sql)|\.aider[^/]*)(/|$) ]] && return 0
+  [[ "$path" =~ (^|/)(\.git|\.vibeignore|\.vibe-coded\.json(\.[^/]*)?|\.DS_Store|\.gitignore|\.env[^/]*|\.dev\.vars|[^/]*\.(map|sql)|\.aider[^/]*)(/|$) ]] && return 0
   [[ "$path" =~ (^|/)(\.claude|\.cursor|\.codex|\.agents|\.gemini|\.windsurf|\.continue|\.aider|\.vscode|\.idea|\.zed)(/|$) ]] && return 0
   shopt -s nocasematch
   if [[ "$path" =~ ^(AGENTS|CLAUDE|GEMINI|MODEL|[^/]*-MODEL|OBSERVATIONS|SPEC|TODO|NOTES|README)\.md$ ]]; then
@@ -1098,6 +1114,7 @@ cmd_preview() {
   local vibe_info visibility file_access
   # Only used for wording; a failed lookup must never block the upload.
   vibe_info=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) || vibe_info=""
+  _sync_manifest_storage "$vibe_info"
   visibility=$(echo "$vibe_info" | jq -r '.vibe.visibility // .visibility // empty')
   case "$visibility" in
     public|unlisted) file_access="publicly readable at their paths" ;;
@@ -1339,6 +1356,7 @@ cmd_preview() {
       # best effort: the build already succeeded, so a refused read waits out a
       # short Retry-After once, then prints a fallback line instead of a 429.
       vibe_info=$(_quiet_vibe_lookup)
+      _sync_manifest_storage "$vibe_info"
       _print_tool_count "$vibe_info" 1 preview
       echo "  Run 'vibe publish' to go live."
       exit 0
@@ -1403,6 +1421,7 @@ cmd_publish() {
   # preview it serves): a newer failed preview is the platform's refusal to give.
   local info preview_id production_id
   if [ "$force" = 0 ] && info=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null) && printf '%s' "$info" | jq -e '.success == true' >/dev/null 2>&1; then
+    _sync_manifest_storage "$info"
     preview_id=$(printf '%s' "$info" | jq -r '.vibe.previewBuildId // .previewBuildId // empty')
     production_id=$(printf '%s' "$info" | jq -r '.vibe.productionBuildId // .productionBuildId // empty')
     if [ -n "$production_id" ] && [ "$production_id" = "$preview_id" ] \
@@ -1475,6 +1494,7 @@ cmd_publish() {
     # Reading the sharing settings is best effort: a refused lookup must not
     # make a finished publish look failed.
     current=$(_quiet_vibe_lookup)
+    _sync_manifest_storage "$current"
     visibility=$(echo "$current" | jq -r '(.vibe.visibility // .visibility) // empty' 2>/dev/null) || visibility=""
     if [ -z "$visibility" ]; then
       echo "Who can open it: the sharing settings could not be read just now; see $manage_url (private by default: anonymous requests get 401)."
@@ -1552,6 +1572,7 @@ cmd_status() {
   # Vibe info (fields nested under .vibe in detail response)
   _status_fetch "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG"
   INFO="$STATUS_BODY"
+  _sync_manifest_storage "$INFO"
 
   echo "Vibe: $USER_SLUG/$VIBE_SLUG"
   echo ""
@@ -2931,7 +2952,7 @@ USAGE
 }
 
 cmd_dev() {
-  # Local dev — fully offline, no credentials needed.
+  # Local dev. Runs offline without credentials; signed in, it reads the plan once.
   _load_manifest
   _ensure_gitignore
   local type storage
@@ -3008,12 +3029,44 @@ NODE
     [ $? -eq 0 ] || exit 1
   fi
 
-  local skill_dir; skill_dir="$(_resolve_skill_dir)"
-  if [ ! -d "$skill_dir/node_modules/miniflare" ]; then
-    echo "First run: installing local dev dependencies (miniflare, esbuild, chokidar) in $skill_dir …"
-    ( cd "$skill_dir" && npm install --silent ) \
-      || { echo "Error: npm install failed in $skill_dir." >&2; exit 1; }
+  # The runtime's packages install once per skill version into the user's
+  # cache, never into the skill folder; dev-server.mjs loads them from there.
+  # One install per version runs at a time: the <version>.lock directory is
+  # held while npm runs, released on any exit, and a lock older than 10
+  # minutes belongs to an install that was killed.
+  local skill_dir deps_dir lock waiting=""
+  skill_dir="$(_resolve_skill_dir)"
+  deps_dir="${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime/$(jq -r '.version' "$skill_dir/package.json")"
+  if [ ! -f "$deps_dir/installed" ]; then
+    lock="$deps_dir.lock"
+    mkdir -p "${deps_dir%/*}"
+    until mkdir "$lock" 2>/dev/null; do
+      if [ -n "$(find "$lock" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+        rmdir "$lock" 2>/dev/null || true
+        continue
+      fi
+      [ -n "$waiting" ] || { waiting=1; echo "Waiting for another vibe dev to finish installing in $deps_dir …"; }
+      sleep 1
+    done
+    trap "rmdir $(printf '%q' "$lock") 2>/dev/null; unset TOKEN 2>/dev/null" EXIT
+    if [ ! -f "$deps_dir/installed" ]; then
+      echo "First run: installing local dev dependencies (miniflare, esbuild, chokidar) in $deps_dir …"
+      mkdir -p "$deps_dir" && cp "$skill_dir/package.json" "$deps_dir/package.json" \
+        && ( cd "$deps_dir" && npm install --silent ) && touch "$deps_dir/installed" \
+        || { echo "Error: npm install failed in $deps_dir." >&2; exit 1; }
+    fi
+    rmdir "$lock"
+    trap 'unset TOKEN 2>/dev/null' EXIT
   fi
+
+  # Storage is bound as the account's plan deploys it. Signed out, offline or
+  # on a failed read the plan is unknown and every binding stays. --retry 0
+  # keeps a ~/.curlrc retry setting from stretching the 5 s cap.
+  local plan=""
+  if [ -f "$CREDS" ]; then
+    plan=$( (_load_creds && _API_NO_RETRY=1 _plan_lookup "" --retry 0 --connect-timeout 3 --max-time 5 | jq -r '.plan') 2>/dev/null ) || plan=""
+  fi
+  export VIBE_DEV_DEPS="$deps_dir" VIBE_DEV_PLAN="${plan:-unknown}"
 
   # The process keeps "vibe dev <args>" as its name, so pkill -f "vibe dev"
   # and pkill -f "vibe dev --port N" both find it.
@@ -3072,7 +3125,7 @@ _print_command_help() {
     templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates served by the platform." ;;
     list) printf '%s\n' "Usage: vibe list" "List your vibes; * marks the current folder's vibe. No manifest needed." ;;
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
-    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] | vibe dev seed <file.sql>" "Run the worker and local storage offline; --reset clears local state." "On first run, installs miniflare, esbuild and chokidar with npm in the skill directory." ;;
+    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan once and binds storage as a deploy does (Free: no SQL or files)." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
     preview|deploy) printf '%s\n' "Usage: vibe preview [--prune|--no-prune]" "Mirror local source to preview and wait for its build." "Uploads are limited to 30 an hour per account and address, separate from the build allowance." ;;
     publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." "--plan shows your plan instead: monthly calls, vibes, preview builds and source uploads used. No .vibe-coded.json needed." ;;
@@ -3194,7 +3247,7 @@ case "${1:-help}" in
     echo "  templates                    List runnable starter templates"
     echo "  list                         List your vibes (marks the current folder's vibe)"
     echo "  source [path]                List deployed source or read a file's exact bytes"
-    echo "  dev [--port N] [--reset]     Run the worker locally (SQL, key-value and file storage; reloads on save)"
+    echo "  dev [--port N] [--reset]     Run the worker locally (your plan's storage; reloads on save)"
     echo "  dev seed <file.sql>          Apply SQL to the local database"
     echo "  preview [--prune|--no-prune] Upload source, prune stale files, and build (alias: deploy)"
     echo "  publish [--open]             Promote preview to production (--open: app or sharing page in the browser)"
@@ -3213,7 +3266,7 @@ case "${1:-help}" in
     echo ""
     echo "Help: vibe help <command> or vibe help <command> <subcommand> (e.g. vibe help files upload)"
     echo ""
-    echo "Develop locally with 'vibe dev' (local worker with SQL, key-value and file storage) — preview/publish when ready."
+    echo "Develop locally with 'vibe dev' (local worker with your plan's storage) — preview/publish when ready."
     echo ""
     echo "Credentials: ~/.vibe-coded/credentials.json (run 'vibe login')"
     echo "Manifest:    .vibe-coded.json (created by init)"

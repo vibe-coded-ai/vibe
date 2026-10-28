@@ -7,8 +7,8 @@ import { createServer } from 'node:net';
 import { copyFileSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { buildMfOptions, DEV_PLATFORM_PREFIX, DEV_PLATFORM_REFUSAL, extractTools, extractToolsWithWarnings, printDroppedTools, withDispatchHeaders, ipv6PortTaken, needsViteBuild } from '../dev-server.mjs';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { buildMfOptions, createVibeIgnore, DEV_PLATFORM_PREFIX, DEV_PLATFORM_REFUSAL, extractTools, extractToolsWithWarnings, printDroppedTools, withDispatchHeaders, ipv6PortTaken, needsViteBuild } from '../dev-server.mjs';
 import { splitSqlStatements } from '../sql-statements.mjs';
 
 const VIBE_BIN = resolve(dirname(fileURLToPath(import.meta.url)), '../../bin/vibe');
@@ -335,9 +335,11 @@ function getFreePort() {
   });
 }
 
-function setupDevRuntime() {
+// depsDir: where the stub packages go, relative to the temp root (default: the skill).
+function setupDevRuntime(depsDir = 'skill') {
   const root = mkdtempSync(join(tmpdir(), 'vibe-dev-reset-test-'));
   const skillDir = join(root, 'skill');
+  const modules = join(root, depsDir, 'node_modules');
   const runtimeDir = join(skillDir, 'runtime');
   const project = join(root, 'project');
   const devDir = join(project, '.vibe-coded', 'dev');
@@ -356,11 +358,11 @@ function setupDevRuntime() {
   // esbuild stub: without bun on PATH the dev server bundles via esbuild; the stub
   // copies the entry so this test doesn't depend on either being installed.
   for (const packageName of ['miniflare', 'chokidar', 'esbuild']) {
-    const packageDir = join(skillDir, 'node_modules', packageName);
+    const packageDir = join(modules, packageName);
     mkdirSync(packageDir, { recursive: true });
     writeFileSync(join(packageDir, 'package.json'), JSON.stringify({ type: 'module', exports: './index.js' }));
   }
-  writeFileSync(join(skillDir, 'node_modules', 'miniflare', 'index.js'), `
+  writeFileSync(join(modules, 'miniflare', 'index.js'), `
     export class Miniflare {
       async dispatchFetch(url) {
         return new URL(url).pathname.startsWith('/files')
@@ -392,11 +394,11 @@ function setupDevRuntime() {
       async setOptions() {}
     }
   `);
-  writeFileSync(join(skillDir, 'node_modules', 'esbuild', 'index.js'), `
+  writeFileSync(join(modules, 'esbuild', 'index.js'), `
     import { copyFileSync } from 'node:fs';
     export async function build({ entryPoints, outfile }) { copyFileSync(entryPoints[0], outfile); }
   `);
-  writeFileSync(join(skillDir, 'node_modules', 'chokidar', 'index.js'), `
+  writeFileSync(join(modules, 'chokidar', 'index.js'), `
     import assert from 'node:assert/strict';
     import { statSync, writeFileSync, unlinkSync } from 'node:fs';
     import { resolve } from 'node:path';
@@ -412,7 +414,7 @@ function setupDevRuntime() {
       return { on() { return this; }, async close() {} };
     } };
   `);
-  return { root, runtimeDir, project, devDir, staleFile };
+  return { root, runtimeDir, project, devDir, staleFile, modules };
 }
 
 test('vibe dev --reset starts the server and honours ignore rules for serving and watching', async (t) => {
@@ -828,6 +830,176 @@ test('vibe dev drops Authorization, Cookie and unknown headers before the worker
   assert.equal(seen.accept, 'application/json');
   child.kill('SIGTERM');
   await new Promise(resolveExit => child.once('exit', resolveExit));
+});
+
+// Start dev-server.mjs and resolve once its banner is printed; null when the
+// environment forbids loopback binding (the test is then skipped).
+async function startDevServer(t, root, runtimeDir, project, env) {
+  let port;
+  try {
+    port = await getFreePort();
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    if (error?.code === 'EPERM') { t.skip('loopback binding is not permitted in this environment'); return null; }
+    throw error;
+  }
+  const child = spawn(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), '--port', String(port)], {
+    cwd: project, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { output += chunk; });
+  t.after(() => {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    rmSync(root, { recursive: true, force: true });
+  });
+  await new Promise((resolveStarted, reject) => {
+    const timer = setTimeout(() => reject(new Error(`server did not start\n${output}`)), 10000);
+    child.stdout.on('data', () => {
+      if (output.includes('Watching worker for changes')) { clearTimeout(timer); resolveStarted(); }
+    });
+    child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`server exited (${code})\n${output}`)); });
+  });
+  return { base: `http://127.0.0.1:${port}`, output: () => output };
+}
+
+test('vibe dev loads miniflare, chokidar and esbuild from VIBE_DEV_DEPS, with nothing in the skill folder', async (t) => {
+  const { root, runtimeDir, project, devDir } = setupDevRuntime('cache');
+  assert.equal(existsSync(join(root, 'skill', 'node_modules')), false);
+  // No bun on PATH, so the worker is bundled with the esbuild package too.
+  const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_DEPS: join(root, 'cache'), PATH: '/usr/bin:/bin' });
+  if (!server) return;
+  assert.equal(existsSync(join(devDir, 'worker.js')), true);
+  assert.equal(existsSync(join(root, 'skill', 'node_modules')), false);
+});
+
+for (const via of ['NODE_PATH', 'an ancestor folder']) {
+  test(`vibe dev treats a package found through ${via} as not installed in its cache folder`, () => {
+    // The stub packages sit outside the cache: in another folder named by
+    // NODE_PATH, or in node_modules at the temp root above the cache.
+    const { root, runtimeDir, project, modules } = setupDevRuntime(via === 'NODE_PATH' ? 'elsewhere' : '.');
+    const cache = join(root, 'sub', 'cache');
+    try {
+      mkdirSync(join(cache, 'node_modules'), { recursive: true });
+      writeFileSync(join(project, 'seed.sql'), 'CREATE TABLE t (id INTEGER);');
+      const result = spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), 'seed', 'seed.sql'], {
+        cwd: project, encoding: 'utf8', timeout: 10000,
+        env: { ...process.env, VIBE_DEV_DEPS: cache, ...(via === 'NODE_PATH' ? { NODE_PATH: modules } : {}) },
+      });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.ok(result.stderr.startsWith(`Error: local dev dependencies could not be loaded from ${cache}.\nRemove ${cache} and run vibe dev again to reinstall them.\nCause: miniflare is not installed in ${realpathSync(join(cache, 'node_modules'))}`), result.stderr);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test('vibe dev never serves a manifest scratch file', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-dev-ignore-'));
+  try {
+    const isIgnored = createVibeIgnore(root);
+    for (const file of ['.vibe-coded.json', '.vibe-coded.json.AbC123', 'nested/.vibe-coded.json.x']) assert.equal(isIgnored(join(root, file)), true, file);
+    assert.equal(isIgnored(join(root, 'vibe-coded.json.txt')), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const [plan, bound, lines] of [
+  ['free', false, [
+    '  State:   .vibe-coded/dev/  (KV, persisted)',
+    '  Plan:    Free — as deployed, env.VIBE_D1 throws the plan error and there is no env.VIBE_R2.',
+    '           SQL and files need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing',
+  ]],
+  ['byov', true, ['  State:   .vibe-coded/dev/  (D1 + KV + R2, persisted)', '  Plan:    Pro — SQL, key-value and files, as deployed.']],
+  ['pro', true, ['  State:   .vibe-coded/dev/  (D1 + KV + R2, persisted)', '  Plan:    Pro+ — SQL, key-value and files, as deployed.']],
+  [undefined, true, [
+    '  State:   .vibe-coded/dev/  (D1 + KV + R2, persisted)',
+    '  Plan:    unknown (signed out, offline or the read failed). SQL and files work here,',
+    '           but a vibe on the Free plan has neither once deployed.',
+  ]],
+]) {
+  test(`vibe dev on plan ${plan ?? 'unknown'} binds ${bound ? 'SQL and files' : 'neither SQL nor files'} and says so in the banner`, async (t) => {
+    const { root, runtimeDir, project, modules } = setupDevRuntime();
+    const optionsFile = join(root, 'miniflare-options.json');
+    writeFileSync(join(modules, 'miniflare', 'index.js'), `
+      import { writeFileSync } from 'node:fs';
+      export class Miniflare {
+        constructor(options) { this.options = options; writeFileSync(${JSON.stringify(optionsFile)}, JSON.stringify(options)); }
+        async dispatchFetch() { return new Response('not found', { status: 404 }); }
+        async getR2Bucket(name) {
+          // Real Miniflare throws for a bucket it was not given.
+          if (!this.options.r2Buckets?.[name]) throw new Error(name + ' is not bound');
+          return { async get() { return null; }, async head() { return null; } };
+        }
+        async dispose() {}
+        async setOptions() {}
+      }
+    `);
+    writeFileSync(join(project, '.vibe-coded.json'), JSON.stringify({ vibeSlug: 'demo', userSlug: 'tester', type: 'fullstack', storage: 'd1' }));
+    const server = await startDevServer(t, root, runtimeDir, project, plan ? { VIBE_DEV_PLAN: plan } : {});
+    if (!server) return;
+    const options = JSON.parse(readFileSync(optionsFile, 'utf8'));
+    assert.deepEqual(options.kvNamespaces, { VIBE_STORAGE: 'VIBE_STORAGE' });
+    assert.deepEqual(options.d1Databases, bound ? { VIBE_D1: 'VIBE_D1' } : undefined);
+    assert.deepEqual(options.r2Buckets, bound ? { VIBE_R2: 'VIBE_R2' } : undefined);
+    const output = server.output();
+    assert.ok(output.includes('  vibe dev — tester/demo (sql)\n'), output);
+    assert.ok(output.includes(lines.join('\n') + '\n  Watching worker for changes'), output);
+    const file = await fetch(server.base + '/files/logo.png');
+    assert.equal(file.status, 404);
+    assert.deepEqual(await file.json(), { success: false, error: 'File not found' });
+  });
+}
+
+test('vibe dev seed on Free refuses before starting Miniflare: the deployed vibe has no SQL', () => {
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  try {
+    writeFileSync(join(modules, 'miniflare', 'index.js'), `
+      export class Miniflare { constructor() { console.log('Miniflare started'); } }
+    `);
+    writeFileSync(join(project, 'seed.sql'), 'CREATE TABLE t (id INTEGER);');
+    const result = spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), 'seed', 'seed.sql'], {
+      cwd: project, encoding: 'utf8', timeout: 10000, env: { ...process.env, VIBE_DEV_PLAN: 'free' },
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr, 'Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use KV storage".\n');
+    assert.doesNotMatch(result.stdout, /Miniflare started/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the Free bindings reach the worker through the shim as production does: env.VIBE_D1 throws the plan error, no env.VIBE_R2', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vibe-dev-free-shim-'));
+  try {
+    copyFileSync(join(RUNTIME_DIR, 'platform-shim.js'), join(dir, '_platform-shim.js'));
+    writeFileSync(join(dir, 'worker.js'), `export default { async fetch(request, env) {
+      if (new URL(request.url).pathname === '/api/files') return Response.json({ r2: typeof env.VIBE_R2 });
+      await env.VIBE_D1.prepare('SELECT 1').all();
+      return new Response('SQL ran');
+    } };`);
+    const shim = (await import(pathToFileURL(join(dir, '_platform-shim.js')).href)).default;
+    const manifest = { vibeId: '1', vibeSlug: 'demo', userSlug: 'tester' };
+    const token = 'd'.repeat(64);
+    const options = buildMfOptions(join(dir, 'dev'), manifest, {}, token, 8787, 'free');
+    // Miniflare puts every bindings entry and every named namespace, database and bucket on env.
+    const env = { ...options.bindings };
+    for (const group of ['kvNamespaces', 'd1Databases', 'r2Buckets']) {
+      for (const name of Object.keys(options[group] || {})) env[name] = { binding: name };
+    }
+    const call = (path) => shim.fetch(new Request(`http://localhost${path}`, { headers: withDispatchHeaders({}, manifest, token) }), env, {});
+
+    const sql = await call('/api/sql');
+    assert.equal(sql.status, 403);
+    const body = await sql.json();
+    assert.equal(body.code, 'ENTITLEMENT_EXCEEDED');
+    assert.equal(body.limitType, 'd1_storage');
+    assert.match(body.error, /^SQL storage \(env\.VIBE_D1\) is unavailable for this vibe\. SQL requires Pro \(\$9\/mo\) or Pro\+ \(\$20\/mo\)/);
+    assert.deepEqual(await (await call('/api/files')).json(), { r2: 'undefined' });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('vendored dispatch-header-policy.mjs is byte-identical to the platform copy', (t) => {
