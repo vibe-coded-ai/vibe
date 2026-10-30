@@ -9,6 +9,17 @@ Through MCP, get_vibe returns the manageUrl to give the owner; through the CLI, 
 Check private vibes as the owner with call_tool / fetch_page through MCP, or vibe call / vibe fetch through the CLI.
 MCP clients use worker tools for SQL and files; they do not need a CLI, a local credentials file or vibe files.
 
+## Account allowances
+
+`usage` reports account-wide KV, SQL and file storage; SQL includes preview and production databases.
+Monthly calls include API calls and builds. Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
+MCP `usage` returns the plan's call cost for each preview build or publish as `monthlyCalls.buildCallEquivalent`; `vibe status --plan` prints the same cost.
+
+Measured KV/file/SQL storage pauses worker requests and MCP tools past twice the plan's limit, or past the lowest paid limit for storage the plan does not include; HTTP returns 429 with reason storage_quota.
+Owner totals pause all vibes; a SQL database past its pause threshold pauses its environment. At or below that threshold, shim checks refuse writes at the plan cap; reads and deletes work, including after downgrades.
+Free space through platform storage APIs or delete an unused vibe; SQL deletion requires a plan with SQL storage. Upgrades recheck immediately.
+Hourly checks restore access at or below the pause threshold, plus up to 60 seconds of caching and KV propagation; failed measurements retain the prior verdict. Static assets and file reads keep their usual gates.
+
 ## KV (`env.VIBE_STORAGE`, every plan)
 
 Store JSON strings under colon-separated keys (`items:<id>`). `list()` can miss
@@ -154,9 +165,9 @@ A 403 SignatureDoesNotMatch on the PUT means the bytes sent differ from contentL
 The browser's PUT to the signed URL is CORS-allowed from the vibe's own origin (preflight answers 204); no CORS setup is needed.
 
 **Downloading outside the page** (a script, another server): the worker
-mints `createDownloadUrl(key)`; the URL lasts at most 120 seconds in local dev
-and production, so mint one per request and never store or share it. A page
-does not need this: use `/files/<key>`.
+mints `createDownloadUrl(key)`; the URL lasts at most 120 seconds, so mint one
+per request and never store or share it. A page does not need this: use
+`/files/<key>`.
 
 Through MCP, expose file operations as worker tools and
 invoke them with call_tool. For an operation the worker does not expose, add an
@@ -167,7 +178,7 @@ invoke them with call_tool. For an operation the worker does not expose, add an
 From a terminal with the CLI installed and signed in, use `vibe files upload|download|ls|rm|url` (alias `vibe r2`) (MCP: expose a worker tool and invoke it with call_tool).
 These default to production's files; add `--preview` for the preview tree.
 The preview host serves the preview tree and the production host the production tree; upload to both when a page needs the file in both.
-`vibe files usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; `usage` storage counts KV only.
+`vibe files usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; account `usage` reports KV, SQL and file storage.
 Signed uploads count at once; files the worker writes with `put()` count within the hour.
 
 **Check a private vibe with curl:** the token in `~/.vibe-coded/credentials.json`

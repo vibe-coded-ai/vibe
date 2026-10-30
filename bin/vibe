@@ -191,6 +191,13 @@ _api() {
       printf '%s' "$body" | jq --arg retry "$retry_after" '. + {_retryAfter: $retry}'
       return 1
     fi
+    # Any other named refusal (the monthly allowance, a full build queue) is a
+    # gate with its own message, not a request bucket to wait out.
+    if [ -n "$(printf '%s' "$body" | jq -r '.reason // empty' 2>/dev/null)" ] && ! _is_build_limit_error "$body" 2>/dev/null; then
+      _entitlement_hint "$body" "$VIBE_COMMAND_LINE"
+      printf '%s' "$body"
+      return 1
+    fi
     if _is_build_limit_error "$body" 2>/dev/null; then _build_limit_hint "$body"; fi
     # A per-minute bucket refilling within a minute is worth one pause; a build
     # cap or a longer Retry-After is the caller's to report.
@@ -223,7 +230,7 @@ _entitlement_hint() {
   printf '%s\n' "$err" >&2
 }
 
-# One line of monthly calls when the ledger is available. Silent otherwise.
+# Monthly calls when the ledger is available, plus the build cost when known.
 _print_budget_line() {
   local fields used limit reset_day reset_month
   fields=$(echo "$1" | jq -r '
@@ -232,9 +239,15 @@ _print_budget_line() {
          and (.budget.resetsAt | type) == "string"
       then "\(.monthlyCallsUsed | commas) \(.monthlyCalls | commas) \(.budget.resetsAt[0:19] | strptime("%Y-%m-%dT%H:%M:%S") | strftime("%d %b"))"
       else empty end' 2>/dev/null) || return 0
-  [ -n "$fields" ] || return 0
-  read -r used limit reset_day reset_month <<<"$fields"
-  printf 'Monthly calls: %s of %s (resets %d %s)\n' "$used" "$limit" "$((10#$reset_day))" "$reset_month"
+  if [ -n "$fields" ]; then
+    read -r used limit reset_day reset_month <<<"$fields"
+    printf 'Monthly calls: %s of %s (resets %d %s)\n' "$used" "$limit" "$((10#$reset_day))" "$reset_month"
+  fi
+  echo "$1" | jq -r '
+    def commas: tostring | split("") | reverse | join("") | gsub("(?<n>[0-9]{3})(?=[0-9])"; "\(.n),") | split("") | reverse | join("");
+    if (.buildCallEquivalent | type) == "number"
+      then "API calls and builds share this monthly allowance; each preview build and each publish counts as about \(.buildCallEquivalent | commas) calls."
+      else empty end' 2>/dev/null || true
 }
 
 # Plan lookup: prints the raw GET /api/v1/vibes result once it carries a plan.
@@ -1362,8 +1375,17 @@ cmd_preview() {
       exit 0
     elif [ "$STATUS" = "failed" ]; then
       echo ""
-      echo "Build failed. Logs:" >&2
-      _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds/$BUILD_ID/logs" >&2
+      local error_message build_logs
+      error_message=$(printf '%s' "$BUILD" | jq -r '.builds[0].errorMessage // "Unknown build error"')
+      printf 'Build %s failed: %s\n' "$BUILD_ID" "$error_message" >&2
+      if build_logs=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds/$BUILD_ID/logs"); then
+        if printf '%s' "$build_logs" | jq -e '.success == true and (.lines | type == "array")' >/dev/null; then
+          printf '%s' "$build_logs" | jq -r '.lines[] | "\(.ts) [\(.step)] \(.msg)"' | tail -n 30 >&2
+        else
+          printf '%s' "$build_logs" | jq -r '.error // "Could not read build logs."' >&2
+        fi
+      fi
+      printf 'Full log: vibe logs %s\n' "$BUILD_ID" >&2
       exit 1
     fi
   done
@@ -2525,15 +2547,17 @@ cmd_logout() {
   echo "To fully revoke the token server-side: DELETE /auth/api-token from a signed-in browser session."
 }
 
-# Read a secret value into SECRET_VAL: hidden at a terminal, or the first line
-# of stdin when it is piped, with no prompt.
+# Read a secret value into SECRET_VAL: one hidden line at a terminal, or stdin
+# through EOF without a prompt, removing one final newline.
 _read_secret_value() {
   if [ -t 0 ]; then
+    printf '%s\n' 'For multi-line values, use a pipe or input redirection (< file).' >&2
     printf '%s' "$1" >&2
     IFS= read -rs SECRET_VAL || true
     echo "" >&2
   else
-    IFS= read -r SECRET_VAL || true
+    IFS= read -r -d '' SECRET_VAL || true
+    SECRET_VAL=${SECRET_VAL%$'\n'}
   fi
 }
 
@@ -2565,7 +2589,21 @@ cmd_secrets() {
       local usage_type="custom"
       [ "${1:-}" = "--type" ] && usage_type="${2:-custom}"
 
-      # Check the server's entitlement gate before asking for sensitive input.
+      # Storing a secret needs Pro or Pro+, but listing is open on every plan,
+      # so the list request below cannot show the gate. On Free, an empty
+      # create request returns the server's gate before the body is read, and
+      # no value is asked for. Fail closed if the plan cannot be verified.
+      local current_plan
+      if ! current_plan=$(_current_plan); then
+        exit 1
+      fi
+      if [ "$current_plan" = "free" ]; then
+        RESULT=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/secrets" -d '{}')
+        _check_success "$RESULT" "vibe secrets create $name"
+        exit 1
+      fi
+
+      # Check the vibe and ownership before asking for sensitive input.
       RESULT=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/secrets")
       _check_success "$RESULT" "vibe secrets create $name"
 
@@ -3081,10 +3119,10 @@ _print_command_help() {
       printf '%s\n' "Usage: vibe dev seed <file.sql>" "Apply a SQL seed file to the local SQL database without starting the dev server."
       return ;;
     secrets:create)
-      printf '%s\n' "Usage: vibe secrets create <NAME> [--type custom]" "Create a write-only secret (Pro); value read from the terminal, or from stdin when piped."
+      printf '%s\n' "Usage: vibe secrets create <NAME> [--type custom]" "Create a write-only secret (Pro); value read from the terminal, or from stdin when piped." "For multi-line values, use < file or pipe the value; one final newline is removed."
       return ;;
     secrets:update)
-      printf '%s\n' "Usage: vibe secrets update <NAME>" "Replace a write-only secret value, read from the terminal, or from stdin when piped."
+      printf '%s\n' "Usage: vibe secrets update <NAME>" "Replace a write-only secret value, read from the terminal, or from stdin when piped." "For multi-line values, use < file or pipe the value; one final newline is removed."
       return ;;
     secrets:delete)
       printf '%s\n' "Usage: vibe secrets delete <NAME>" "Delete a secret by name."

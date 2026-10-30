@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.33
+version: 4.7.43
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -192,8 +192,12 @@ user, ask them to approve in the browser, then run `vibe login --finish`. It wor
 for Google and GitHub accounts too. A person at a terminal can just run
 `vibe login`.
 
-**Secrets** are read with `read -s`, so values never enter the conversation. Never
-ask the user to paste one into chat.
+**Secrets** use a hidden single-line prompt at a terminal. For multi-line values,
+redirect a file (`vibe secrets create NAME < file` or `vibe secrets update NAME < file`)
+or pipe the value: stdin is read through EOF and one final newline is removed.
+Never ask the user to paste a secret into chat. Each value may be at most 5 KB (5,120 UTF-8
+bytes); oversized creates and updates return HTTP 400. Shorten the value before
+retrying.
 
 **`vibe dev` vs production:** locally there are no access checks, R2 signed URLs
 don't work, and `/mcp` supports only `initialize`,
@@ -221,6 +225,10 @@ Details and examples (including running SQL against a live vibe):
 - **KV `list()` lags new writes by up to a minute.** Don't build a list tool on
   `list()` alone; use the pattern in `references/platform-patterns.md` (the
   templates do), or use SQL.
+- Workers built or redeployed with shim v13 share 10,000 units per request
+  across KV and R2 calls: reads cost 1;
+  writes, lists and deletes cost 10 (R2 batch deletes count per key). Paginate
+  large jobs across requests.
 - Files and images go in R2, not base64 in KV.
 - Vue: use `createWebHashHistory()`, and keep `vite` in `devDependencies`.
 - Use one root worker: `worker.ts` or `worker.js`, not both, and not `src/worker.*`.
