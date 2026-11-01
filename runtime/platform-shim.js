@@ -35,7 +35,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 // Token checks, request sanitizing and platform POSTs use intrinsics captured
 // before author code loads. The meaning of each version is documented beside
 // SHIM_VERSION.
-const PLATFORM_SHIM_VERSION = 16;
+const PLATFORM_SHIM_VERSION = 17;
 void PLATFORM_SHIM_VERSION;
 
 // Capture these before any user module code executes. Invoking the captured
@@ -60,6 +60,10 @@ const _apply = Reflect.apply;
 const _charCodeAt = String.prototype.charCodeAt;
 const _stringSlice = String.prototype.slice;
 const _stringIncludes = String.prototype.includes;
+const _stringIndexOf = String.prototype.indexOf;
+const _stringToUpperCase = String.prototype.toUpperCase;
+const _regexpExec = RegExp.prototype.exec;
+const _setHas = Set.prototype.has;
 const _decodeURIComponent = decodeURIComponent;
 const _Headers = Headers;
 const _Request = Request;
@@ -70,6 +74,53 @@ const _headersAppend = Headers.prototype.append;
 const _stringify = JSON.stringify;
 const _fetch = fetch;
 const _min = Math.min;
+const _isSafeInteger = Number.isSafeInteger;
+const _getPrototypeOf = Object.getPrototypeOf;
+const _promiseThen = Promise.prototype.then;
+const _resolved = Promise.resolve();
+_defineProperty(_resolved, 'constructor', { __proto__: null, value: undefined });
+let _runtimeWaitUntil;
+let _serviceFetch;
+
+function emptyStorageUsage() {
+  return { __proto__: null, kvReads: 0, kvWrites: 0, r2ClassA: 0, r2ClassB: 0, d1RowsWritten: 0 };
+}
+
+// A report snapshots private counters before any await. Late operations (for
+// example waitUntil work) send deltas under the original request's allowance.
+function reportStorage(budget) {
+  if (!budget.reportEnv || budget.reportScheduled) return;
+  budget.reportScheduled = true;
+  const task = _apply(_promiseThen, _resolved, [async () => {
+    budget.reportScheduled = false;
+    const usage = budget.usage;
+    budget.usage = emptyStorageUsage();
+    if (!(usage.kvReads || usage.kvWrites || usage.r2ClassA || usage.r2ClassB || usage.d1RowsWritten)) return;
+    try {
+      const response = await _signedInternalFetch(budget.reportEnv, budget.vibeId, '/api/internal/storage-usage', _stringify(usage));
+      if (!response.ok) throw new Error('Storage usage rejected');
+    } catch (_) {
+      // Match the account ledger's fail-open outage policy: KV/R2 execution
+      // remains bounded by the request allowance and daily request cap.
+      console.warn('Storage usage report failed');
+    }
+  }]);
+  if (budget.waitUntil) _apply(budget.waitUntil, budget.ctx, [task]);
+}
+
+function recordD1Rows(result) {
+  const budget = _apply(_alsGetStore, als, [])?.storageBudget;
+  if (!budget) return;
+  const meta = ownValue(result, 'meta');
+  let rows = ownValue(meta, 'rows_written');
+  if (!(typeof rows === 'number' && _isSafeInteger(rows) && rows >= 0)) rows = ownValue(meta, 'changes');
+  // Missing or invalid provider metadata consumes the full request allowance
+  // in row-write charges. SQL text never supplies a billing exemption.
+  if (!(typeof rows === 'number' && _isSafeInteger(rows) && rows >= 0)) rows = budget.limit;
+  // Saturation keeps even repeated ambiguous results valid for the endpoint.
+  budget.usage.d1RowsWritten = _min(9007199254740991, budget.usage.d1RowsWritten + rows);
+  if (budget.finished) reportStorage(budget);
+}
 
 /**
  * The value of `obj`'s own data property `name`, or undefined. Never walks the
@@ -291,13 +342,15 @@ function registerStorageBinding(binding) {
 // Shared by every KV/R2 facade, including aliases and wrappers retained by
 // author code. Reserve synchronously before any binding call or await so
 // concurrent operations cannot spend the same units. Missing context denies.
-function chargeStorage(units, binding) {
+function chargeStorage(units, binding, category) {
   const budget = _apply(_alsGetStore, als, [])?.storageBudget;
   if (!budget || !_apply(_weakMapGet, budget.bindings, [binding])
       || !(units >= 0 && units <= budget.remaining)) {
-    throw new Error('Storage operation limit exceeded: 10000 units per request (reads 1; writes, lists and deletes 10)');
+    throw new Error('Storage operation limit exceeded: ' + (budget ? budget.limit : 0) + ' units per request (reads 1; writes, lists and deletes 10)');
   }
   budget.remaining -= units;
+  if (category) budget.usage[category] += units === 1 ? 1 : units / 10;
+  if (budget.finished) reportStorage(budget);
 }
 
 // Establish the request's access mode, then run `fn` inside it. PRIVATE and NOT
@@ -321,7 +374,7 @@ function chargeStorage(units, binding) {
 // can never be escalated to write. Living here, not in fetch(), makes the
 // no-escalation invariant true by construction for every entrypoint (fetch
 // today; scheduled/queue if ever added), not just the one that remembered it.
-function _enterMode(requestedMode, fn) {
+function _enterMode(requestedMode, fn, limit = 500, reportEnv, ctx, waitUntil) {
   const ambient = _apply(_alsGetStore, als, []);
   const mode = ambient?.mode === 'read' ? 'read' : requestedMode;
   // Pass the effective (clamped) mode to fn so the caller wraps bindings against
@@ -329,8 +382,17 @@ function _enterMode(requestedMode, fn) {
   // Re-entering fetch in an ambient request shares its budget. A top-level
   // invocation receives a fresh allowance.
   const storageBudget = ambient ? ambient.storageBudget
-    : { __proto__: null, remaining: 10_000, bindings: new _WeakMap() };
-  return _apply(_alsRun, als, [{ __proto__: null, mode, storageBudget }, () => fn(mode)]);
+    : { __proto__: null, remaining: limit, limit, bindings: new _WeakMap(), usage: emptyStorageUsage(),
+      reportEnv, vibeId: ownValue(reportEnv, 'VIBE_ID'), ctx, waitUntil, finished: false, reportScheduled: false };
+  return _apply(_alsRun, als, [{ __proto__: null, mode, storageBudget }, async () => {
+    try { return await fn(mode); }
+    finally {
+      if (!ambient) {
+        storageBudget.finished = true;
+        reportStorage(storageBudget);
+      }
+    }
+  }]);
 }
 
 /**
@@ -385,22 +447,22 @@ function createKVFacade(kv, prefix, checkPutQuota) {
 
   return {
     get(key, options) {
-      chargeStorage(1, kv);
+      chargeStorage(1, kv, 'kvReads');
       return kv.get(safePrefix(key), options);
     },
     async put(key, value, options) {
       denyReadOnlyWrite();
-      chargeStorage(10, kv);
+      chargeStorage(10, kv, 'kvWrites');
       if (checkPutQuota) await checkPutQuota();
       return kv.put(safePrefix(key), value, options);
     },
     delete(key) {
       denyReadOnlyWrite();
-      chargeStorage(10, kv);
+      chargeStorage(10, kv, 'kvWrites');
       return kv.delete(safePrefix(key));
     },
     async list(options) {
-      chargeStorage(10, kv);
+      chargeStorage(10, kv, 'kvWrites');
       const opts = options || {};
       const requested = ownValue(opts, 'prefix');
       const userPrefix = requested == null ? '' : _kvKeyText(requested, 'list prefix');
@@ -425,7 +487,7 @@ function createKVFacade(kv, prefix, checkPutQuota) {
       };
     },
     getWithMetadata(key, options) {
-      chargeStorage(1, kv);
+      chargeStorage(1, kv, 'kvReads');
       return kv.getWithMetadata(safePrefix(key), options);
     }
   };
@@ -671,7 +733,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
      */
     async put(key, body, options) {
       denyReadOnlyWrite();
-      chargeStorage(10, bucket);
+      chargeStorage(10, bucket, 'r2ClassA');
       if (await isOverQuota()) {
         throw new Error(R2_STORAGE_FULL);
       }
@@ -683,7 +745,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
      * Get an object. Returns `R2ObjectBody | null`.
      */
     async get(key, options) {
-      chargeStorage(1, bucket);
+      chargeStorage(1, bucket, 'r2ClassB');
       const fullKey = _r2GetKey(prefix, key);
       return bucket.get(fullKey, options);
     },
@@ -692,7 +754,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
      * Get object metadata without body. Returns `R2Object | null`.
      */
     async head(key) {
-      chargeStorage(1, bucket);
+      chargeStorage(1, bucket, 'r2ClassB');
       const fullKey = _r2GetKey(prefix, key);
       return bucket.head(fullKey);
     },
@@ -732,7 +794,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
      * callers see only their relative paths.
      */
     async list(options) {
-      chargeStorage(10, bucket);
+      chargeStorage(10, bucket, 'r2ClassA');
       const opts = options || {};
       const requested = ownValue(opts, 'prefix');
       if (requested != null && typeof requested !== 'string') {
@@ -829,8 +891,10 @@ export function createPrefixedR2(bucket, vibeId, env) {
 // alter those results. Independent Cloudflare API measurements and platform
 // dispatch pauses enforce the storage caps.
 //
-// run(), all() and batch() return metadata. Non-read first() uses all() for rows
-// and metadata in one call; raw() and exec() writes need a size probe.
+// run(), all() and batch() return metadata. first() uses all() for rows and
+// metadata in one call, independently of SQL classification. Platform raw()
+// and exec() are refused because they omit row-write metadata; local writes
+// through these APIs need a size probe.
 //
 // Author-realm fast paths:
 //   1. The per-database cap is checked locally via size_after.
@@ -873,8 +937,10 @@ const D1_NON_GROWTH_KEYWORDS = new Set([
 function _leadingVerb(sql) {
   const s = _stripLeadingComments(sql);
   if (s === null) return null;
-  const m = s.match(/^([a-zA-Z]+)/);
-  return m ? m[1].toUpperCase() : null;
+  // Access and quota classification uses captured methods without author
+  // regexp hooks or coercions. Billing uses only binding result metadata.
+  const m = _apply(_regexpExec, /^([a-zA-Z]+)/, [s]);
+  return m ? _apply(_stringToUpperCase, ownValue(m, 1), []) : null;
 }
 
 /**
@@ -890,13 +956,14 @@ function _stripLeadingComments(sql) {
   let s = sql;
   for (let i = 0; i < 100; i++) {
     const before = s;
-    s = s.replace(/^\s+/, '');
-    if (s.startsWith('--')) {
-      const nl = s.indexOf('\n');
-      s = nl === -1 ? '' : s.slice(nl + 1);
-    } else if (s.startsWith('/*')) {
-      const end = s.indexOf('*/');
-      s = end === -1 ? '' : s.slice(end + 2);
+    const whitespace = _apply(_regexpExec, /^\s+/, [s]);
+    if (whitespace) s = _apply(_stringSlice, s, [ownValue(whitespace, 0).length]);
+    if (_apply(_stringSlice, s, [0, 2]) === '--') {
+      const nl = _apply(_stringIndexOf, s, ['\n']);
+      s = nl === -1 ? '' : _apply(_stringSlice, s, [nl + 1]);
+    } else if (_apply(_stringSlice, s, [0, 2]) === '/*') {
+      const end = _apply(_stringIndexOf, s, ['*/']);
+      s = end === -1 ? '' : _apply(_stringSlice, s, [end + 2]);
     }
     if (s === before) break;
   }
@@ -918,7 +985,7 @@ function _stripLeadingComments(sql) {
  */
 export function _isIdempotentSchemaDdl(sql) {
   const s = _stripLeadingComments(sql);
-  return s !== null && /^CREATE\s+(TABLE|UNIQUE\s+INDEX|INDEX)\s+IF\s+NOT\s+EXISTS\b/i.test(s);
+  return s !== null && _apply(_regexpExec, /^CREATE\s+(TABLE|UNIQUE\s+INDEX|INDEX)\s+IF\s+NOT\s+EXISTS\b/i, [s]) !== null;
 }
 
 /** What a read-mode caller gets back for an idempotent DDL no-op. */
@@ -935,7 +1002,7 @@ function _readModeDdlNoopResult() {
  */
 export function _isD1GrowthStatement(sql) {
   const verb = _leadingVerb(sql);
-  return verb === null || !D1_NON_GROWTH_KEYWORDS.has(verb);
+  return verb === null || !_apply(_setHas, D1_NON_GROWTH_KEYWORDS, [verb]);
 }
 
 /**
@@ -1034,10 +1101,21 @@ export function createMeteredD1(db, opts) {
   }
 
   function absorb(result, isWrite) {
+    recordD1Rows(result);
     const size = ownValue(ownValue(result, 'meta'), 'size_after');
     if (typeof size === 'number' && size >= 0) {
       lastKnownBytes = size;
       if (isWrite) maybeReport(size);
+    }
+  }
+
+  async function executeD1(invoke, count = 1) {
+    try {
+      return await invoke();
+    } catch (error) {
+      // A rejected call supplies no row metadata, including partial failures.
+      for (let i = 0; i < count; i++) recordD1Rows();
+      throw error;
     }
   }
 
@@ -1131,7 +1209,7 @@ export function createMeteredD1(db, opts) {
       isRead: _isD1ReadStatement(sql),
       isGrowth: _isD1GrowthStatement(sql),
       isIdempotentDdl: _isIdempotentSchemaDdl(sql),
-      isDropTrigger: /^DROP\s+TRIGGER\b/i.test(_stripLeadingComments(sql) || ''),
+      isDropTrigger: _apply(_regexpExec, /^DROP\s+TRIGGER\b/i, [_stripLeadingComments(sql) || '']) !== null,
     };
     // Read-mode gate. Idempotent schema DDL short-circuits to a no-op result
     // instead of a denial; everything else non-read is denied.
@@ -1163,23 +1241,22 @@ export function createMeteredD1(db, opts) {
       },
       async run() {
         if (readModeNoop() || await overCapNoop()) return _readModeDdlNoopResult();
-        const r = await realStmt.run();
+        const r = await executeD1(() => realStmt.run());
         absorb(r, true); // write: refresh size + maybe report to platform
         return r;
       },
       async all() {
         if (readModeNoop() || await overCapNoop()) return _readModeDdlNoopResult();
-        const r = await realStmt.all();
+        const r = await executeD1(() => realStmt.all());
         absorb(r, !isRead); // writes report; SELECT/EXPLAIN only refresh size
         return r;
       },
       async first(colName) {
         if (readModeNoop() || await overCapNoop()) return null;
-        if (isRead) return realStmt.first(colName);
-        // all() supplies the write's size without a second binding call. Read
+        // all() supplies billing metadata without a second binding call. Read
         // only own data slots when selecting the first row or a named column.
-        const r = await realStmt.all();
-        absorb(r, true);
+        const r = await executeD1(() => realStmt.all());
+        absorb(r, !isRead);
         const row = ownValue(ownValue(r, 'results'), 0);
         if (row === undefined || row === null) return null;
         if (colName === undefined) return row;
@@ -1189,6 +1266,11 @@ export function createMeteredD1(db, opts) {
       },
       async raw(rawOpts) {
         if (readModeNoop() || await overCapNoop()) return [];
+        // raw() omits billing metadata for every statement. SQL classification
+        // never authorizes a metadata-free platform execution.
+        if (_apply(_alsGetStore, als, [])?.storageBudget.reportEnv) {
+          throw new Error('SQL raw() is unavailable; use run(), all(), first() or batch() for usage accounting');
+        }
         const r = await realStmt.raw(rawOpts);
         if (!isRead) await absorbSizeAfterWrite();
         return r;
@@ -1265,8 +1347,12 @@ export function createMeteredD1(db, opts) {
             _defineProperty(results, i, { __proto__: null, value: _readModeDdlNoopResult(), writable: true, enumerable: true, configurable: true });
           }
           if (reads) {
-            const readResults = await target.batch(reals);
-            for (let j = 0; j < reads; j++) results[readIdx[j]] = readResults[j];
+            const readResults = await executeD1(() => target.batch(reals), reads);
+            for (let j = 0; j < reads; j++) {
+              const result = ownValue(readResults, j);
+              absorb(result, false);
+              results[readIdx[j]] = result;
+            }
           }
           return results;
         }
@@ -1298,26 +1384,27 @@ export function createMeteredD1(db, opts) {
             _defineProperty(out, i, { __proto__: null, value: _readModeDdlNoopResult(), writable: true, enumerable: true, configurable: true });
           }
           if (runs) {
-            const ran = await target.batch(reals);
-            for (let j = 0; j < runs; j++) out[runIdx[j]] = ran[j];
-            absorb(ran[ran.length - 1], true);
+            const ran = await executeD1(() => target.batch(reals), runs);
+            for (let j = 0; j < runs; j++) out[runIdx[j]] = ownValue(ran, j);
+            for (let j = 0; j < runs; j++) absorb(ownValue(ran, j), true);
           }
           return out;
         }
-        const results = await target.batch(reals);
-        if (_arrayIsArray(results) && results.length) {
-          absorb(results[results.length - 1], true); // batch is a write path
-        }
+        const results = await executeD1(() => target.batch(reals), runs);
+        for (let i = 0; i < runs; i++) absorb(ownValue(results, i), true);
         return results;
       },
       async exec(sql) {
         // exec() is multi-statement and returns no size_after — treat it as
         // growth unconditionally and re-read the size afterwards: blocked
         // when over cap (an over-cap vibe recovers via prepare().run() DELETE/
-        // DROP), allowed otherwise. Fail closed rather than gate on the leading
+        // DROP), allowed locally otherwise. Fail closed rather than gate on the leading
         // keyword only (which `SELECT 1; INSERT …` would slip past).
         denyReadOnlyWrite();
         await enforceIfOverCap();
+        if (_apply(_alsGetStore, als, [])?.storageBudget.reportEnv) {
+          throw new Error('SQL exec() is unavailable; use prepare().run() or batch() for usage accounting');
+        }
         try {
           return await target.exec(sql);
         } finally {
@@ -1386,8 +1473,9 @@ export async function _signedInternalFetch(env, vibeId, path, bodyJson) {
   // (HTTP 522). A service binding is direct worker-to-worker. The plain fetch
   // is the fallback for a vibe deployed without the binding (it still 522s).
   const service = ownValue(env, 'PLATFORM_SERVICE');
-  if (service && typeof service.fetch === 'function') {
-    return service.fetch(url, init);
+  const serviceFetch = ownValue(service, 'fetch') || _serviceFetch;
+  if (typeof serviceFetch === 'function') {
+    return _apply(serviceFetch, service, [url, init]);
   }
   return _fetch(url, init);
 }
@@ -1501,6 +1589,10 @@ export default {
     // getter for a name this deploy does not bind; reading that name on the
     // runtime env would run the getter with the raw env as `this`.
     env = ownEnvCopy(env);
+    const service = ownValue(env, 'PLATFORM_SERVICE');
+    if (!_serviceFetch && service && !ownValue(service, 'fetch')) {
+      _serviceFetch = ownValue(_getPrototypeOf(service), 'fetch');
+    }
     const requestHeaders = _apply(_requestHeaders, request, []);
     const headerMode = _apply(_headersGet, requestHeaders, ['x-vibe-access-mode']);
     const presented = _apply(_headersGet, requestHeaders, ['x-vibe-access-token']);
@@ -1508,6 +1600,15 @@ export default {
     const proven = headerMode === 'write' && typeof expected === 'string' && expected.length > 0
       && typeof presented === 'string' && _constantTimeEqual(presented, expected);
     const requestedMode = proven ? 'write' : 'read';
+    const limit = _apply(_headersGet, requestHeaders, ['x-vibe-storage-units']) === '10000' ? 10000 : 500;
+    // Runtime prototype methods are captured before the first author import.
+    const ownWaitUntil = ownValue(ctx, 'waitUntil');
+    if (!_runtimeWaitUntil && ctx && typeof ownWaitUntil !== 'function') {
+      _runtimeWaitUntil = ownValue(_getPrototypeOf(ctx), 'waitUntil');
+    }
+    const waitUntil = typeof ownWaitUntil === 'function' ? ownWaitUntil : _runtimeWaitUntil;
+    const reportEnv = typeof ownValue(env, 'PLATFORM_VIBE_TOKEN') === 'string'
+      && ownValue(env, 'VIBE_ID') && ownValue(env, 'PLATFORM_SERVICE') ? env : undefined;
 
     // The proof is a platform capability, not author-visible request metadata.
     // Copy only safe headers through captured methods; no author hook sees the
@@ -1686,6 +1787,6 @@ export default {
       if (err instanceof D1EntitlementError) return d1EntitlementResponse(err.message);
       throw err;
     }
-    });
+    }, limit, reportEnv, ctx, waitUntil);
   }
 };

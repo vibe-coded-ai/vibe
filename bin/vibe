@@ -248,6 +248,11 @@ _print_budget_line() {
     if (.buildCallEquivalent | type) == "number"
       then "API calls and builds share this monthly allowance; each preview build and each publish counts as about \(.buildCallEquivalent | commas) calls."
       else empty end' 2>/dev/null || true
+  _print_budget_pause "$1"
+}
+
+_print_budget_pause() {
+  echo "$1" | jq -r '.monthlyCallsPauseMessage | select(type == "string")' 2>/dev/null || true
 }
 
 # Plan lookup: prints the raw GET /api/v1/vibes result once it carries a plan.
@@ -835,6 +840,7 @@ cmd_init() {
       fi
     fi
     echo "Created on platform."
+    _print_budget_pause "$RESULT"
   fi
 
   VIBE_SLUG="$slug"

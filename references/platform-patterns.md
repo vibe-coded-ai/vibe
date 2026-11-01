@@ -12,8 +12,9 @@ MCP clients use worker tools for SQL and files; they do not need a CLI, a local 
 ## Account allowances
 
 `usage` reports account-wide KV, SQL and file storage; SQL includes preview and production databases.
-Monthly calls include API calls and builds. Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
+Monthly calls include API calls, builds and storage operations at list price; KV/R2 share 500 units per Free request or 10,000 on Pro/Pro+ (reads 1; writes/lists/deletes 10). Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
 MCP `usage` returns the plan's call cost for each preview build or publish as `monthlyCalls.buildCallEquivalent`; `vibe status --plan` prints the same cost.
+At the monthly allowance, `usage` reports `monthlyCalls.paused: true` and `monthlyCalls.pauseMessage`; its text and `vibe status --plan` name the paused operations, UTC reset date, and how to upgrade or wait. `create_vibe` and `vibe init` include the same warning in their creation notes. Creation still uses a vibe slot; builds remain paused. No pause warning appears under the allowance. An unavailable ledger leaves the status unknown unless the existing budget verdict keeps the account paused.
 
 Measured KV/file/SQL storage pauses worker requests and MCP tools past twice the plan's limit, or past the lowest paid limit for storage the plan does not include; HTTP returns 429 with reason storage_quota.
 Owner totals pause all vibes; a SQL database past its pause threshold pauses its environment. At or below that threshold, shim checks refuse writes at the plan cap; reads and deletes work, including after downgrades.
@@ -83,7 +84,7 @@ try {
 }
 ```
 
-Use `.prepare(...).run()` / `.all()`, not `.exec()`.
+Use `.prepare(...).run()` / `.all()`, `.first()` or `.batch()` for SQL; hosted `.raw()` and `.exec()` are refused because they omit billing metadata; missing write counts charge 500 Free / 10,000 paid rows per statement.
 
 Through MCP, use call_tool to exercise the worker's SQL tools as the owner.
 For a query the worker does not expose, add an @mcp-expose tool, push_source
