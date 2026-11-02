@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.48
+version: 4.7.52
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -93,7 +93,8 @@ or resend it from https://vibe-coded.ai/account (Resend verification email).
 - **Dates:** the worker runs in UTC. For records that belong to a day, take a
   `date` parameter (`YYYY-MM-DD`, the user's local date) and fall back to UTC today.
 - **Don't build auth into tools.** The platform decides who can read and who can
-  write (see *Who can use a vibe*).
+  write (see *Who can use a vibe*). For machine endpoints, Authorization and Cookie
+  never reach the worker; use `X-Webhook-Token` (see `references/platform-patterns.md`).
 
 ## 3. Path B — a site or a web app
 
@@ -178,7 +179,7 @@ settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug
 | `preview` | Upload, build, and deploy to the preview URL |
 | `publish` | Promote the preview to production |
 | `call <tool> ['{json}'] [--preview]` | Call one tool on the live vibe as the owner |
-| `fetch <path> [--preview] [--headers\|-i]` | Fetch a deployed page or file as the owner; `--headers` (`-i`) includes the status line and file-serving headers |
+| `fetch <path> [--preview] [--headers\|-i]` | Fetch a deployed page or file as the owner; 2xx and 3xx succeed; redirects print Location without following it; `--headers` (`-i`) includes the status line and file-serving headers |
 | `connect [<owner>/<slug>] [--revoke]` | Connect Claude Code to a vibe (yours or one shared with you) |
 | `status [--plan]` | Live builds, tool counts, and plan (`--plan` also shows this month's usage against the plan's budget); upgrades are at vibe-coded.ai/billing |
 | `logs [build-id]` | Build logs |

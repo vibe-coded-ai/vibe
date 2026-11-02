@@ -56,7 +56,7 @@ export default {
 
 ## Rules
 
-On MCP and `vibe call`, `@param` types are checked by the platform before the
+On MCP `call_tool` and CLI `vibe call`, `@param` types are checked by the platform before the
 worker runs; a wrong type is refused with `Argument 'x' must be ...`. A direct
 HTTP request to `/api/<name>` reaches the worker unchecked.
 
@@ -73,3 +73,22 @@ HTTP request to `/api/<name>` reaches the worker unchecked.
   "no such table" on a read as empty; preview starts with an empty database.
 - KV: use the `rememberWrite` / `loadAll` helpers from the template for lists
   (see `platform-patterns.md`).
+
+## Background work and logs
+
+The worker's fetch method accepts `ctx`; register background work before returning:
+
+```javascript
+async fetch(request, env, ctx) {
+  ctx.waitUntil(env.VIBE_STORAGE.put('last-request', request.url));
+  return new Response('Accepted', { status: 202 });
+}
+```
+
+Background storage is booked against the same request's allowance. After the
+response, the shim drains registered work for up to 20 seconds, then closes
+storage admission; it can close earlier when the work settles. Further storage
+operations in that request are refused once admission closes, or if reporting fails.
+
+Worker console output is not visible anywhere. `vibe logs` (MCP: `logs`) shows
+build logs only.

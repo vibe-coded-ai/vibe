@@ -97,6 +97,9 @@ for (const name of ['signal', 'cf', 'cache', 'integrity', 'keepalive', 'credenti
   if (getter) _requestInitGetters[name] = getter;
 }
 const _requestInitNames = _objectKeys(_requestInitGetters);
+const _signalAborted = captureGetter(AbortSignal.prototype, 'aborted');
+const _addEventListener = EventTarget.prototype.addEventListener;
+const _removeEventListener = EventTarget.prototype.removeEventListener;
 const _requestBodyHeaderNames = ['content-encoding', 'content-language', 'content-location', 'content-type'];
 const _responseOk = _getOwnPropertyDescriptor(Response.prototype, 'ok').get;
 const _responseStatus = _getOwnPropertyDescriptor(Response.prototype, 'status').get;
@@ -123,8 +126,10 @@ const _promiseAllSettled = Promise.allSettled;
 const _promiseRace = Promise.race;
 const _setTimeout = setTimeout;
 const _clearTimeout = clearTimeout;
-// Leave time to send the report within the runtime's waitUntil limit.
+// Leave time to report after the handler settles or the client disconnects.
 const AUTHOR_DRAIN_MS = 20000;
+// Bound booking even when the handler never settles and the client stays connected.
+const REQUEST_REPORT_CAP_MS = 120000;
 const _resolved = Promise.resolve();
 _defineProperty(_resolved, 'constructor', { __proto__: null, value: undefined });
 _defineProperty(_resolved, 'then', { __proto__: null, value: _promiseThen });
@@ -340,16 +345,34 @@ function trackStorageMethods(surface, names) {
 
 // One reserved report covers every storage call started before booking closes.
 // Author work may await a fetch before starting storage. Keep admission open
-// until both sets settle or the response's deadline expires. Storage-only
-// churn retains the three-pass fallback, then one final closed snapshot.
-function reportStorage(budget) {
+// until the handler and both sets settle, the post-handler/abort drain expires,
+// or the overall request cap expires.
+// Storage-only churn gets three passes after handler settlement, then one
+// final closed snapshot.
+function reportStorage(budget, handler, signal) {
   if (!budget.reportEnv || budget.reportScheduled) return;
   budget.reportScheduled = true;
   const task = (async () => {
-    let timer;
-    const deadline = new StorageSettlement(resolve => { timer = _setTimeout(resolve, AUTHOR_DRAIN_MS); });
+    let drainTimer;
+    let capTimer;
+    let drainStarted = false;
+    let startDrain;
+    const deadline = new StorageSettlement(resolve => {
+      startDrain = () => {
+        if (drainStarted || budget.closing) return;
+        drainStarted = true;
+        drainTimer = _setTimeout(resolve, AUTHOR_DRAIN_MS);
+      };
+      capTimer = _setTimeout(resolve, REQUEST_REPORT_CAP_MS);
+      if (signal) {
+        _apply(_addEventListener, signal, ['abort', startDrain, { __proto__: null, once: true }]);
+        if (_apply(_signalAborted, signal, [])) startDrain();
+      }
+    });
     const drained = new StorageSettlement(resolve => {
       (async () => {
+        await handler;
+        startDrain();
         for (let pass = 0; !budget.closing; pass++) {
           await settleStorageOperations(budget.inFlight, budget.authorTasks);
           if (_apply(_setSize, budget.authorTasks, []) === 0
@@ -364,9 +387,11 @@ function reportStorage(budget) {
     try {
       await _apply(_promiseRace, StorageSettlement, [storageSettlementIterable(racers)]);
     } finally {
-      _clearTimeout(timer);
+      budget.closing = true;
+      _clearTimeout(drainTimer);
+      _clearTimeout(capTimer);
+      if (signal) _apply(_removeEventListener, signal, ['abort', startDrain]);
     }
-    budget.closing = true;
     await settleStorageOperations(budget.inFlight);
     budget.reportSent = true;
     const usage = ownEnvCopy(budget.usage);
@@ -647,7 +672,7 @@ function chargeStorage(units, binding, category) {
 // can never be escalated to write. Living here, not in fetch(), makes the
 // no-escalation invariant true by construction for every entrypoint (fetch
 // today; scheduled/queue if ever added), not just the one that remembered it.
-function _enterMode(requestedMode, fn, limit = 500, reportEnv, ctx, waitUntil, outboundLimit = 5) {
+function _enterMode(requestedMode, fn, limit = 500, reportEnv, ctx, waitUntil, outboundLimit = 5, signal) {
   const ambient = _apply(_alsGetStore, als, []);
   const mode = ambient?.mode === 'read' ? 'read' : requestedMode;
   // Pass the effective (clamped) mode to fn so the caller wraps bindings against
@@ -660,11 +685,14 @@ function _enterMode(requestedMode, fn, limit = 500, reportEnv, ctx, waitUntil, o
       inFlight: new _Set(), authorTasks: new _Set(), reportScheduled: false,
       outboundLimit, outboundRemaining: outboundLimit, closing: false, reportSent: false, reportFailed: false };
   return _apply(_alsRun, als, [{ __proto__: null, mode, storageBudget }, async () => {
+    if (ambient || !storageBudget.reportEnv) return fn(mode);
+    let settleHandler;
+    const handler = new StorageSettlement(resolve => { settleHandler = resolve; });
+    // Register before author code runs so an unsettled handler cannot skip booking.
+    reportStorage(storageBudget, handler, signal);
     try { return await fn(mode); }
     finally {
-      if (!ambient) {
-        reportStorage(storageBudget);
-      }
+      settleHandler();
     }
   }]);
 }
@@ -1393,15 +1421,25 @@ export function createMeteredD1(db, opts) {
     }
   }
 
-  async function executeD1(invoke, count = 1) {
-    checkD1StorageBooking();
-    try {
-      return await invoke();
-    } catch (error) {
-      // A rejected call supplies no row metadata, including partial failures.
-      for (let i = 0; i < count; i++) recordD1Rows();
-      throw error;
-    }
+  // Pin binding and private wrapper promises until their metadata is absorbed.
+  // Await consults then when the inherited Promise constructor changes.
+  function pinD1Settlement(promise) {
+    _defineProperty(promise, 'constructor', { __proto__: null, value: undefined });
+    _defineProperty(promise, 'then', { __proto__: null, value: _promiseThen });
+    return promise;
+  }
+
+  function executeD1(invoke, count = 1) {
+    return pinD1Settlement((async () => {
+      checkD1StorageBooking();
+      try {
+        return await pinD1Settlement(invoke());
+      } catch (error) {
+        // A rejected call supplies no row metadata, including partial failures.
+        for (let i = 0; i < count; i++) recordD1Rows();
+        throw error;
+      }
+    })());
   }
 
   // Cold-start guard: if we've never seen a size, probe once with a cheap read
@@ -1412,7 +1450,7 @@ export function createMeteredD1(db, opts) {
   async function ensureSizeKnown() {
     if (cap === Infinity || lastKnownBytes !== null) return;
     try {
-      const probe = await db.prepare('SELECT 1').all();
+      const probe = await pinD1Settlement(db.prepare('SELECT 1').all());
       absorb(probe, false); // read: refresh size, don't trigger a usage report
     } catch (_e) {
       // Leave unknown — never let a probe failure break writes.
@@ -1425,7 +1463,7 @@ export function createMeteredD1(db, opts) {
   async function absorbSizeAfterWrite() {
     if (cap === Infinity && !canReport()) return;
     try {
-      absorb(await db.prepare('SELECT 1').all(), true);
+      absorb(await pinD1Settlement(db.prepare('SELECT 1').all()), true);
     } catch (_e) {
       // Keep the last known size; never fail a write that already ran.
     }
@@ -1458,7 +1496,7 @@ export function createMeteredD1(db, opts) {
   async function enforceNoTriggers() {
     if (hasTriggers === undefined) {
       try {
-        const r = await db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' LIMIT 1").all();
+        const r = await pinD1Settlement(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'trigger' LIMIT 1").all());
         hasTriggers = !!(r && Array.isArray(r.results) && r.results.length);
       } catch (_e) {
         hasTriggers = true;
@@ -2134,6 +2172,7 @@ export default {
       if (err instanceof D1EntitlementError) return d1EntitlementResponse(err.message);
       throw err;
     }
-    }, limit, reportEnv, ctx, waitUntil, outboundLimit);
+    }, limit, reportEnv, ctx, waitUntil, outboundLimit,
+      _requestInitGetters.signal ? _apply(_requestInitGetters.signal, request, []) : undefined);
   }
 };

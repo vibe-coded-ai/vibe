@@ -1559,6 +1559,7 @@ cmd_publish() {
   elif [ -n "$served" ]; then
     echo "Production serves preview build $served."
   fi
+  echo "Preview data does not carry to production; production keeps its own data."
   echo "The new build reaches every edge within about ten seconds; a fetch in that window may still show the previous one."
   _print_urls production
   if [ "$open_after" = "1" ]; then
@@ -1919,6 +1920,12 @@ cmd_fetch() {
       /:/ { headers = headers $0 "\n" }
       END { printf "%s\n", headers }
     ' "$headers"
+  elif [[ "$http_status" =~ ^3[0-9][0-9]$ ]]; then
+    awk '
+      /^HTTP\// { location = "" }
+      tolower($0) ~ /^location:/ { location = $0; sub(/^[^:]*:[ \t]*/, "", location); sub(/\r$/, "", location) }
+      END { if (location != "") print "Location: " location }
+    ' "$headers"
   fi
   local content_type
   content_type=$(awk '
@@ -1926,7 +1933,7 @@ cmd_fetch() {
     tolower($0) ~ /^content-type:/ { type = tolower($0); sub(/^[^:]*:[ \t]*/, "", type); sub(/[;\r].*$/, "", type) }
     END { print type }
   ' "$headers")
-  if [[ ! "$http_status" =~ ^2[0-9][0-9]$ ]]; then
+  if [[ ! "$http_status" =~ ^[23][0-9][0-9]$ ]]; then
     # The platform's own gate answers 401 as {"error":"Authentication required"}
     # (on /mcp as the JSON-RPC envelope {"error":{"message":"Authentication required"}},
     # to a browser as its "Authentication Required" sign-in page); any other 401
@@ -3185,16 +3192,16 @@ _print_command_help() {
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
     dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan once and binds storage as a deploy does (Free: no SQL or files)." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
     preview|deploy) printf '%s\n' "Usage: vibe preview [--prune|--no-prune]" "Mirror local source to preview and wait for its build." "Uploads are limited to 30 an hour per account and address, separate from the build allowance." ;;
-    publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." ;;
+    publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." "Preview data does not carry to production; production keeps its own data." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." "--plan shows your plan instead: monthly calls, vibes, preview builds and source uploads used. No .vibe-coded.json needed." ;;
     urls) printf '%s\n' "Usage: vibe urls" "Print preview and production app/MCP endpoints." ;;
-    fetch) printf '%s\n' "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" "Fetch a deployed route as the owner, including from a private vibe. GET by default; --header is repeatable. The platform's header allowlist still applies." "--headers (-i) prints the status line and all response headers except cookies before the body." "The → owner/slug (env) line goes to stderr; stdout carries only the response." ;;
+    fetch) printf '%s\n' "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" "Fetch a deployed route as the owner, including from a private vibe. GET by default; --header is repeatable. Authorization and Cookie never reach the worker. For a machine endpoint, send a dedicated secret in X-Webhook-Token and check it against env.SYNC_TOKEN in the worker; create it with vibe secrets create SYNC_TOKEN (Pro). Provider signature headers and X-Webhook-* are forwarded." "" "2xx and 3xx responses succeed. Redirects are not followed; 3xx prints the Location header when present." "--headers (-i) prints the status line and all response headers except cookies before the body." "The → owner/slug (env) line goes to stderr; stdout carries only the response." ;;
     call) printf '%s\n' "Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--preview]" "Call one live MCP tool as the owner and print its text result." "The → owner/slug (env) line goes to stderr; stdout carries only the result." ;;
     connect) printf '%s\n' "Usage: vibe connect [<owner>/<slug>] [--name N] [--print|--revoke]" "Register or revoke a scoped MCP connection in Claude Code: this vibe, or <owner>/<slug> for a vibe shared with you." "--print creates a real connection token and prints its command. Revoke it with: vibe connect [<owner>/<slug>] --revoke" ;;
-    logs) printf '%s\n' "Usage: vibe logs [build-id]" "Show build logs; defaults to the last build started from this machine; vibe logs <id> for another." ;;
+    logs) printf '%s\n' "Usage: vibe logs [build-id]" "Show build logs only; defaults to the last build started from this machine; vibe logs <id> for another. Worker console output is not visible anywhere." ;;
     settings) printf '%s\n' "Usage: vibe settings [--title T] [--visibility private|unlisted|public] [--interaction public|public_read|authenticated|invite_only]" "View settings or update the title; exposure changes are web-only and exit non-zero." ;;
     access) printf '%s\n' "Usage: vibe access list|grant|update|revoke|revoke-all [args]" "List access in the CLI; owner-only mutations are completed on the website." ;;
-    secrets) printf '%s\n' "Usage: vibe secrets list|create|update|delete|audit [NAME]" "Manage write-only worker secrets (Pro)." ;;
+    secrets) printf '%s\n' "Usage: vibe secrets list|create|update|delete|audit [NAME]" "Manage write-only worker secrets (Pro). Authorization and Cookie never reach the worker. For a machine endpoint, create a dedicated secret with vibe secrets create SYNC_TOKEN, send it in X-Webhook-Token and check it against env.SYNC_TOKEN in the worker. Provider signature headers and X-Webhook-* are forwarded. See references/platform-patterns.md for the webhook inbox recipe, including the website step for anonymous access." ;;
     r2) printf '%s\n' "Usage: vibe files upload|download|url|ls|rm|usage [args]   (alias: vibe r2)" "Manage the current vibe's stored files. Uploading needs Pro; on Free you can still list, download and delete kept files." \
           "  upload <path> --key <key>     download <key> --to <path>     url <key>" \
           "  ls [prefix]                   rm <key>                       usage" \

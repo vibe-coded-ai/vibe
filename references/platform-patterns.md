@@ -6,7 +6,7 @@ New vibes start with visibility private and interaction policy invite_only. Publ
 On private vibes, anonymous requests receive 401 before the worker runs, including webhook and cron requests. A host with no build yet answers 404 to everyone (production until the first publish).
 Visibility (private, unlisted, public) and interaction policy (public, public_read, authenticated, invite_only) change only on the website.
 Through MCP, get_vibe returns the manageUrl to give the owner; through the CLI, vibe settings prints the page.
-Check private vibes as the owner with call_tool / fetch_page through MCP, or vibe call / vibe fetch through the CLI.
+Check private vibes as the owner with `vibe call` (MCP: `call_tool`) or `vibe fetch` (MCP: `fetch_page`).
 MCP clients use worker tools for SQL and files; they do not need a CLI, a local credentials file or vibe files.
 
 The platform answers CORS preflights before the worker; a vibe's page calls its own /api same-origin, while a page on another origin cannot call that API from a browser (server-to-server calls are unaffected).
@@ -14,7 +14,7 @@ The platform answers CORS preflights before the worker; a vibe's page calls its 
 ## Account allowances
 
 `usage` reports account-wide KV, SQL and file storage; SQL includes preview and production databases.
-Outbound requests allow 5 per request on Free, 20 on Pro, and 50 on Pro+. The shim keeps an extra slot for storage reporting. Fetch returns redirects without following them; make an explicit follow-up call within the allowance. EventSource is unavailable; use streaming fetch within the allowance. ID allocation, signed URLs and SQL size reports also use outbound slots. The single storage report waits for in-flight KV/R2/D1 calls to settle within the request lifetime. Start background storage work before returning the response; operations started while draining join that report. Once reporting closes admission, further storage operations in that request are refused, as they are after a failed report. Re-entering the shim with the author env cannot create fresh outbound capacity; only the private runtime env authenticates a new allowance.
+Outbound requests allow 5 per request on Free, 20 on Pro, and 50 on Pro+. The shim keeps an extra slot for storage reporting. Fetch follows redirects; each hop uses one slot of the allowance. EventSource is unavailable; use streaming fetch within the allowance. ID allocation, signed URLs and SQL size reports also use outbound slots. The single storage report waits for in-flight KV/R2/D1 calls and registered `ctx.waitUntil` work for up to 20 seconds after the handler returns, within the runtime request lifetime; a handler that never returns is cut off after 120 seconds. Register background work before returning the response; storage operations started while draining join that report and are booked against the same request. Once reporting closes admission, further storage operations in that request are refused, as they are after a failed report. See `worker-template.md` for a `ctx.waitUntil` example. Re-entering the shim with the author env cannot create fresh outbound capacity; only the private runtime env authenticates a new allowance.
 Monthly calls include API calls, builds and storage operations at list price; KV/R2 share 500 units per Free request or 10,000 on Pro/Pro+ (reads 1; writes/lists/deletes 10). Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
 MCP `usage` returns the plan's call cost for each preview build or publish as `monthlyCalls.buildCallEquivalent`; `vibe status --plan` prints the same cost.
 At the monthly allowance, `usage` reports `monthlyCalls.paused: true` and `monthlyCalls.pauseMessage`; its text and `vibe status --plan` name the paused operations, UTC reset date, and how to upgrade or wait. `create_vibe` and `vibe init` include the same warning in their creation notes. Creation still uses a vibe slot; builds remain paused. No pause warning appears under the allowance. An unavailable ledger leaves the status unknown unless the existing budget verdict keeps the account paused.
@@ -235,6 +235,40 @@ function _checkToken(request, env) {
 Use a dedicated secret (not the user's CLI token), and never echo it in responses
 or logs. Keys the worker calls out with (Stripe, OpenAI) are also secrets, read
 as `env.NAME`.
+
+### Webhook inbox recipe
+
+1. Add a root worker route for `POST /webhooks/inbox`, outside `/api`. Check
+   `_checkToken(request, env)` above before storing the payload or making outbound
+   calls; reject a missing or invalid token before any side effect.
+2. Create `SYNC_TOKEN` with MCP `set_secret` or CLI `vibe secrets create SYNC_TOKEN`.
+   Have the sender supply that dedicated secret in `X-Webhook-Token`.
+3. Build with MCP `push_source` or CLI `vibe preview`. Probe the route as the owner
+   with MCP `fetch_page` (`method: "POST"`, `headers`, `body`) or CLI
+   `vibe fetch /webhooks/inbox --preview --method POST --header 'X-Webhook-Token: <dedicated secret>' --data '<payload>'`.
+   An owner probe does not prove anonymous access.
+4. **Website step:** give the owner `get_vibe`'s `manageUrl` (CLI: `vibe settings`).
+   For a public webhook inbox that stores messages, the owner chooses public or
+   unlisted visibility and public interaction on that page. Neither MCP nor the
+   CLI changes these settings; publishing does not change them either.
+5. Publish with MCP `publish` or CLI `vibe publish`, then verify an anonymous
+   server-to-server POST with the dedicated header. Preview data does not carry
+   to production; check the stored message in production.
+
+For a user vibe with public or unlisted visibility, an anonymous POST to this
+non-`/api` route has the following capabilities:
+
+| Interaction policy | Anonymous `POST /webhooks/inbox` |
+|---|---|
+| `public` | Reaches the worker with storage writes and secrets. |
+| `authenticated` | Also reaches this non-`/api` route with storage writes and secrets; sign-in is required on `/api` routes. |
+| `public_read` | Reaches the worker in read mode: storage writes are refused and secrets are hidden. Outbound fetches still run. |
+| `invite_only` | Receives 401 before the worker runs. |
+
+Private visibility returns 401 for anonymous requests under every interaction
+policy. A webhook token cannot grant storage writes or reveal secrets in read
+mode. Always verify the token before side effects; `authenticated` alone does
+not authenticate an anonymous caller to a non-`/api` route.
 
 ## URLs
 
