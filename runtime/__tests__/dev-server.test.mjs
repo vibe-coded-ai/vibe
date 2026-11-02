@@ -757,7 +757,7 @@ const CLIENT_HEADERS = {
   'x-forwarded-for': '1.2.3.4',
   'cf-connecting-ip': '1.2.3.4',
 };
-const DEV_CONTEXT_HEADERS = ['x-client-ip', 'x-request-id', 'x-vibe-access-mode', 'x-vibe-access-token',
+const DEV_CONTEXT_HEADERS = ['x-client-ip', 'x-request-id', 'x-vibe-access-mode', 'x-vibe-access-token', 'x-vibe-subrequests',
   'x-vibe-env', 'x-vibe-id', 'x-vibe-slug', 'x-vibe-user-slug'];
 
 test('withDispatchHeaders forwards only the production allowlist', () => {

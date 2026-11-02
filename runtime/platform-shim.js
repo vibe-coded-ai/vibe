@@ -35,7 +35,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 // Token checks, request sanitizing and platform POSTs use intrinsics captured
 // before author code loads. The meaning of each version is documented beside
 // SHIM_VERSION.
-const PLATFORM_SHIM_VERSION = 17;
+const PLATFORM_SHIM_VERSION = 18;
 void PLATFORM_SHIM_VERSION;
 
 // Capture these before any user module code executes. Invoking the captured
@@ -45,6 +45,7 @@ const _alsRun = AsyncLocalStorage.prototype.run;
 const _alsGetStore = AsyncLocalStorage.prototype.getStore;
 const als = new AsyncLocalStorage();
 const _getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const _getPrototypeOf = Object.getPrototypeOf;
 const _defineProperty = Object.defineProperty;
 const _hasOwn = Object.hasOwn;
 const _objectKeys = Object.keys;
@@ -64,47 +65,320 @@ const _stringIndexOf = String.prototype.indexOf;
 const _stringToUpperCase = String.prototype.toUpperCase;
 const _regexpExec = RegExp.prototype.exec;
 const _setHas = Set.prototype.has;
+const _Set = Set;
+const _setAdd = Set.prototype.add;
+const _setDelete = Set.prototype.delete;
+const _setForEach = Set.prototype.forEach;
+const _setSize = _getOwnPropertyDescriptor(Set.prototype, 'size').get;
+const _iterator = Symbol.iterator;
 const _decodeURIComponent = decodeURIComponent;
 const _Headers = Headers;
 const _Request = Request;
+const _URL = URL;
+const _urlHref = _getOwnPropertyDescriptor(URL.prototype, 'href').get;
+const _urlOrigin = _getOwnPropertyDescriptor(URL.prototype, 'origin').get;
+const _requestUrl = _getOwnPropertyDescriptor(Request.prototype, 'url').get;
+const _requestMethod = _getOwnPropertyDescriptor(Request.prototype, 'method').get;
+// workerd inherits body accessors from its Body mixin; Node defines them on
+// Request.prototype. Capture either layout before the author module loads.
+function captureGetter(prototype, name) {
+  while (prototype) {
+    const descriptor = _getOwnPropertyDescriptor(prototype, name);
+    if (descriptor) return descriptor.get;
+    prototype = _getPrototypeOf(prototype);
+  }
+}
+const _requestBody = captureGetter(Request.prototype, 'body');
+const _requestRedirect = _getOwnPropertyDescriptor(Request.prototype, 'redirect').get;
 const _requestHeaders = _getOwnPropertyDescriptor(Request.prototype, 'headers').get;
+const _requestInitGetters = { __proto__: null };
+for (const name of ['signal', 'cf', 'cache', 'integrity', 'keepalive', 'credentials', 'mode', 'referrer', 'referrerPolicy', 'duplex']) {
+  const getter = captureGetter(Request.prototype, name);
+  if (getter) _requestInitGetters[name] = getter;
+}
+const _requestInitNames = _objectKeys(_requestInitGetters);
+const _requestBodyHeaderNames = ['content-encoding', 'content-language', 'content-location', 'content-type'];
+const _responseOk = _getOwnPropertyDescriptor(Response.prototype, 'ok').get;
+const _responseStatus = _getOwnPropertyDescriptor(Response.prototype, 'status').get;
+const _responseHeaders = _getOwnPropertyDescriptor(Response.prototype, 'headers').get;
 const _headersGet = Headers.prototype.get;
 const _headersForEach = Headers.prototype.forEach;
 const _headersAppend = Headers.prototype.append;
+const _headersDelete = Headers.prototype.delete;
+const _hasInstance = Function.prototype[Symbol.hasInstance];
+const _ArrayBuffer = ArrayBuffer;
+const _arrayBufferIsView = ArrayBuffer.isView;
+const _URLSearchParams = URLSearchParams;
+const _FormData = FormData;
+const _Blob = Blob;
 const _stringify = JSON.stringify;
 const _fetch = fetch;
+const _Error = Error;
+const _TypeError = TypeError;
 const _min = Math.min;
 const _isSafeInteger = Number.isSafeInteger;
-const _getPrototypeOf = Object.getPrototypeOf;
 const _promiseThen = Promise.prototype.then;
+const _Promise = Promise;
+const _promiseAllSettled = Promise.allSettled;
+const _promiseRace = Promise.race;
+const _setTimeout = setTimeout;
+const _clearTimeout = clearTimeout;
+// Leave time to send the report within the runtime's waitUntil limit.
+const AUTHOR_DRAIN_MS = 20000;
 const _resolved = Promise.resolve();
 _defineProperty(_resolved, 'constructor', { __proto__: null, value: undefined });
+_defineProperty(_resolved, 'then', { __proto__: null, value: _promiseThen });
 let _runtimeWaitUntil;
+let _runtimeContextPrototype;
+const _runtimeContextGetters = { __proto__: null };
+const _contextPropertyNames = ['props', 'exports'];
 let _serviceFetch;
+let _runtimeEnvInitialized = false;
+let _runtimeVibeToken;
+
+// Author code only receives this wrapper, never the native fetch it closes
+// over. Replacing the global cannot recover the native network capability.
+// Host tools import pure helpers from this module; only Workers install the
+// network wrappers, before the lazy author import.
+if (typeof globalThis.WebSocketPair === 'function') {
+  const meteredFetch = async function fetch(input, init) {
+    chargeAuthorSubrequest();
+    const options = ownEnvCopy(init);
+    const inputIsRequest = _apply(_hasInstance, _Request, [input]);
+    const redirect = options.redirect !== undefined ? options.redirect
+      : inputIsRequest ? _apply(_requestRedirect, input, []) : 'follow';
+    if (redirect !== 'follow' && redirect !== 'manual' && redirect !== 'error') {
+      throw new _TypeError('Invalid fetch redirect mode');
+    }
+    // workerd rejects native redirect:'error'. Always fetch one hop at a time
+    // and implement the caller's mode here, charging before each network call.
+    options.redirect = 'manual';
+    // Keep the caller's headers before Request adds a body Content-Type. In
+    // particular, replaying FormData must generate a fresh matching boundary.
+    const headers = new _Headers();
+    const sourceHeaders = options.headers !== undefined ? new _Headers(options.headers)
+      : inputIsRequest ? _apply(_requestHeaders, input, []) : undefined;
+    if (sourceHeaders) _apply(_headersForEach, sourceHeaders, [(value, name) => {
+      _apply(_headersAppend, headers, [name, value]);
+    }]);
+    let request = new _Request(input, options);
+    let currentUrl = new _URL(_apply(_requestUrl, request, []));
+    let method = _apply(_requestMethod, request, []);
+    // Request bodies are streams once constructed. Retain a supplied BodyInit
+    // for replay, but never buffer or retry a caller-supplied stream.
+    let body = options.body ?? _apply(_requestBody, request, []);
+    const replayable = body == null || typeof body === 'string' || _arrayBufferIsView(body)
+      || _apply(_hasInstance, _ArrayBuffer, [body]) || _apply(_hasInstance, _URLSearchParams, [body])
+      || _apply(_hasInstance, _FormData, [body]) || _apply(_hasInstance, _Blob, [body]);
+    for (let i = 0; i < _requestInitNames.length; i++) {
+      const name = _requestInitNames[i];
+      options[name] = _apply(_requestInitGetters[name], request, []);
+    }
+    options.headers = headers;
+    for (let redirects = 0; ; redirects++) {
+      const response = await _fetch(request, { __proto__: null, redirect: 'manual' });
+      const status = _apply(_responseStatus, response, []);
+      if (status !== 301 && status !== 302 && status !== 303 && status !== 307 && status !== 308) return response;
+      if (redirect === 'manual') return response;
+      if (redirect === 'error') throw new _TypeError('Fetch redirect mode is error');
+      const location = _apply(_headersGet, _apply(_responseHeaders, response, []), ['location']);
+      if (location === null) return response;
+      if (redirects === 20) throw new _TypeError('Too many fetch redirects');
+      if ((status === 301 || status === 302 || status === 303) && method !== 'GET' && method !== 'HEAD') {
+        method = 'GET';
+        body = null;
+        for (let i = 0; i < _requestBodyHeaderNames.length; i++) {
+          _apply(_headersDelete, headers, [_requestBodyHeaderNames[i]]);
+        }
+      } else if (body !== null && !replayable) {
+        return response;
+      }
+      const nextUrl = new _URL(location, _apply(_urlHref, currentUrl, []));
+      if (_apply(_urlOrigin, nextUrl, []) !== _apply(_urlOrigin, currentUrl, [])) {
+        _apply(_headersDelete, headers, ['authorization']);
+        _apply(_headersDelete, headers, ['proxy-authorization']);
+        _apply(_headersDelete, headers, ['cookie']);
+      }
+      options.method = method;
+      options.body = body;
+      chargeAuthorSubrequest();
+      request = new _Request(_apply(_urlHref, nextUrl, []), options);
+      currentUrl = nextUrl;
+    }
+  };
+  replaceGlobalNetworkCapability('fetch', meteredFetch);
+
+  // EventSource opens, redirects and reconnects outside the fetch wrapper.
+  // Disable it, including the native prototype's constructor alias.
+  if (typeof globalThis.EventSource === 'function') {
+    const NativeEventSource = globalThis.EventSource;
+    const denyEventSource = function EventSource() {
+      throw new _Error('EventSource is unavailable; use fetch within the outbound subrequest allowance');
+    };
+    _defineProperty(NativeEventSource.prototype, 'constructor', { __proto__: null, value: denyEventSource, configurable: true, writable: true });
+    replaceGlobalNetworkCapability('EventSource', denyEventSource);
+  }
+
+  // Outbound WebSockets also initiate a network subrequest. Hide the native
+  // constructor on its prototype as well as on the global.
+  if (typeof globalThis.WebSocket === 'function') {
+    const NativeWebSocket = globalThis.WebSocket;
+    const construct = Reflect.construct;
+    const MeteredWebSocket = new Proxy(NativeWebSocket, {
+      construct(target, args, newTarget) {
+        chargeAuthorSubrequest();
+        return construct(target, args, newTarget);
+      },
+    });
+    _defineProperty(NativeWebSocket.prototype, 'constructor', { __proto__: null, value: MeteredWebSocket, configurable: true, writable: true });
+    replaceGlobalNetworkCapability('WebSocket', MeteredWebSocket);
+  }
+}
+
+// Remove inherited copies too, so walking the global's prototype chain never
+// recovers a native network capability behind the wrapper.
+function replaceGlobalNetworkCapability(name, value) {
+  let owner = globalThis;
+  while (owner) {
+    const descriptor = _getOwnPropertyDescriptor(owner, name);
+    if (descriptor && _hasOwn(descriptor, 'value')) {
+      _defineProperty(owner, name, { __proto__: null, value, writable: descriptor.writable,
+        enumerable: descriptor.enumerable, configurable: descriptor.configurable });
+    }
+    owner = _getPrototypeOf(owner);
+  }
+}
+
+function chargeAuthorSubrequest() {
+  const budget = _apply(_alsGetStore, als, [])?.storageBudget;
+  if (!budget || budget.outboundRemaining <= 0) {
+    throw new _Error('Outbound subrequest limit exceeded: ' + (budget ? budget.outboundLimit : 0) + ' per request; one platform slot is reserved for storage usage');
+  }
+  budget.outboundRemaining--;
+}
+
+function checkStorageBooking() {
+  const budget = _apply(_alsGetStore, als, [])?.storageBudget;
+  if (budget?.reportEnv && (typeof budget.waitUntil !== 'function' || budget.closing || budget.reportFailed || budget.reportSent)) {
+    throw new _Error('Storage usage reporting unavailable; further storage operations are refused');
+  }
+}
 
 function emptyStorageUsage() {
   return { __proto__: null, kvReads: 0, kvWrites: 0, r2ClassA: 0, r2ClassB: 0, d1RowsWritten: 0 };
 }
 
-// A report snapshots private counters before any await. Late operations (for
-// example waitUntil work) send deltas under the original request's allowance.
+// Bookkeeping promises never leave the shim. Discard settlement values so even
+// allSettled's result array cannot invoke an author-installed `then` hook.
+function StorageSettlement(executor) {
+  const promise = new _Promise((resolve, reject) => executor(() => resolve(), reject));
+  _defineProperty(promise, 'constructor', { __proto__: null, value: undefined });
+  _defineProperty(promise, 'then', { __proto__: null, value: _promiseThen });
+  return promise;
+}
+StorageSettlement.resolve = promise => promise;
+
+function storageSettlementIterable(pending, authorTasks) {
+  const snapshot = { __proto__: null };
+  let count = 0;
+  const append = promise => { snapshot[count++] = promise; };
+  _apply(_setForEach, pending, [append]);
+  if (authorTasks) _apply(_setForEach, authorTasks, [append]);
+  let index = 0;
+  const iterator = { __proto__: null, next: () => ({ __proto__: null,
+    done: index === count, value: index < count ? snapshot[index++] : undefined }) };
+  return { __proto__: null, [_iterator]: () => iterator };
+}
+
+function settleStorageOperations(pending, authorTasks) {
+  return _apply(_promiseAllSettled, StorageSettlement, [storageSettlementIterable(pending, authorTasks)]);
+}
+
+// Only author registrations join this set; the platform report must never
+// wait on itself. Keep settlement values and rejections out of bookkeeping.
+function trackAuthorTask(budget, task) {
+  let settle;
+  const pending = new StorageSettlement(resolve => { settle = resolve; });
+  _apply(_setAdd, budget.authorTasks, [pending]);
+  (async () => {
+    try { await task; }
+    catch (_) { /* The original task still reaches runtime waitUntil. */ }
+    finally {
+      _apply(_setDelete, budget.authorTasks, [pending]);
+      settle();
+    }
+  })();
+}
+
+// Track the whole facade call, including quota awaits and D1 result accounting.
+// Register before invoking it so a response cannot overtake a pending operation.
+function trackStorageMethods(surface, names) {
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    const method = ownValue(surface, name);
+    surface[name] = function (...args) {
+      const budget = _apply(_alsGetStore, als, [])?.storageBudget;
+      if (!budget) return _apply(method, this, args);
+      let settle;
+      const pending = new StorageSettlement(resolve => { settle = resolve; });
+      _apply(_setAdd, budget.inFlight, [pending]);
+      const finish = () => {
+        _apply(_setDelete, budget.inFlight, [pending]);
+        settle();
+      };
+      let result;
+      try { result = _apply(method, this, args); }
+      catch (error) { finish(); throw error; }
+      return (async () => {
+        try { return await result; }
+        finally { finish(); }
+      })();
+    };
+  }
+  return surface;
+}
+
+// One reserved report covers every storage call started before booking closes.
+// Author work may await a fetch before starting storage. Keep admission open
+// until both sets settle or the response's deadline expires. Storage-only
+// churn retains the three-pass fallback, then one final closed snapshot.
 function reportStorage(budget) {
   if (!budget.reportEnv || budget.reportScheduled) return;
   budget.reportScheduled = true;
-  const task = _apply(_promiseThen, _resolved, [async () => {
-    budget.reportScheduled = false;
-    const usage = budget.usage;
-    budget.usage = emptyStorageUsage();
+  const task = (async () => {
+    let timer;
+    const deadline = new StorageSettlement(resolve => { timer = _setTimeout(resolve, AUTHOR_DRAIN_MS); });
+    const drained = new StorageSettlement(resolve => {
+      (async () => {
+        for (let pass = 0; !budget.closing; pass++) {
+          await settleStorageOperations(budget.inFlight, budget.authorTasks);
+          if (_apply(_setSize, budget.authorTasks, []) === 0
+              && (_apply(_setSize, budget.inFlight, []) === 0 || pass >= 2)) break;
+        }
+        resolve();
+      })();
+    });
+    const racers = new _Set();
+    _apply(_setAdd, racers, [drained]);
+    _apply(_setAdd, racers, [deadline]);
+    try {
+      await _apply(_promiseRace, StorageSettlement, [storageSettlementIterable(racers)]);
+    } finally {
+      _clearTimeout(timer);
+    }
+    budget.closing = true;
+    await settleStorageOperations(budget.inFlight);
+    budget.reportSent = true;
+    const usage = ownEnvCopy(budget.usage);
     if (!(usage.kvReads || usage.kvWrites || usage.r2ClassA || usage.r2ClassB || usage.d1RowsWritten)) return;
     try {
-      const response = await _signedInternalFetch(budget.reportEnv, budget.vibeId, '/api/internal/storage-usage', _stringify(usage));
-      if (!response.ok) throw new Error('Storage usage rejected');
+      const response = await signedInternalFetch(budget.reportEnv, budget.vibeId, '/api/internal/storage-usage', _stringify(usage));
+      if (!_apply(_responseOk, response, [])) throw new _Error('Storage usage rejected');
     } catch (_) {
-      // Match the account ledger's fail-open outage policy: KV/R2 execution
-      // remains bounded by the request allowance and daily request cap.
+      budget.reportFailed = true;
       console.warn('Storage usage report failed');
     }
-  }]);
+  })();
   if (budget.waitUntil) _apply(budget.waitUntil, budget.ctx, [task]);
 }
 
@@ -119,7 +393,6 @@ function recordD1Rows(result) {
   if (!(typeof rows === 'number' && _isSafeInteger(rows) && rows >= 0)) rows = budget.limit;
   // Saturation keeps even repeated ambiguous results valid for the endpoint.
   budget.usage.d1RowsWritten = _min(9007199254740991, budget.usage.d1RowsWritten + rows);
-  if (budget.finished) reportStorage(budget);
 }
 
 /**
@@ -343,6 +616,7 @@ function registerStorageBinding(binding) {
 // author code. Reserve synchronously before any binding call or await so
 // concurrent operations cannot spend the same units. Missing context denies.
 function chargeStorage(units, binding, category) {
+  checkStorageBooking();
   const budget = _apply(_alsGetStore, als, [])?.storageBudget;
   if (!budget || !_apply(_weakMapGet, budget.bindings, [binding])
       || !(units >= 0 && units <= budget.remaining)) {
@@ -350,7 +624,6 @@ function chargeStorage(units, binding, category) {
   }
   budget.remaining -= units;
   if (category) budget.usage[category] += units === 1 ? 1 : units / 10;
-  if (budget.finished) reportStorage(budget);
 }
 
 // Establish the request's access mode, then run `fn` inside it. PRIVATE and NOT
@@ -374,21 +647,22 @@ function chargeStorage(units, binding, category) {
 // can never be escalated to write. Living here, not in fetch(), makes the
 // no-escalation invariant true by construction for every entrypoint (fetch
 // today; scheduled/queue if ever added), not just the one that remembered it.
-function _enterMode(requestedMode, fn, limit = 500, reportEnv, ctx, waitUntil) {
+function _enterMode(requestedMode, fn, limit = 500, reportEnv, ctx, waitUntil, outboundLimit = 5) {
   const ambient = _apply(_alsGetStore, als, []);
   const mode = ambient?.mode === 'read' ? 'read' : requestedMode;
   // Pass the effective (clamped) mode to fn so the caller wraps bindings against
   // what was actually entered, not what it requested.
-  // Re-entering fetch in an ambient request shares its budget. A top-level
-  // invocation receives a fresh allowance.
+  // Ambient re-entry shares its budget. A context-less invocation receives
+  // outbound capacity only when fetch authenticates its private runtime env.
   const storageBudget = ambient ? ambient.storageBudget
     : { __proto__: null, remaining: limit, limit, bindings: new _WeakMap(), usage: emptyStorageUsage(),
-      reportEnv, vibeId: ownValue(reportEnv, 'VIBE_ID'), ctx, waitUntil, finished: false, reportScheduled: false };
+      reportEnv, vibeId: ownValue(reportEnv, 'VIBE_ID'), ctx, waitUntil,
+      inFlight: new _Set(), authorTasks: new _Set(), reportScheduled: false,
+      outboundLimit, outboundRemaining: outboundLimit, closing: false, reportSent: false, reportFailed: false };
   return _apply(_alsRun, als, [{ __proto__: null, mode, storageBudget }, async () => {
     try { return await fn(mode); }
     finally {
       if (!ambient) {
-        storageBudget.finished = true;
         reportStorage(storageBudget);
       }
     }
@@ -445,7 +719,7 @@ function createKVFacade(kv, prefix, checkPutQuota) {
     return _hasPrefix(text, prefix) ? text : prefix + text;
   }
 
-  return {
+  return trackStorageMethods({
     get(key, options) {
       chargeStorage(1, kv, 'kvReads');
       return kv.get(safePrefix(key), options);
@@ -490,7 +764,7 @@ function createKVFacade(kv, prefix, checkPutQuota) {
       chargeStorage(1, kv, 'kvReads');
       return kv.getWithMetadata(safePrefix(key), options);
     }
-  };
+  }, ['get', 'put', 'delete', 'list', 'getWithMetadata']);
 }
 
 /**
@@ -719,7 +993,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
     return readOverQuotaFlag(ownValue(capturedEnv, 'VIBE_STORAGE'), 'r2:overquota:' + idStr, 'R2');
   }
 
-  return {
+  return trackStorageMethods({
     /**
      * Put an object. Body can be string | ArrayBuffer | ReadableStream | Blob | null.
      *
@@ -878,7 +1152,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
         ttl: _min(scalarValue(ownValue(options, 'ttl')) || 120, 120),
       });
     },
-  };
+  }, ['put', 'get', 'head', 'delete', 'list']);
 }
 
 // ===========================================================================
@@ -1036,6 +1310,16 @@ export function _isD1ReadStatement(sql) {
  * @returns {D1Database} Wrapped binding with the same prepare/batch/exec/dump/withSession surface
  */
 export function createMeteredD1(db, opts) {
+  const requiresReporting = !!_apply(_alsGetStore, als, [])?.storageBudget.reportEnv;
+  // Hosted facades require a request budget. Context-less callbacks cannot
+  // start storage that no request's report can observe. Local facades retain
+  // their existing behavior when hosted reporting is not configured.
+  function checkD1StorageBooking() {
+    if (requiresReporting && !_apply(_alsGetStore, als, [])?.storageBudget) {
+      throw new _Error('Storage usage reporting unavailable; further storage operations are refused');
+    }
+    checkStorageBooking();
+  }
   const capBytes = ownValue(opts, 'capBytes');
   const cap = (typeof capBytes === 'number' && capBytes > 0)
     ? capBytes
@@ -1110,6 +1394,7 @@ export function createMeteredD1(db, opts) {
   }
 
   async function executeD1(invoke, count = 1) {
+    checkD1StorageBooking();
     try {
       return await invoke();
     } catch (error) {
@@ -1215,6 +1500,7 @@ export function createMeteredD1(db, opts) {
     // instead of a denial; everything else non-read is denied.
     // Returns true when the caller should return the no-op result.
     const readModeNoop = () => {
+      checkD1StorageBooking();
       if (isRead) return false;
       if (isIdempotentDdl && currentMode() !== 'write') return true;
       denyReadOnlyWrite();
@@ -1237,6 +1523,7 @@ export function createMeteredD1(db, opts) {
     const wrapped = {
       _sql: sql, // for debugging/tests only — NOT trusted for classification
       bind(...args) {
+        checkD1StorageBooking();
         return wrapStatement(realStmt.bind(...args), sql, { isRead, isGrowth, isIdempotentDdl, isDropTrigger });
       },
       async run() {
@@ -1277,7 +1564,7 @@ export function createMeteredD1(db, opts) {
       },
     };
     _apply(_weakMapSet, wrapperMeta, [wrapped, { realStmt, isRead, isGrowth, isIdempotentDdl, isDropTrigger }]);
-    return wrapped;
+    return trackStorageMethods(wrapped, ['run', 'all', 'first', 'raw']);
   }
 
   // workerd's D1 binding calls statements.map in the author's realm. Pin the
@@ -1290,11 +1577,13 @@ export function createMeteredD1(db, opts) {
   }
 
   function buildSurface(target) {
-    return {
+    return trackStorageMethods({
       prepare(sql) {
+        checkD1StorageBooking();
         return wrapStatement(target.prepare(sql), sql);
       },
       async batch(statements) {
+        checkD1StorageBooking();
         const count = _arrayIsArray(statements) ? ownValue(statements, 'length') : 0;
         if (typeof count !== 'number' || count !== (count >>> 0)) throw new TypeError('Invalid D1 batch length');
         const list = { __proto__: null };
@@ -1395,6 +1684,7 @@ export function createMeteredD1(db, opts) {
         return results;
       },
       async exec(sql) {
+        checkD1StorageBooking();
         // exec() is multi-statement and returns no size_after — treat it as
         // growth unconditionally and re-read the size afterwards: blocked
         // when over cap (an over-cap vibe recovers via prepare().run() DELETE/
@@ -1412,13 +1702,15 @@ export function createMeteredD1(db, opts) {
         }
       },
       dump(...args) {
+        checkD1StorageBooking();
         return target.dump(...args);
       },
       withSession(constraint) {
+        checkD1StorageBooking();
         // A D1 session shares this facade's cap/size state (same physical DB).
         return buildSurface(target.withSession(constraint));
       },
-    };
+    }, ['batch', 'exec', 'dump']);
   }
 
   return buildSurface(db);
@@ -1441,6 +1733,11 @@ export function createMeteredD1(db, opts) {
  * @returns {Promise<Response>} The raw fetch Response (caller handles status)
  */
 export async function _signedInternalFetch(env, vibeId, path, bodyJson) {
+  chargeAuthorSubrequest();
+  return signedInternalFetch(env, vibeId, path, bodyJson);
+}
+
+function signedInternalFetch(env, vibeId, path, bodyJson) {
   const token = ownValue(env, 'PLATFORM_VIBE_TOKEN');
   if (typeof token !== 'string' || !token) {
     throw new Error('PLATFORM_VIBE_TOKEN not configured on this worker');
@@ -1460,6 +1757,7 @@ export async function _signedInternalFetch(env, vibeId, path, bodyJson) {
   const init = {
     __proto__: null,
     method: 'POST',
+    redirect: 'manual',
     headers: {
       __proto__: null,
       'Content-Type': 'application/json',
@@ -1589,26 +1887,48 @@ export default {
     // getter for a name this deploy does not bind; reading that name on the
     // runtime env would run the getter with the raw env as `this`.
     env = ownEnvCopy(env);
+    // The first runtime entry precedes the lazy author import. Pin its private
+    // token once: a context-less callback cannot mint capacity with an author
+    // env, even if it supplies a matching pair of forged env/header tokens.
+    if (!_runtimeEnvInitialized) {
+      _runtimeEnvInitialized = true;
+      const token = ownValue(env, 'PLATFORM_VIBE_TOKEN');
+      if (typeof token === 'string' && token.length > 0) _runtimeVibeToken = token;
+    }
     const service = ownValue(env, 'PLATFORM_SERVICE');
+    const serviceFetch = ownValue(service, 'fetch') || (service && ownValue(_getPrototypeOf(service), 'fetch'));
     if (!_serviceFetch && service && !ownValue(service, 'fetch')) {
-      _serviceFetch = ownValue(_getPrototypeOf(service), 'fetch');
+      _serviceFetch = serviceFetch;
     }
     const requestHeaders = _apply(_requestHeaders, request, []);
     const headerMode = _apply(_headersGet, requestHeaders, ['x-vibe-access-mode']);
     const presented = _apply(_headersGet, requestHeaders, ['x-vibe-access-token']);
     const expected = env.PLATFORM_VIBE_TOKEN;
+    const trustedEnv = typeof expected === 'string' && typeof _runtimeVibeToken === 'string'
+      && _constantTimeEqual(expected, _runtimeVibeToken);
     const proven = headerMode === 'write' && typeof expected === 'string' && expected.length > 0
       && typeof presented === 'string' && _constantTimeEqual(presented, expected);
     const requestedMode = proven ? 'write' : 'read';
     const limit = _apply(_headersGet, requestHeaders, ['x-vibe-storage-units']) === '10000' ? 10000 : 500;
+    const outboundHeader = _apply(_headersGet, requestHeaders, ['x-vibe-subrequests']);
+    const outboundLimit = trustedEnv ? (outboundHeader === '50' ? 50 : outboundHeader === '20' ? 20 : 5) : 0;
     // Runtime prototype methods are captured before the first author import.
+    const contextPrototype = ctx && _getPrototypeOf(ctx);
+    if (!_runtimeContextPrototype && contextPrototype) {
+      _runtimeContextPrototype = contextPrototype;
+      for (let i = 0; i < _contextPropertyNames.length; i++) {
+        const name = _contextPropertyNames[i];
+        const getter = captureGetter(ctx, name);
+        if (getter) _runtimeContextGetters[name] = getter;
+      }
+    }
     const ownWaitUntil = ownValue(ctx, 'waitUntil');
     if (!_runtimeWaitUntil && ctx && typeof ownWaitUntil !== 'function') {
       _runtimeWaitUntil = ownValue(_getPrototypeOf(ctx), 'waitUntil');
     }
     const waitUntil = typeof ownWaitUntil === 'function' ? ownWaitUntil : _runtimeWaitUntil;
-    const reportEnv = typeof ownValue(env, 'PLATFORM_VIBE_TOKEN') === 'string'
-      && ownValue(env, 'VIBE_ID') && ownValue(env, 'PLATFORM_SERVICE') ? env : undefined;
+    const reportEnv = trustedEnv && ownValue(env, 'VIBE_ID')
+      && typeof serviceFetch === 'function' ? env : undefined;
 
     // The proof is a platform capability, not author-visible request metadata.
     // Copy only safe headers through captured methods; no author hook sees the
@@ -1623,6 +1943,33 @@ export default {
     // this exported handler during a read request cannot escalate to write) and
     // passes the effective mode to the callback. See _enterMode.
     return _enterMode(requestedMode, async (mode) => {
+    // Forward author waitUntil calls through a facade, keeping the runtime
+    // receiver private and the report's own registration out of authorTasks.
+    const authorCtx = ctx ? { ...ownEnvCopy(ctx) } : ctx;
+    // Native context properties can be accessors rather than own data. Read
+    // only captured runtime getters, with their original branded receiver.
+    if (authorCtx && contextPrototype === _runtimeContextPrototype) {
+      for (let i = 0; i < _contextPropertyNames.length; i++) {
+        const name = _contextPropertyNames[i];
+        const getter = _runtimeContextGetters[name];
+        if (getter) _defineProperty(authorCtx, name, { __proto__: null, configurable: true, enumerable: true, writable: true,
+          value: _apply(getter, ctx, []) });
+      }
+    }
+    if (authorCtx && typeof waitUntil === 'function') {
+      const budget = _apply(_alsGetStore, als, []).storageBudget;
+      _defineProperty(authorCtx, 'waitUntil', { __proto__: null, configurable: true, enumerable: true, writable: true,
+        value(task) {
+          trackAuthorTask(budget, task);
+          return _apply(waitUntil, ctx, [task]);
+        } });
+    }
+    const passThrough = ownValue(ctx, 'passThroughOnException')
+      || (ctx && ownValue(_getPrototypeOf(ctx), 'passThroughOnException'));
+    if (authorCtx && typeof passThrough === 'function') {
+      _defineProperty(authorCtx, 'passThroughOnException', { __proto__: null, configurable: true, enumerable: true, writable: true,
+        value() { return _apply(passThrough, ctx, []); } });
+    }
     // Lazy so shim module init (ALS + prototype capture above) runs before any
     // user top-level code; cache the RESOLVED handler so steady-state requests
     // skip the await entirely (the module registry already caches the import).
@@ -1782,11 +2129,11 @@ export default {
     const authorEnv = { ...wrappedEnv };
 
     try {
-      return await userWorker.fetch(userRequest, authorEnv, ctx);
+      return await userWorker.fetch(userRequest, authorEnv, authorCtx);
     } catch (err) {
       if (err instanceof D1EntitlementError) return d1EntitlementResponse(err.message);
       throw err;
     }
-    }, limit, reportEnv, ctx, waitUntil);
+    }, limit, reportEnv, ctx, waitUntil, outboundLimit);
   }
 };

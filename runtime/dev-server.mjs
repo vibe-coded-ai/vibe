@@ -256,6 +256,7 @@ export function withDispatchHeaders(headers, manifest, vibeAccessToken, internal
   h.set('x-vibe-env', 'preview');
   h.set('x-vibe-access-mode', 'write');
   h.set('x-vibe-access-token', vibeAccessToken);
+  h.set('x-vibe-subrequests', PLAN === 'pro' ? '50' : PLAN === 'byov' ? '20' : '5');
   h.set('x-client-ip', '127.0.0.1');
   if (!h.has('x-request-id')) h.set('x-request-id', `dev-${Date.now()}`);
   return h;
