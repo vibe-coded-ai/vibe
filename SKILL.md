@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.45
+version: 4.7.47
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -46,6 +46,8 @@ Ask (with `AskUserQuestion`) only if the request doesn't make it obvious:
 downloads its files. These commands need a network connection. Prefer a template
 over hand-written files.
 `vibe status --plan` shows the plan (SQL, R2 and secrets need Pro).
+Publishing needs a verified email. Open the link in your verification email,
+or resend it from https://vibe-coded.ai/account (Resend verification email).
 
 ## 2. Path A — your AI's data
 

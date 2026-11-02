@@ -65,6 +65,18 @@ _has_worker() {
   [ -f worker.ts ] || [ -f worker.js ]
 }
 
+_print_publish_guidance() {
+  local account
+  account=$(_API_NO_RETRY=1 _api GET "/auth/me" 2>/dev/null) || account=""
+  if printf '%s' "$account" | jq -e '.success == true and .user.emailVerified == true' >/dev/null 2>&1; then
+    if [ "${1:-}" = "publish" ]; then
+      echo "  Run 'vibe publish' to go live."
+    fi
+  else
+    echo "  Publishing needs a verified email. Open the link in your verification email, or resend it from $WEB_BASE/account (Resend verification email)."
+  fi
+}
+
 _print_urls() {
   local env="${1:-preview}"
   local prefix=""
@@ -246,7 +258,7 @@ _print_budget_line() {
   echo "$1" | jq -r '
     def commas: tostring | split("") | reverse | join("") | gsub("(?<n>[0-9]{3})(?=[0-9])"; "\(.n),") | split("") | reverse | join("");
     if (.buildCallEquivalent | type) == "number"
-      then "API calls and builds share this monthly allowance; each preview build and each publish counts as about \(.buildCallEquivalent | commas) calls."
+      then "API calls, storage operations and builds share this monthly allowance; each preview build and each publish counts as about \(.buildCallEquivalent | commas) calls."
       else empty end' 2>/dev/null || true
   _print_budget_pause "$1"
 }
@@ -884,6 +896,7 @@ cmd_init() {
     echo "  3. Run: vibe preview"
   fi
   _print_urls preview
+  _print_publish_guidance
   return 0
 }
 
@@ -1333,6 +1346,7 @@ cmd_preview() {
     _print_served_files "$(echo "$vibe_info" | jq -r '.vibe.previewBuildId // .previewBuildId // empty' 2>/dev/null)" "$listed" "$file_access"
     _print_urls preview
     _print_tool_count "$vibe_info" 1 preview
+    _print_publish_guidance
     exit 0
   fi
 
@@ -1377,7 +1391,7 @@ cmd_preview() {
       vibe_info=$(_quiet_vibe_lookup)
       _sync_manifest_storage "$vibe_info"
       _print_tool_count "$vibe_info" 1 preview
-      echo "  Run 'vibe publish' to go live."
+      _print_publish_guidance publish
       exit 0
     elif [ "$STATUS" = "failed" ]; then
       echo ""

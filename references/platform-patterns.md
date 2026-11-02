@@ -9,6 +9,8 @@ Through MCP, get_vibe returns the manageUrl to give the owner; through the CLI, 
 Check private vibes as the owner with call_tool / fetch_page through MCP, or vibe call / vibe fetch through the CLI.
 MCP clients use worker tools for SQL and files; they do not need a CLI, a local credentials file or vibe files.
 
+The platform answers CORS preflights before the worker; a vibe's page calls its own /api same-origin, while a page on another origin cannot call that API from a browser (server-to-server calls are unaffected).
+
 ## Account allowances
 
 `usage` reports account-wide KV, SQL and file storage; SQL includes preview and production databases.
