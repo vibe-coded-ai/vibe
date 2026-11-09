@@ -247,7 +247,7 @@ as `env.NAME`.
    Have the sender supply that dedicated secret in `X-Webhook-Token`.
 3. Build with MCP `push_source` or CLI `vibe preview`. Probe the route as the owner
    with MCP `fetch_page` (`method: "POST"`, `headers`, `body`) or CLI
-   `vibe fetch /webhooks/inbox --preview --method POST --header 'X-Webhook-Token: <dedicated secret>' --data '<payload>'`.
+   `vibe fetch /webhooks/inbox --method POST --header 'X-Webhook-Token: <dedicated secret>' --data '<payload>'`.
    An owner probe does not prove anonymous access.
 4. **Website step:** give the owner `get_vibe`'s `manageUrl` (CLI: `vibe settings`).
    For a public webhook inbox that stores messages, the owner chooses public or

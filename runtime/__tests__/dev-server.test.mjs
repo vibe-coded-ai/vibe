@@ -920,14 +920,14 @@ test('vibe dev never serves a manifest scratch file', () => {
 
 for (const [plan, bound, lines] of [
   ['free', false, [
-    '  State:   .vibe-coded/dev/  (KV, persisted)',
+    '  State:   .vibe-coded/dev/  (key-value, persisted)',
     '  Plan:    Free — as deployed, env.VIBE_D1 throws the plan error and there is no env.VIBE_R2.',
     '           SQL and files need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing',
   ]],
-  ['byov', true, ['  State:   .vibe-coded/dev/  (D1 + KV + R2, persisted)', '  Plan:    Pro — SQL, key-value and files, as deployed.']],
-  ['pro', true, ['  State:   .vibe-coded/dev/  (D1 + KV + R2, persisted)', '  Plan:    Pro+ — SQL, key-value and files, as deployed.']],
+  ['byov', true, ['  State:   .vibe-coded/dev/  (SQL, key-value and files, persisted)', '  Plan:    Pro — SQL, key-value and files, as deployed.']],
+  ['pro', true, ['  State:   .vibe-coded/dev/  (SQL, key-value and files, persisted)', '  Plan:    Pro+ — SQL, key-value and files, as deployed.']],
   [undefined, true, [
-    '  State:   .vibe-coded/dev/  (D1 + KV + R2, persisted)',
+    '  State:   .vibe-coded/dev/  (SQL, key-value and files, persisted)',
     '  Plan:    unknown (signed out, offline or the read failed). SQL and files work here,',
     '           but a vibe on the Free plan has neither once deployed.',
   ]],
@@ -965,6 +965,29 @@ for (const [plan, bound, lines] of [
   });
 }
 
+test('vibe dev props on an unknown plan names the next step and prints no stack unless VIBE_DEBUG is set', () => {
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  try {
+    writeFileSync(join(modules, 'miniflare', 'index.js'), `
+      export class Miniflare { constructor() { console.log('Miniflare started'); } }
+    `);
+    const run = (extra) => spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), '--generation', 'props'], {
+      cwd: project, encoding: 'utf8', timeout: 10000, env: { ...process.env, VIBE_DEV_PLAN: '', VIBE_DEBUG: '', ...extra },
+    });
+    const plain = run({});
+    assert.equal(plain.status, 1);
+    assert.match(plain.stderr, /vibe login/);
+    assert.match(plain.stderr, /--generation shim/);
+    assert.doesNotMatch(plain.stderr, /\n\s+at /);
+    assert.doesNotMatch(plain.stdout, /Miniflare started/);
+    const debug = run({ VIBE_DEBUG: '1' });
+    assert.equal(debug.status, 1);
+    assert.match(debug.stderr, /\n\s+at /);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('vibe dev seed on Free refuses before starting Miniflare: the deployed vibe has no SQL', () => {
   const { root, runtimeDir, project, modules } = setupDevRuntime();
   try {
@@ -976,7 +999,7 @@ test('vibe dev seed on Free refuses before starting Miniflare: the deployed vibe
       cwd: project, encoding: 'utf8', timeout: 10000, env: { ...process.env, VIBE_DEV_PLAN: 'free' },
     });
     assert.equal(result.status, 1);
-    assert.equal(result.stderr, 'Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use KV storage".\n');
+    assert.equal(result.stderr, 'Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use key-value storage".\n');
     assert.doesNotMatch(result.stdout, /Miniflare started/);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -1305,15 +1328,16 @@ test('commands without a manifest explain shared-vibe MCP access without inventi
   assert.doesNotMatch(result.stderr, /https:\/\/.*--.*\.vibe-coded\.ai\/mcp/);
 });
 
-test('vibe call makes a real MCP tools/call on the production vibe and prints the result', () => {
-  const result = runCli('call', ['add_note', '{"text":"hi"}']);
+test('vibe call --production makes a real MCP tools/call on the production vibe and prints the result', () => {
+  const result = runCli('call', ['add_note', '{"text":"hi"}', '--production']);
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /\{"success":true\}/);
   assert.match(result.calls, /POST\thttps:\/\/tester--demo\.vibe-coded\.ai\/mcp\t.*"method":"tools\/call".*"name":"add_note".*"text":"hi"/);
 });
 
-test('vibe call --preview targets the preview host; tool errors and unknown tools exit 1', () => {
+test('vibe call targets the preview host by default and with --preview; tool errors and unknown tools exit 1', () => {
+  assert.match(runCli('call', ['list_notes']).calls, /https:\/\/p--tester--demo\.vibe-coded\.ai\/mcp/);
   assert.match(runCli('call', ['list_notes', '--preview']).calls, /https:\/\/p--tester--demo\.vibe-coded\.ai\/mcp/);
   const failing = runCli('call', ['failing_tool']);
   assert.equal(failing.status, 1);
@@ -1534,7 +1558,7 @@ test('ipv6PortTaken detects another program on the same port over IPv6 (localhos
 test('vibe call identifies the target and relays missing-vibe errors', () => {
   for (const tool of ['unbuilt_tool', 'unbuilt_rpc']) {
     for (const preview of [false, true]) {
-      const result = runCli('call', [tool, ...(preview ? ['--preview'] : [])]);
+      const result = runCli('call', [tool, ...(preview ? [] : ['--production'])]);
       assert.equal(result.status, 1);
       assert.equal(result.stderr, `→ tester/demo (${preview ? 'preview' : 'production'})\nError: Vibe not found\n`);
       assert.equal(result.stdout, '');
@@ -1543,7 +1567,7 @@ test('vibe call identifies the target and relays missing-vibe errors', () => {
 });
 
 test('vibe fetch reads a private deployed path with the owner token transport', () => {
-  const production = runCli('fetch', ['/docs/guide.html']);
+  const production = runCli('fetch', ['/docs/guide.html', '--production']);
   assert.equal(production.status, 0, production.stderr);
   assert.match(production.stdout, /private owner view/);
   assert.match(production.calls, /^GET\thttps:\/\/tester--demo\.vibe-coded\.ai\/docs\/guide\.html\t/m);
@@ -1823,11 +1847,12 @@ test('a network failure is reported, not silent', () => {
   assert.match(r.stderr, /could not reach .* \(network error\)/);
 });
 
-test('vibe dev selects v1 info generation, retains the shim default and permits an explicit override', () => {
+test('vibe dev selects the nested preview generation, retains the shim default and permits an explicit override', () => {
   for (const [info, args, expected] of [
-    [{ success: true, generation: 'props' }, [], '--generation props'],
-    [{ success: true }, [], '--generation shim'],
-    [{ success: true, generation: 'props' }, ['--generation', 'shim'], '--generation props seed local.sql --generation shim'],
+    [{ success: true, vibe: { previewGeneration: 'props' } }, [], '--generation props'],
+    [{ success: true, vibe: {} }, [], '--generation shim'],
+    [{ success: true, generation: 'props', previewGeneration: 'props' }, [], '--generation shim'],
+    [{ success: true, vibe: { previewGeneration: 'props' } }, ['--generation', 'shim'], '--generation props seed local.sql --generation shim'],
   ]) {
     const result = runCli('dev', ['seed', 'local.sql', ...args], 'normal', info);
     assert.equal(result.status, 0, result.stderr);
@@ -2072,10 +2097,12 @@ test('props local storage enforces the shared ceiling per request, including dir
   } };`);
   const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'free' }, ['--generation', 'props']);
   if (!server) return;
-  const expected = { completed: 500,
-    message: 'Storage operation limit exceeded: 500 units per request (reads 1; writes, lists and deletes 10)',
-    platformBinding: 'undefined', token: 'undefined', mode: null };
-  for (let i = 0; i < 2; i++) assert.deepEqual(await (await fetch(server.base + '/api/ceiling')).json(), expected);
+  const expected = { completed: 500, platformBinding: 'undefined', token: 'undefined', mode: null };
+  for (let i = 0; i < 2; i++) {
+    const { message, ...rest } = await (await fetch(server.base + '/api/ceiling')).json();
+    assert.deepEqual(rest, expected);
+    assert.match(message, /\b500 reads\b.*\b50 writes\b/);
+  }
   assert.equal(await (await fetch(server.base + '/api/background')).text(), 'queued');
   assert.deepEqual(await (await fetch(server.base + '/api/check')).json(), { value: 'saved' });
   await server.stop();
@@ -2128,7 +2155,7 @@ test('props local storage round-trips R2, metadata, allocation, D1 batches and s
   assert.deepEqual(data, { metadata: { value: { answer: 42 }, metadata: { tag: 'local' }, cacheStatus: null },
     alias: true, file: 'file bytes', contentType: 'text/plain', custom: { tag: 'local' }, keys: ['folder/item'],
     ids: { startId: 100, count: 2 }, row: { bytes: [0, 255] }, count: 2, bookmarkType: 'string',
-    batchError: 'Invalid D1 batch', tailError: 'Expected one SQL statement per D1 descriptor; use batch() to run several',
+    batchError: 'batch() takes 1 to 100 statements made with prepare()', tailError: 'One SQL statement per prepare(); use batch() to run several',
     signingError: DEV_PLATFORM_REFUSAL.error, traversalError: 'Invalid key format' });
   await server.stop();
   const restarted = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'pro' }, ['--generation', 'props']);
@@ -2138,7 +2165,7 @@ test('props local storage round-trips R2, metadata, allocation, D1 batches and s
   await restarted.stop();
 });
 
-test('props and shim preserve the identical Free SQL refusal message and response', async (t) => {
+test('props and shim give the same Free SQL refusal response; props words it without provider terms', async (t) => {
   if (!existsSync(resolve(RUNTIME_DIR, '../../../src/package.json'))) { t.skip('native runtime dependency lives in the platform repo'); return; }
   const outcomes = [];
   for (const generation of ['shim', 'props']) {
@@ -2154,7 +2181,11 @@ test('props and shim preserve the identical Free SQL refusal message and respons
   }
   assert.equal(outcomes[0].status, 403);
   assert.equal(outcomes[0].body.code, 'ENTITLEMENT_EXCEEDED');
-  assert.deepEqual(outcomes[1], outcomes[0]);
+  // The legacy shim keeps its own wording; status, headers and fields match.
+  const withoutText = ({ body: { error, ...body }, ...rest }) => ({ ...rest, body });
+  assert.deepEqual(withoutText(outcomes[1]), withoutText(outcomes[0]));
+  assert.match(outcomes[1].body.error, /SQL requires Pro/);
+  assert.doesNotMatch(outcomes[1].body.error, /\bKV\b|\bD1\b/);
 });
 
 test('a direct STORAGE D1 call on Free gets the same structured refusal as the facade', async (t) => {

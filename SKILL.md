@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.57
+version: 4.7.58
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -58,8 +58,9 @@ or resend it from https://vibe-coded.ai/account (Resend verification email).
    (`POST /api/<tool>` or `/mcp`). Fix before deploying.
 4. **Preview:** `vibe preview`. Check the reported tool count.
 5. **Publish:** `vibe publish`.
-6. **Prove it works — required.** `vibe call` calls a tool on the live vibe as the
-   owner. Create a uniquely named record, read it back, then delete it by its `id`:
+6. **Prove it works — required.** `vibe call` calls a tool as the owner, on the
+   preview build by default; add `--production` for the published build. Create
+   a uniquely named record, read it back, then delete it by its `id`:
    ```bash
    TEST=$(vibe call add_x '{"name":"vibe verification test"}')
    ID=$(printf '%s' "$TEST" | jq -r '.data.id')
@@ -99,7 +100,7 @@ or resend it from https://vibe-coded.ai/account (Resend verification email).
 ## 3. Path B — a site or a web app
 
 - **Site:** `vibe init --template site <slug>`, edit `index.html`, `vibe preview`,
-  check it with `vibe fetch / --preview`, then `vibe publish`. For `/api`
+  check it with `vibe fetch /`, then `vibe publish`. For `/api`
   endpoints, add a root `worker.js` from `references/worker-template.md`.
 - **Web app (Vue/Vite):** `vibe init --template vue <slug>`, edit the starter
   (see `references/vue-template.md`), and add a root `worker.ts` from
@@ -178,8 +179,8 @@ settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug
 | `dev [--port N] [--reset]` | Run locally on `127.0.0.1:8787` with local KV, SQL and R2; `dev seed file.sql` loads local SQL |
 | `preview` | Upload, build, and deploy to the preview URL |
 | `publish` | Promote the preview to production |
-| `call <tool> ['{json}'] [--preview]` | Call one tool on the live vibe as the owner |
-| `fetch <path> [--preview] [--headers\|-i]` | Fetch a deployed page or file as the owner; 2xx and 3xx succeed; redirects print Location without following it; `--headers` (`-i`) includes the status line and file-serving headers |
+| `call <tool> ['{json}'] [--production]` | Call one tool as the owner (preview build; `--production` for production) |
+| `fetch <path> [--production] [--headers\|-i]` | Fetch a page or file from the preview build as the owner (`--production` for production); 2xx and 3xx succeed; redirects print Location without following it; `--headers` (`-i`) includes the status line and file-serving headers |
 | `connect [<owner>/<slug>] [--revoke]` | Connect Claude Code to a vibe (yours or one shared with you) |
 | `status [--plan]` | Live builds, tool counts, and plan (`--plan` also shows this month's usage against the plan's budget); upgrades are at vibe-coded.ai/billing |
 | `logs [build-id]` | Build logs |

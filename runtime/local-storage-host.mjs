@@ -1,14 +1,28 @@
 import { withLocalOutbound } from './local-outbound.mjs';
 import { VibeStorage, VibeStorageDO, AccountBudgetDO, bookDispatch, getPlan, getPlanLimit,
   planHasFeature, jsonResponse, D1_STORAGE_FULL,
-  classifyD1, assertD1SingleStatement, d1DdlNoop, D1_ENTITLEMENT_REQUIRED, WRITE_ACCESS_DENIED } from './dev-storage.js';
+  classifyD1, assertD1SingleStatement, d1DdlNoop, D1_ENTITLEMENT_REQUIRED, WRITE_ACCESS_DENIED,
+  sqlErrorMessageForAuthor } from './dev-storage.js';
 // The adapter's own error class, so a direct STORAGE call gets the same structured refusal as the facade.
 import { D1EntitlementError } from './client-adapter.js';
 
 export { VibeStorageDO, AccountBudgetDO };
 
 const SIGNED_URL_REFUSAL = 'Signed file URLs (createUploadUrl, createDownloadUrl) are not available in vibe dev; env.VIBE_R2 put, get, list and delete work locally. Test signed URLs on the preview: vibe preview.';
+const INVALID_STATEMENT = 'Invalid SQL statement: prepare() takes a non-empty SQL string of at most 100,000 characters and at most 100 parameters';
+const INVALID_PARAMETER = 'Invalid SQL parameter: use strings, numbers, booleans, null or bytes (at most 100)';
+const INVALID_BATCH = 'batch() takes 1 to 100 statements made with prepare()';
 let registryReady = false;
+
+// Native statement errors reach author code in the hosted broker's wording.
+function authorSqlError(error) {
+  if (!(error instanceof Error)) return error;
+  const message = sqlErrorMessageForAuthor(error.message);
+  if (message === error.message) return error;
+  const translated = new Error(message);
+  translated.name = error.name;
+  return translated;
+}
 
 async function initializeRegistry(env, config) {
   if (registryReady) return;
@@ -31,16 +45,16 @@ function localD1(env, ctx, props) {
   }
   function descriptor(value) {
     if (!value || typeof value.sql !== 'string' || !['run', 'all', undefined].includes(value.method)
-      || (value.params !== undefined && (!Array.isArray(value.params) || value.params.length > 100))) throw new Error('Invalid D1 descriptor');
+      || (value.params !== undefined && (!Array.isArray(value.params) || value.params.length > 100))) throw new Error(INVALID_STATEMENT);
     // Refuse tails before classification: native D1 can execute more than one statement.
     assertD1SingleStatement(value.sql);
     const params = value.params === undefined ? [] : Array.from(value.params, (param, index) => {
-      if (!Object.hasOwn(value.params, index)) throw new Error('Invalid D1 parameter');
+      if (!Object.hasOwn(value.params, index)) throw new Error(INVALID_PARAMETER);
       if (param === null || typeof param === 'string' || typeof param === 'boolean' || (typeof param === 'number' && Number.isFinite(param))) return param;
       if (param instanceof ArrayBuffer) return param.slice(0);
       if (ArrayBuffer.isView(param)) return param.buffer.slice(param.byteOffset, param.byteOffset + param.byteLength);
       if (Array.isArray(param) && Array.from(param, (byte, i) => Object.hasOwn(param, i) && Number.isInteger(byte) && byte >= 0 && byte <= 255).every(Boolean)) return param.slice();
-      throw new Error('Invalid D1 parameter');
+      throw new Error(INVALID_PARAMETER);
     });
     return { ...value, params };
   }
@@ -76,14 +90,14 @@ function localD1(env, ctx, props) {
         if (!statement) return d1DdlNoop();
         let result;
         try { result = await statement[value.method ?? 'all'](); }
-        catch (error) { book(); throw error; }
+        catch (error) { book(); throw authorSqlError(error); }
         book(result);
         return result;
       },
       async batch(inputs) {
-        if (!Array.isArray(inputs) || inputs.length < 1 || inputs.length > 100) throw new Error('Invalid D1 batch');
+        if (!Array.isArray(inputs) || inputs.length < 1 || inputs.length > 100) throw new Error(INVALID_BATCH);
         const values = Array.from(inputs, (value, index) => {
-          if (!Object.hasOwn(inputs, index)) throw new Error('Invalid D1 batch');
+          if (!Object.hasOwn(inputs, index)) throw new Error(INVALID_BATCH);
           return descriptor(value);
         });
         // Validate the complete batch before native execution, including in sessions.
@@ -92,7 +106,7 @@ function localD1(env, ctx, props) {
         const native = statements.filter(Boolean);
         let results;
         try { results = native.length ? await target.batch(native) : []; }
-        catch (error) { for (const _ of native) book(); throw error; }
+        catch (error) { for (const _ of native) book(); throw authorSqlError(error); }
         for (let i = 0; i < native.length; i++) book(results[i]);
         let index = 0;
         return statements.map(statement => statement ? results[index++] : d1DdlNoop());

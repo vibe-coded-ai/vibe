@@ -515,9 +515,9 @@ async function main() {
   const manifest = loadManifest();
   manifest.generation = opts.generation;
   // Local props dispatch cannot infer entitlement from an unavailable plan.
-  if (opts.generation === 'props' && PLAN === 'unknown') throw new Error('Local props storage requires a known account plan; sign in and retry vibe dev');
+  if (opts.generation === 'props' && PLAN === 'unknown') throw new Error('vibe dev could not read your plan (signed out or offline). Sign in with vibe login so vibe dev knows your plan, or pass --generation shim');
   if (opts.seed && PLAN === 'free') {
-    console.error('Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use KV storage".');
+    console.error('Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use key-value storage".');
     process.exit(1);
   }
   const isIgnored = createVibeIgnore(process.cwd());
@@ -706,11 +706,11 @@ const PLAN_LINES = {
 
 function printBanner(manifest, port, tools) {
   console.log('');
-  console.log(`  vibe dev — ${manifest.userSlug}/${manifest.vibeSlug} (${manifest.storage === 'd1' ? 'sql' : manifest.storage})`);
+  console.log(`  vibe dev — ${manifest.userSlug}/${manifest.vibeSlug} (${manifest.storage === 'd1' ? 'sql' : manifest.storage === 'kv' ? 'key-value' : manifest.storage})`);
   console.log(`  Local:   http://127.0.0.1:${port}`);
   console.log(`  API:     http://127.0.0.1:${port}/api/<function>`);
   console.log(`  MCP:     http://127.0.0.1:${port}/mcp  (${tools.length} tool${tools.length === 1 ? '' : 's'})`);
-  console.log(`  State:   .vibe-coded/dev/  (${PLAN === 'free' ? 'KV' : 'D1 + KV + R2'}, persisted)`);
+  console.log(`  State:   .vibe-coded/dev/  (${PLAN === 'free' ? 'key-value' : 'SQL, key-value and files'}, persisted)`);
   PLAN_LINES[PLAN].forEach((line, i) => console.log(`  ${i ? '        ' : 'Plan:   '} ${line}`));
   console.log('  Watching worker for changes — Ctrl-C to stop.');
   if (needsViteBuild(process.cwd())) {
@@ -725,7 +725,7 @@ function printBanner(manifest, port, tools) {
 // Run only when invoked directly (not when imported by tests).
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
-    console.error(err && err.stack || err);
+    console.error(process.env.VIBE_DEBUG ? (err && err.stack || err) : `Error: ${err && err.message || err}`);
     process.exit(1);
   });
 }

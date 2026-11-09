@@ -133,7 +133,7 @@ _print_tool_count() {
   elif [ "$count" = "0" ]; then
     echo "  Warning: no MCP tools were extracted. @mcp-expose is only picked up on" >&2
     echo "  'async function name(...)' declarations — arrow functions and object" >&2
-    echo "  methods are skipped. Check the build logs: vibe logs" >&2
+    echo "  methods are skipped. Run vibe dev to see which tools were dropped and why." >&2
   fi
 }
 
@@ -410,15 +410,15 @@ _display_policy() {
 }
 
 # jq: the stores a vibe holds data in (the byte counters on its record), else
-# the storage type it was created with. KV bytes are measured hourly;
-# storage_note says so when a KV vibe's KV bytes are not counted yet.
+# the storage type it was created with. Key-value bytes are measured hourly;
+# storage_note says so when a key-value vibe's bytes are not counted yet.
 STORAGE_IN_USE_JQ='def storage_in_use: . as $v
   | [ (if $v.storageType == "d1" or (($v.d1BytesUsed // 0) + ($v.d1PreviewBytesUsed // 0)) > 0 then "sql" else empty end),
-      (if ($v.kvBytesUsed // 0) > 0 then "kv" else empty end),
+      (if ($v.kvBytesUsed // 0) > 0 then "key-value" else empty end),
       (if ($v.r2BytesUsed // 0) > 0 then "files" else empty end) ]
-  | if length > 0 then join(", ") else ($v.storageType // "kv") end;
-def storage_note: if (.storageType // "kv") == "kv" and (storage_in_use | split(", ") | index("kv") == null)
-  then " (KV is measured hourly)" else "" end;'
+  | if length > 0 then join(", ") else (($v.storageType // "kv") | if . == "kv" then "key-value" elif . == "d1" then "sql" else . end) end;
+def storage_note: if (.storageType // "kv") == "kv" and (storage_in_use | split(", ") | index("key-value") == null)
+  then " (key-value usage is measured hourly)" else "" end;'
 
 # Set .vibe-coded.json's storage from a vibe-detail result ($1): d1 once the
 # platform records SQL for the vibe, else its recorded type. vibe dev's banner
@@ -481,6 +481,19 @@ _quiet_vibe_lookup() {
     printf '%s' "$info"
   elif _api_was_rate_limited "$info" 15 && info=$(_API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" 2>/dev/null); then
     printf '%s' "$info"
+  fi
+}
+
+# After a build, say when the environment's SQL database is not reachable yet.
+# A new database answers "still being set up" until its broker binding is
+# active. Args: vibe-detail JSON, preview|production. Silent when the detail
+# was not read or does not carry the flag.
+_print_sql_setting_up() {
+  local flag="d1BrokerActive"
+  [ "$2" = "preview" ] && flag="d1PreviewBrokerActive"
+  if printf '%s' "$1" | jq -e --arg f "$flag" '(.vibe // .) as $v
+      | $v.storageType == "d1" and ($v | has($f)) and ($v[$f] == 0 or $v[$f] == false)' >/dev/null 2>&1; then
+    echo "Its SQL database is still being set up (usually under two minutes); SQL calls answer 'still being set up' until then — retry, no rebuild needed."
   fi
 }
 
@@ -768,7 +781,7 @@ cmd_init() {
     if [ -n "$storage_flag" ] && [ "$storage_flag" != "$storage" ]; then
       local want="$storage_flag" have="$storage"
       [ "$want" = "d1" ] && want="SQL"; [ "$have" = "d1" ] && have="SQL"
-      [ "$want" = "kv" ] && want="KV"; [ "$have" = "kv" ] && have="KV"
+      [ "$want" = "kv" ] && want="key-value"; [ "$have" = "kv" ] && have="key-value"
       echo "Note: template '$template' uses $have storage, so --storage ${storage_flag/d1/sql} was ignored." >&2
       if [ "$storage_flag" = "d1" ]; then
         local sql_plan_note=""
@@ -914,7 +927,7 @@ cmd_list() {
   _check_success "$result" "List"
   echo "OWNER/SLUG  TITLE  VISIBILITY/POLICY  STORAGE  STATE"
   printf '%s' "$result" | jq -r --arg owner "$USER_SLUG" --arg current "$current" "$STORAGE_IN_USE_JQ"'
-    .vibes[] | "\($owner)/\(.slug)  \(.title)  \(.visibility)/\(.interactionPolicy)  \(storage_in_use)  \(if .productionBuildId != null then "published" elif .previewBuildId != null then "preview-only" else "not built" end)\(if .slug == $current then "  * current" else "" end)"'
+    .vibes[] | "\($owner)/\(.slug)  \(.title)  \(.visibility)/\(.interactionPolicy)  \(storage_in_use)  \(if .status == "suspended" then "suspended" elif .productionBuildId != null then "published" elif .previewBuildId != null then "preview-only" else "not built" end)\(if .slug == $current then "  * current" else "" end)"'
 }
 
 cmd_source() {
@@ -1254,7 +1267,7 @@ cmd_preview() {
           echo "No upload history in this manifest; treating every remote file missing locally as never uploaded by this machine."
         fi
         kept_display=$(printf '%s' "$kept_paths" | jq -r '.[0:5] | join(", ") | gsub("[\u0000-\u001f\u007f]"; "?")')
-        echo "Kept $kept_count remote file(s) this machine never uploaded (another client added them): $kept_display. Re-run with --prune to remove them, or pull them into this folder with vibe source <path>."
+        echo "Kept $kept_count remote file(s) this machine never uploaded (another client added them): $kept_display. Re-run with --prune to remove them, or pull each into this folder with vibe source <path> > <path>."
       fi
       prune_paths=$(jq -cn --argjson stale "$prune_paths" --argjson kept "$kept_paths" '$stale - $kept')
     fi
@@ -1391,6 +1404,7 @@ cmd_preview() {
       vibe_info=$(_quiet_vibe_lookup)
       _sync_manifest_storage "$vibe_info"
       _print_tool_count "$vibe_info" 1 preview
+      _print_sql_setting_up "$vibe_info" preview
       _print_publish_guidance publish
       exit 0
     elif [ "$STATUS" = "failed" ]; then
@@ -1406,6 +1420,12 @@ cmd_preview() {
         fi
       fi
       printf 'Full log: vibe logs %s\n' "$BUILD_ID" >&2
+      exit 1
+    elif [ "$STATUS" = "canceled" ] || [ "$STATUS" = "cancelled" ]; then
+      echo ""
+      local cancel_message
+      cancel_message=$(printf '%s' "$BUILD" | jq -r '.builds[0].errorMessage // empty')
+      printf 'Build %s was canceled%s\n' "$BUILD_ID" "${cancel_message:+: $cancel_message}" >&2
       exit 1
     fi
   done
@@ -1560,6 +1580,7 @@ cmd_publish() {
     echo "Production serves preview build $served."
   fi
   echo "Preview data does not carry to production; production keeps its own data."
+  _print_sql_setting_up "$current" production
   echo "The new build reaches every edge within about ten seconds; a fetch in that window may still show the previous one."
   _print_urls production
   if [ "$open_after" = "1" ]; then
@@ -1704,15 +1725,18 @@ _status_fetch() {
 
 # When the vibe lookup shows the vibe exists with no build in <env>, say so and
 # how to make one, and succeed; otherwise print nothing and fail. <verb> is the
-# command that would reach the preview build with --preview.
+# command, which reaches the preview build by default and production with
+# --production.
 _no_build_error() {
   local env="$1" info="$2" verb="$3" field
   [ "$env" = "production" ] && field=productionBuildId || field=previewBuildId
   printf '%s' "$info" | jq -e --arg f "$field" '.success == true and ((.vibe[$f] // .[$f]) == null)' >/dev/null 2>&1 || return 1
   if [ "$env" = "production" ] && printf '%s' "$info" | jq -e '(.vibe.previewBuildId // .previewBuildId) == null' >/dev/null 2>&1; then
-    echo "Error: $USER_SLUG/$VIBE_SLUG has no build yet. Run: vibe preview, then vibe publish (or vibe preview, then add --preview to $verb the preview build)." >&2
+    echo "Error: $USER_SLUG/$VIBE_SLUG has no build yet. Run: vibe preview, then vibe publish." >&2
   elif [ "$env" = "production" ]; then
-    echo "Error: $USER_SLUG/$VIBE_SLUG has no production build yet. Run: vibe publish — or add --preview to $verb the preview build." >&2
+    echo "Error: $USER_SLUG/$VIBE_SLUG has no production build yet. Run: vibe publish — or drop --production to $verb the preview build." >&2
+  elif printf '%s' "$info" | jq -e '(.vibe.productionBuildId // .productionBuildId) != null' >/dev/null 2>&1; then
+    echo "Error: $USER_SLUG/$VIBE_SLUG has no preview build yet. Run: vibe preview — or add --production to $verb the production build." >&2
   else
     echo "Error: $USER_SLUG/$VIBE_SLUG has no preview build yet. Run: vibe preview" >&2
   fi
@@ -1721,18 +1745,19 @@ _no_build_error() {
 # Call one MCP tool on the live vibe as the owner (same token as deploy), so an
 # agent can prove the published vibe works without a browser sign-in.
 cmd_call() {
-  local tool="" args="{}" env="production"
+  local tool="" args="{}" env="preview"
   while [ $# -gt 0 ]; do
     case "$1" in
       --preview) env="preview"; shift ;;
-      -*) echo "Unknown flag: $1. Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--preview]" >&2; exit 1 ;;
+      --production) env="production"; shift ;;
+      -*) echo "Unknown flag: $1. Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--production]" >&2; exit 1 ;;
       *)
         if [ -z "$tool" ]; then tool="$1"; else args="$1"; fi
         shift ;;
     esac
   done
   if [ -z "$tool" ]; then
-    echo "Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--preview]" >&2
+    echo "Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--production]" >&2
     exit 1
   fi
   if ! echo "$args" | jq -e 'type == "object"' >/dev/null 2>&1; then
@@ -1803,11 +1828,12 @@ cmd_call() {
 # platform Bearer token as the management API, so this lets agents verify pages
 # and assets without weakening visibility or requiring a browser session.
 cmd_fetch() {
-  local path="" env="production" show_headers=0 method="GET" header
+  local path="" env="preview" show_headers=0 method="GET" header
   local -a request_args=(-sS)
   while [ $# -gt 0 ]; do
     case "$1" in
       --preview) env="preview" ;;
+      --production) env="production" ;;
       --headers|-i) show_headers=1 ;;
       --method)
         [ $# -ge 2 ] && [[ "$2" =~ ^[A-Za-z]+$ ]] || { echo "Error: --method requires an HTTP method." >&2; exit 1; }
@@ -1834,7 +1860,7 @@ cmd_fetch() {
       --)
         shift
         if [ $# -ne 1 ]; then
-          echo "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
+          echo "Usage: vibe fetch <path> [--production] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
           exit 1
         fi
         path="$1"
@@ -1843,7 +1869,7 @@ cmd_fetch() {
       -*) echo "Error: Unknown fetch option: $1" >&2; exit 1 ;;
       *)
         if [ -n "$path" ]; then
-          echo "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
+          echo "Usage: vibe fetch <path> [--production] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
           exit 1
         fi
         path="$1"
@@ -1852,7 +1878,7 @@ cmd_fetch() {
     shift
   done
   if [ -z "$path" ]; then
-    echo "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
+    echo "Usage: vibe fetch <path> [--production] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" >&2
     exit 1
   fi
   if [[ "$path" == *$'\n'* || "$path" == *$'\r'* ]]; then
@@ -2555,23 +2581,16 @@ cmd_login() {
 }
 
 cmd_logout() {
-  # Remove local credentials. Server-side revocation is best-effort: an API
-  # (Bearer) token cannot revoke itself — full revocation needs a web session
-  # cookie (DELETE /auth/api-token). We always clear the local creds.
+  # Remove local credentials. A Bearer token cannot revoke itself (revocation
+  # needs a signed-in browser session), so logout only clears the local file
+  # and points at Revoke all on the account page.
   if [ ! -f "$CREDS" ]; then
     echo "Already logged out — no credentials at $CREDS."
     return
   fi
-  local token
-  token=$(jq -r '.token // empty' "$CREDS" 2>/dev/null)
-  if [ -n "$token" ]; then
-    curl -s -K - -X DELETE "$API_BASE/auth/api-token" \
-      -H "Content-Type: application/json" \
-      <<<"header = \"Authorization: Bearer ${token}\"" >/dev/null 2>&1 || true
-  fi
   rm -f "$CREDS"
   echo "Logged out — local credentials removed ($CREDS)."
-  echo "To fully revoke the token server-side: DELETE /auth/api-token from a signed-in browser session."
+  echo "To revoke it everywhere: Revoke all at $WEB_BASE/account"
 }
 
 # Read a secret value into SECRET_VAL: one hidden line at a terminal, or stdin
@@ -2742,7 +2761,7 @@ cmd_r2() {
   case "$sub" in
     ""|help|--help|-h)
       cat <<'USAGE' >&2
-Usage: vibe files <subcommand> [args]   (alias: vibe r2)
+Usage: vibe files <subcommand> [args]
 
 Subcommands:
   upload <path> <key> [--content-type ct] [--ttl 300] [--preview]   (--key <key> also works)
@@ -2764,7 +2783,6 @@ Subcommands:
       Show file storage used across all your vibes, the plan limit and what is left.
 
 Notes:
-  - All keys are auto-namespaced to your vibe (vibes/<id>/<key>).
   - Uploading needs Pro or Pro+; listing, downloading and deleting work on any plan.
   - --preview selects the preview tree; the preview host serves the preview tree, the production host the production tree; upload to both when a page needs the file in both.
   - A stored file is served at
@@ -3132,7 +3150,7 @@ NODE
   if [ -f "$CREDS" ]; then
     plan=$( (_load_creds && _API_NO_RETRY=1 _plan_lookup "" --retry 0 --connect-timeout 3 --max-time 5 | jq -r '.plan') 2>/dev/null ) || plan=""
     if info=$( (_load_creds && _API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" --retry 0 --connect-timeout 3 --max-time 5) 2>/dev/null ); then
-      generation=$(printf '%s' "$info" | jq -r '.previewGeneration // .generation // "shim"') || generation="shim"
+      generation=$(printf '%s' "$info" | jq -r '.vibe.previewGeneration // "shim"') || generation="shim"
     fi
   fi
   export VIBE_DEV_DEPS="$deps_dir" VIBE_DEV_PLAN="${plan:-unknown}"
@@ -3194,19 +3212,19 @@ _print_command_help() {
     templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates served by the platform." ;;
     list) printf '%s\n' "Usage: vibe list" "List your vibes; * marks the current folder's vibe. No manifest needed." ;;
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
-    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation shim|props] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan and generation once (Free: no SQL or files). Defaults to the shim until migration; --generation props selects the adapter." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
+    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation shim|props] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan and generation once (Free: no SQL or files). Runs the same runtime as your hosted preview; --generation overrides it." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
     preview|deploy) printf '%s\n' "Usage: vibe preview [--prune|--no-prune]" "Mirror local source to preview and wait for its build." "Uploads are limited to 30 an hour per account and address, separate from the build allowance." ;;
     publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." "Preview data does not carry to production; production keeps its own data." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." "--plan shows your plan instead: monthly calls, vibes, preview builds and source uploads used. No .vibe-coded.json needed." ;;
     urls) printf '%s\n' "Usage: vibe urls" "Print preview and production app/MCP endpoints." ;;
-    fetch) printf '%s\n' "Usage: vibe fetch <path> [--preview] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" "Fetch a deployed route as the owner, including from a private vibe. GET by default; --header is repeatable. Authorization and Cookie never reach the worker. For a machine endpoint, send a dedicated secret in X-Webhook-Token and check it against env.SYNC_TOKEN in the worker; create it with vibe secrets create SYNC_TOKEN (Pro). Provider signature headers and X-Webhook-* are forwarded." "" "2xx and 3xx responses succeed. Redirects are not followed; 3xx prints the Location header when present." "--headers (-i) prints the status line and all response headers except cookies before the body." "The → owner/slug (env) line goes to stderr; stdout carries only the response." ;;
-    call) printf '%s\n' "Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--preview]" "Call one live MCP tool as the owner and print its text result." "The → owner/slug (env) line goes to stderr; stdout carries only the result." ;;
+    fetch) printf '%s\n' "Usage: vibe fetch <path> [--production] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" "Fetch a deployed route as the owner, including from a private vibe. Targets the preview build; --production targets production. GET by default; --header is repeatable. Authorization and Cookie never reach the worker. For a machine endpoint, send a dedicated secret in X-Webhook-Token and check it against env.SYNC_TOKEN in the worker; create it with vibe secrets create SYNC_TOKEN (Pro). Provider signature headers and X-Webhook-* are forwarded." "" "2xx and 3xx responses succeed. Redirects are not followed; 3xx prints the Location header when present." "--headers (-i) prints the status line and all response headers except cookies before the body." "The → owner/slug (env) line goes to stderr; stdout carries only the response." ;;
+    call) printf '%s\n' "Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--production]" "Call one live MCP tool as the owner and print its text result. Targets the preview build; --production targets production." "The → owner/slug (env) line goes to stderr; stdout carries only the result." ;;
     connect) printf '%s\n' "Usage: vibe connect [<owner>/<slug>] [--name N] [--print|--revoke]" "Register or revoke a scoped MCP connection in Claude Code: this vibe, or <owner>/<slug> for a vibe shared with you." "--print creates a real connection token and prints its command. Revoke it with: vibe connect [<owner>/<slug>] --revoke" ;;
     logs) printf '%s\n' "Usage: vibe logs [build-id]" "Show build logs only; defaults to the last build started from this machine; vibe logs <id> for another. Worker console output is not visible anywhere." ;;
     settings) printf '%s\n' "Usage: vibe settings [--title T] [--visibility private|unlisted|public] [--interaction public|public_read|authenticated|invite_only]" "View settings or update the title; exposure changes are web-only and exit non-zero." ;;
     access) printf '%s\n' "Usage: vibe access list|grant|update|revoke|revoke-all [args]" "List access in the CLI; owner-only mutations are completed on the website." ;;
     secrets) printf '%s\n' "Usage: vibe secrets list|create|update|delete|audit [NAME]" "Manage write-only worker secrets (Pro). Authorization and Cookie never reach the worker. For a machine endpoint, create a dedicated secret with vibe secrets create SYNC_TOKEN, send it in X-Webhook-Token and check it against env.SYNC_TOKEN in the worker. Provider signature headers and X-Webhook-* are forwarded. See references/platform-patterns.md for the webhook inbox recipe, including the website step for anonymous access." ;;
-    r2) printf '%s\n' "Usage: vibe files upload|download|url|ls|rm|usage [args]   (alias: vibe r2)" "Manage the current vibe's stored files. Uploading needs Pro; on Free you can still list, download and delete kept files." \
+    r2) printf '%s\n' "Usage: vibe files upload|download|url|ls|rm|usage [args]" "Manage the current vibe's stored files. Uploading needs Pro; on Free you can still list, download and delete kept files." \
           "  upload <path> --key <key>     download <key> --to <path>     url <key>" \
           "  ls [prefix]                   rm <key>                       usage" \
           "--preview selects the preview tree; the preview host serves the preview tree, the production host the production tree; upload to both when a page needs the file in both." \
@@ -3319,17 +3337,17 @@ case "${1:-help}" in
     echo "  dev [--port N] [--reset]     Run the worker locally (your plan's storage; reloads on save)"
     echo "  dev seed <file.sql>          Apply SQL to the local database"
     echo "  preview [--prune|--no-prune] Upload source, prune stale files, and build (alias: deploy)"
-    echo "  publish [--open]             Promote preview to production (--open: app or sharing page in the browser)"
+    echo "  publish [--open] [--force]   Promote preview to production (--open: app or sharing page in the browser)"
     echo "  status [--plan]              Show vibe info + recent builds (--plan: plan, calls, vibes, build allowance)"
     echo "  urls                         Show all endpoints (app, MCP)"
-    echo "  fetch <path> [--preview] [-i] [--method M] [--header 'K: V'] [--data D]  Fetch a live route as the owner"
-    echo "  call <tool> [json] [--preview]  Call one MCP tool on the live vibe as you"
+    echo "  fetch <path> [--production] [-i] [--method M] [--header 'K: V'] [--data D]  Fetch a preview route as the owner"
+    echo "  call <tool> [json] [--production]  Call one MCP tool on the preview build as you"
     echo "  connect [<owner>/<slug>] [--name N] [--print|--revoke]  Connect Claude Code to a vibe's tools (yours or shared)"
-    echo "  logs [build-id]              Show build logs (latest if omitted)"
+    echo "  logs [build-id]              Show build logs (the last build started from this machine if omitted)"
     echo "  settings [--title T] ...     View or update vibe settings"
     echo "  access list                  List collaborators (changes on the website)"
     echo "  secrets list|create|update|delete|audit [NAME]  Manage secrets (Pro)"
-    echo "  files upload|download|ls|... Manage stored files (upload: Pro; alias: r2)"
+    echo "  files upload|download|ls|... Manage stored files (upload: Pro)"
     echo "  delete                       Link to delete on the website"
     echo "  --version                    Print the CLI version"
     echo ""
