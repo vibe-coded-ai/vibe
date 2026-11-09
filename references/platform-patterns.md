@@ -178,9 +178,10 @@ A 403 SignatureDoesNotMatch on the PUT means the bytes sent differ from contentL
 The browser's PUT to the signed URL is CORS-allowed from the vibe's own origin (preflight answers 204); no CORS setup is needed.
 
 **Downloading outside the page** (a script, another server): the worker
-mints `createDownloadUrl(key)`; the URL lasts at most 120 seconds, so mint one
-per request and never store or share it. A page does not need this: use
-`/files/<key>`.
+mints `createDownloadUrl(key)`, a `/files/<key>?exp=…&sig=…` link on the vibe's
+own host that lasts at most 120 seconds. Until then anyone holding it can open
+that one file with GET or HEAD, whatever the vibe's access settings; each open
+counts as a file read. A page does not need this: use `/files/<key>`.
 
 Through MCP, expose file operations as worker tools and
 invoke them with call_tool. For an operation the worker does not expose, add an
@@ -190,6 +191,8 @@ invoke them with call_tool. For an operation the worker does not expose, add an
 
 From a terminal with the CLI installed and signed in, use `vibe files upload|download|ls|rm|url` (MCP: expose a worker tool and invoke it with call_tool).
 These default to production's files; add `--preview` for the preview tree.
+`vibe files url <key>` prints the file's `/files/<key>` link on the vibe and who can open it.
+`vibe files url <key> --expires 7d` (30m, 12h, at most 7d) prints a link anyone can open until it expires, even on a private vibe; it opens only that file. `vibe dev` refuses `createDownloadUrl` and `createUploadUrl`; test them on preview.
 The preview host serves the preview tree and the production host the production tree; upload to both when a page needs the file in both.
 `vibe files usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; account `usage` reports key-value, SQL and file storage.
 Signed uploads count at once; files the worker writes with `put()` count within the hour.

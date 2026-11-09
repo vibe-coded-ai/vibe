@@ -241,8 +241,6 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     '  emit \'{"success":true,"url":"https://alice--demo.vibe-coded.ai/mcp"}\' 200',
     'elif [[ "$method" = DELETE && "$url" == *"/mcp-tokens/"* ]]; then',
     '  printf \'%s\\n\' \'{"success":true,"revoked":true}\'',
-    'elif [[ "$method" = POST && "$url" == *"/r2/download-url" ]]; then',
-    '  printf \'%s\\n\' \'{"success":true,"url":"https://signed.invalid/object","expiresAt":1770000120}\'',
     'elif [[ "$method" = GET && "$url" == https://*"tester--demo.vibe-coded.ai"* ]]; then',
     '  code=200; body="<h1>private owner view</h1>"',
     '  [ "$VIBE_TEST_SCENARIO" = fetch401 ] && { code=401; body="{\\"error\\":\\"Authentication required\\"}"; }',
@@ -1884,13 +1882,14 @@ test('vibe call supplies its bearer token through curl config stdin, not argv', 
   assert.doesNotMatch(callBody, /-H "Authorization: Bearer \$TOKEN"/);
 });
 
-test('vibe r2 url warns about the 120s cap and prints the actual expiry', () => {
+test('vibe r2 url prints the file link on the vibe host and ignores --ttl', () => {
   const result = runCli('r2', ['url', 'docs/manual.pdf', '--ttl', '3600']);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stderr, /TTL is capped at 120 seconds/);
-  assert.match(result.stdout, /https:\/\/signed\.invalid\/object/);
-  assert.match(result.stdout, /Expires at: 2026-02-02T02:42:00Z \(in -?\d+ seconds\)/);
-  assert.match(result.calls, /"ttl": 3600/);
+  assert.match(result.stderr, /--ttl is ignored/);
+  assert.equal(result.stdout.split('\n')[0], 'https://tester--demo.vibe-coded.ai/files/docs/manual.pdf');
+  assert.match(result.stdout, /Anyone with this link can open it \(the vibe is public\)/);
+  assert.doesNotMatch(result.stdout, /signed\.invalid|Expires at/);
+  assert.doesNotMatch(result.calls, /download-url/);
 });
 
 test('vibe --version prints the skill version', () => {

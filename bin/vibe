@@ -485,6 +485,26 @@ _print_private_access() {
   fi
 }
 
+# The tree a /files link names answers 404 until that host has a build.
+_files_unbuilt_hint() {
+  if [ "$1" = "production" ]; then echo "The production host answers 404 until the vibe is published (vibe publish)."
+  else echo "The preview host answers 404 until it has a build (vibe preview)."; fi
+}
+
+# Seconds in a duration written as N, Ns, Nm, Nh or Nd, from 1s to 7d
+# (the platform's file-link ceiling); fails on anything else.
+_duration_seconds() {
+  [[ "$1" =~ ^([0-9]{1,7})([smhd]?)$ ]] || return 1
+  local n=$((10#${BASH_REMATCH[1]}))
+  case "${BASH_REMATCH[2]}" in
+    m) n=$((n * 60)) ;;
+    h) n=$((n * 3600)) ;;
+    d) n=$((n * 86400)) ;;
+  esac
+  [ "$n" -ge 1 ] && [ "$n" -le 604800 ] || return 1
+  echo "$n"
+}
+
 # Print a vibe's real visibility + interaction policy (never fatal: init has
 # already created the vibe by the time this runs).
 _print_actual_visibility() {
@@ -2849,8 +2869,10 @@ Subcommands:
   download <key> [--to <local-path>] [--ttl 120] [--preview]
       Download a stored file to a local path (defaults to basename).
 
-  url <key> [--ttl 120] [--preview]
-      Print a signed download URL and its actual expiry (120s maximum).
+  url <key> [--expires <duration>] [--preview]
+      Print the file's link on the vibe (/files/<key>) and who can open it.
+      With --expires (30m, 12h, up to 7d), print a link that anyone can open
+      until it expires, whatever the vibe's access settings.
 
   ls [prefix] [--preview]
       List your vibe's stored files.
@@ -2866,8 +2888,7 @@ Notes:
   - --preview selects the preview tree; the preview host serves the preview tree, the production host the production tree; upload to both when a page needs the file in both.
   - A stored file is served at
     /files/<key> on the vibe, under its access settings; use that address in
-    a page. download and url are for fetching a file outside a page.
-  - Download URLs expire within 120s. Mint per request; never persist or share them.
+    a page; url prints that link, and url --expires a time-limited one to share.
 USAGE
       [ -n "$sub" ] || exit 1
       return 0
@@ -2969,8 +2990,10 @@ USAGE
       local http_code; http_code=$(curl -s -o /tmp/vibe-r2-put.log -w "%{http_code}" \
         -X PUT -H "Content-Type: $content_type" --data-binary "@$local_path" "$url")
       if [ "$http_code" != "200" ] && [ "$http_code" != "204" ]; then
-        echo "Upload failed: HTTP $http_code" >&2
-        cat /tmp/vibe-r2-put.log >&2
+        # Storage error bodies echo the signed request (storage host, account,
+        # bucket); only the error code is shown.
+        local put_code; put_code=$(grep -o '<Code>[^<]*</Code>' /tmp/vibe-r2-put.log 2>/dev/null | sed 's/<[^>]*>//g' | head -1)
+        echo "Upload failed: HTTP $http_code${put_code:+ ($put_code)}" >&2
         rm -f /tmp/vibe-r2-put.log
         exit 1
       fi
@@ -2993,45 +3016,91 @@ USAGE
         esac
       done
       [ -z "$to" ] && to=$(basename "$key")
-      if [ -n "$ttl" ] && [ "$ttl" -gt 120 ] 2>/dev/null; then
-        echo "Warning: download URL TTL is capped at 120 seconds (requested ${ttl}s)." >&2
-      fi
       local body; body=$(jq -n --arg k "$key" --arg environment "$environment" --argjson ttl "${ttl:-120}" '{key: $k, ttl: $ttl, environment: $environment}')
       local mint; mint=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/download-url" -d "$body")
       _check_success "$mint" "File download"
+      # The link is a time-limited /files/<key> link on the vibe host; it is
+      # fetched here and never printed.
       local url; url=$(echo "$mint" | jq -r '.url')
       local http_code; http_code=$(curl -s -o "$to" -w "%{http_code}" "$url")
       if [ "$http_code" != "200" ]; then
-        echo "Download failed: HTTP $http_code" >&2
+        if [ "$http_code" = "404" ]; then
+          if [ "$environment" = "production" ]; then echo "Download failed: HTTP 404. The production host serves files once the vibe is published (vibe publish)." >&2
+          else echo "Download failed: HTTP 404. The preview host serves files once it has a build (vibe preview)." >&2; fi
+        else
+          echo "Download failed: HTTP $http_code" >&2
+        fi
         exit 1
       fi
       echo "Downloaded $key → $to"
       ;;
 
     url)
-      # vibe r2 url <r2-key> [--ttl <secs>]   — print signed download URL only
-      local key="${1:-}" ttl=""
-      [ -z "$key" ] && { echo "Usage: vibe files url <key> [--ttl <secs>]" >&2; exit 1; }
+      # vibe files url <key> [--expires <duration>] [--preview] — the file's address on the vibe's own host
+      local key="${1:-}" expires="" has_expires=""
+      [ -z "$key" ] && { echo "Usage: vibe files url <key> [--expires <duration>] [--preview]" >&2; exit 1; }
       shift
       while [ $# -gt 0 ]; do
         case "$1" in
           --ttl)
             [ $# -ge 2 ] || { echo "Error: --ttl requires a value" >&2; exit 1; }
-            ttl="$2"; shift 2 ;;
+            echo "Note: --ttl is ignored; for a link that anyone can open until it expires, use --expires <duration> (for example 1h or 7d)." >&2
+            shift 2 ;;
+          --expires)
+            [ $# -ge 2 ] || { echo "Error: --expires requires a duration (for example 30m, 12h or 7d)" >&2; exit 1; }
+            expires="$2"; has_expires=1; shift 2 ;;
           *) echo "Unknown flag: $1" >&2; exit 1 ;;
         esac
       done
-      if [ -n "$ttl" ] && [ "$ttl" -gt 120 ] 2>/dev/null; then
-        echo "Warning: download URL TTL is capped at 120 seconds (requested ${ttl}s)." >&2
+      # Stored keys have no empty, "." or ".." segments (upload normalizes them
+      # away). A client resolves dot segments in a URL before sending it, so a
+      # link spelled with them would name a different object. Percent signs
+      # are encoded as %25; the server decodes them as upload did.
+      if [[ "/$key/" == *//* || "/$key/" == */./* || "/$key/" == */../* ]]; then
+        echo "Error: give the key as vibe files ls prints it (no empty, '.' or '..' segments)." >&2
+        exit 1
       fi
-      local body; body=$(jq -n --arg k "$key" --arg environment "$environment" --argjson ttl "${ttl:-120}" '{key: $k, ttl: $ttl, environment: $environment}')
-      local mint; mint=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/download-url" -d "$body")
-      _check_success "$mint" "File URL"
-      echo "$mint" | jq -r '.url'
-      local expires_at expires_iso
-      expires_at=$(echo "$mint" | jq -r '.expiresAt')
-      expires_iso=$(date -u -r "$expires_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d "@$expires_at" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || expires_iso=""
-      echo "Expires at: ${expires_iso:-$expires_at} (in $((expires_at - $(date +%s))) seconds)"
+      if [ -n "$has_expires" ]; then
+        # A time-limited link on the vibe host: it opens this one file for
+        # anyone holding it until it expires, whatever the access settings.
+        local seconds
+        seconds=$(_duration_seconds "$expires") || { echo "Error: --expires takes a duration from 1s to 7d, such as 30m, 12h or 7d (got '$expires')." >&2; exit 1; }
+        local body; body=$(jq -n --arg k "$key" --arg environment "$environment" --argjson ttl "$seconds" '{key: $k, ttl: $ttl, environment: $environment}')
+        local mint; mint=$(_api POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/r2/download-url" -d "$body")
+        _check_success "$mint" "File link"
+        local link expires_at expires_iso
+        link=$(echo "$mint" | jq -r '.url')
+        expires_at=$(echo "$mint" | jq -r '.expiresAt')
+        expires_iso=$(date -u -r "$expires_at" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || date -u -d "@$expires_at" '+%Y-%m-%d %H:%M UTC' 2>/dev/null) || expires_iso="$expires_at"
+        echo "$link"
+        echo "Anyone with this link can open this one file until $expires_iso, whatever the vibe's access settings; after that it answers 403. Deleting the file or the vibe ends it sooner. Each open counts as a file read on the vibe."
+        local built
+        built=$(_quiet_vibe_lookup | jq -r --arg e "$environment" \
+          '(.vibe // .) | select(.visibility != null) | if (if $e == "preview" then .previewBuildId else .productionBuildId end) != null then "built" else "unbuilt" end' 2>/dev/null) || true
+        [ "$built" = "unbuilt" ] && _files_unbuilt_hint "$environment"
+        return 0
+      fi
+      local host="${USER_SLUG}--${VIBE_SLUG}.vibe-coded.ai"
+      [ "$environment" = "preview" ] && host="p--${host}"
+      local link; link="https://${host}/files/$(jq -rn --arg k "$key" '$k | split("/") | map(@uri) | join("/")')"
+      echo "$link"
+      # /files/<key> is served under the vibe's page gates: private visibility
+      # and the invite_only policy admit only the owner and invited accounts.
+      local visibility policy built
+      IFS='|' read -r visibility policy built < <(_quiet_vibe_lookup | jq -r --arg e "$environment" \
+        '(.vibe // .) | [.visibility // "", .interactionPolicy // "", (if (if $e == "preview" then .previewBuildId else .productionBuildId end) != null then "built" else "" end)] | join("|")' 2>/dev/null) || true
+      local manage_url="$WEB_BASE/account?vibe=$VIBE_SLUG&panel=settings"
+      if [ "$visibility" = "private" ]; then
+        _print_private_access "$link" "$manage_url" "$built"
+      elif [ "$policy" = "invite_only" ]; then
+        echo "This vibe is invite-only: you and anyone you invite (signed in) can open $link; anonymous requests get 401. Change who can open it at $manage_url."
+      elif [ -n "$visibility" ]; then
+        echo "Anyone with this link can open it (the vibe is $visibility)."
+        [ -z "$built" ] && _files_unbuilt_hint "$environment"
+      else
+        echo "It opens for whoever can open the vibe (its access settings were not read just now; vibe status shows them)."
+      fi
+      echo "To save a copy locally: vibe files download $(printf '%q' "$key")${environment_query:+ --preview}"
       ;;
 
     ls|list)
@@ -3324,7 +3393,7 @@ _print_command_help() {
       printf '%s\n' "Usage: vibe files download <key> [--to <local-path>] [--ttl 120] [--preview]" "Download a stored file to a local file. A page shows a stored file from /files/<key> on the vibe instead."
       return ;;
     r2:url)
-      printf '%s\n' "Usage: vibe files url <key> [--ttl 120] [--preview]" "Print a short-lived signed download URL, for fetching a file outside a page. A page shows a stored file from /files/<key> on the vibe instead."
+      printf '%s\n' "Usage: vibe files url <key> [--expires <duration>] [--preview]" "Print the file's link on the vibe (/files/<key>), served under the vibe's access settings, and who can open it. With --expires (30m, 12h, up to 7d), print a link that anyone can open until it expires."
       return ;;
     r2:ls|r2:list)
       printf '%s\n' "Usage: vibe files ls [--prefix <p>] [--limit <n>] [--preview]" "List the current vibe's stored files."

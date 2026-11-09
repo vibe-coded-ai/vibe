@@ -1246,7 +1246,8 @@ export function createPrefixedR2(bucket, vibeId, env) {
     },
 
     /**
-     * Mint a presigned GET URL for a direct download from R2.
+     * Mint a time-limited `/files/<key>` link on the vibe's own host that
+     * anyone holding it can open with GET or HEAD until it expires.
      *
      * For fetching a file outside a page (a script, another server). A page
      * shows a stored file from `/files/<key>` on the vibe's own origin and
@@ -1937,7 +1938,8 @@ export async function _reportD1Usage(env, vibeId, sizeAfter) {
 
 /**
  * Call the platform's /api/internal/r2-sign-url endpoint (per-vibe bearer auth)
- * and return the resulting presigned R2 URL.
+ * and return the URL it mints: a presigned R2 PUT for an upload, a
+ * time-limited `/files/<key>` link on the vibe host for a download.
  *
  * @param {object} env - Worker env (must have PLATFORM_VIBE_TOKEN)
  * @param {object} body - { vibeId, environment, key, mode, ttl, maxSize?, contentLength?, contentType? }
