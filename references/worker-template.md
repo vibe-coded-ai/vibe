@@ -62,7 +62,7 @@ HTTP request to `/api/<name>` reaches the worker unchecked.
 
 - One root file, `./worker.js` or `./worker.ts`. Local modules and npm packages
   that run on Cloudflare Workers are fine; Node-only modules (`fs`,
-  `child_process`, `net`) are not.
+  `child_process`, `net`, `module`) are not.
 - Tool functions are snake_case `async function`s with `env` as the last
   parameter, and every tool has an entry in `apiFunctions`.
 - Return `{ success: true, data }` or `{ success: false, error }`.
@@ -85,10 +85,8 @@ async fetch(request, env, ctx) {
 }
 ```
 
-Background storage is booked against the same request's allowance. After the
-response, the shim drains registered work for up to 20 seconds, then closes
-storage admission; it can close earlier when the work settles. Further storage
-operations in that request are refused once admission closes, or if reporting fails.
+Work registered with `ctx.waitUntil` before returning may run until 140 seconds
+after the request opened; its storage calls count against the same per-request budget.
 
 Worker console output is not visible anywhere. `vibe logs` (MCP: `logs`) shows
 build logs only.

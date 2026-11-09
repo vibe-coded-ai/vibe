@@ -2431,11 +2431,11 @@ _login_browser_start() {
   local url code
   url=$(echo "$resp" | jq -r '.verificationUriComplete')
   code=$(echo "$resp" | jq -r '.userCode')
-  echo "To sign in, open this link and approve the code:"
+  echo "To sign in, open this link, type the code below from your terminal, then click Approve:"
   echo ""
   echo "  $url"
   echo ""
-  echo "  Code: $code   (the page must show the same code)"
+  echo "  Code: $code   (type this code in the browser)"
   echo ""
 }
 
@@ -3125,17 +3125,21 @@ NODE
   fi
 
   # Storage is bound as the account's plan deploys it. Signed out, offline or
-  # on a failed read the plan is unknown and every binding stays. --retry 0
+  # on a failed read the plan is unknown (props refuses; the legacy shim keeps
+  # its offline bindings). --retry 0
   # keeps a ~/.curlrc retry setting from stretching the 5 s cap.
-  local plan=""
+  local plan="" generation="shim" info
   if [ -f "$CREDS" ]; then
     plan=$( (_load_creds && _API_NO_RETRY=1 _plan_lookup "" --retry 0 --connect-timeout 3 --max-time 5 | jq -r '.plan') 2>/dev/null ) || plan=""
+    if info=$( (_load_creds && _API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" --retry 0 --connect-timeout 3 --max-time 5) 2>/dev/null ); then
+      generation=$(printf '%s' "$info" | jq -r '.previewGeneration // .generation // "shim"') || generation="shim"
+    fi
   fi
   export VIBE_DEV_DEPS="$deps_dir" VIBE_DEV_PLAN="${plan:-unknown}"
 
   # The process keeps "vibe dev <args>" as its name, so pkill -f "vibe dev"
   # and pkill -f "vibe dev --port N" both find it.
-  exec -a "vibe dev${*:+ $*}" node "$skill_dir/runtime/dev-server.mjs" "$@"
+  exec -a "vibe dev${*:+ $*}" node "$skill_dir/runtime/dev-server.mjs" --generation "$generation" "$@"
 }
 
 _print_command_help() {
@@ -3190,7 +3194,7 @@ _print_command_help() {
     templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates served by the platform." ;;
     list) printf '%s\n' "Usage: vibe list" "List your vibes; * marks the current folder's vibe. No manifest needed." ;;
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
-    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan once and binds storage as a deploy does (Free: no SQL or files)." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
+    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation shim|props] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan and generation once (Free: no SQL or files). Defaults to the shim until migration; --generation props selects the adapter." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
     preview|deploy) printf '%s\n' "Usage: vibe preview [--prune|--no-prune]" "Mirror local source to preview and wait for its build." "Uploads are limited to 30 an hour per account and address, separate from the build allowance." ;;
     publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." "Preview data does not carry to production; production keeps its own data." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." "--plan shows your plan instead: monthly calls, vibes, preview builds and source uploads used. No .vibe-coded.json needed." ;;

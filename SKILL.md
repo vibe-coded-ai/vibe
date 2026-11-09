@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.52
+version: 4.7.56
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -116,7 +116,7 @@ or resend it from https://vibe-coded.ai/account (Resend verification email).
    that don't match a static file go to the worker with their method (except the
    paths of its source files and root project files such as `package.json` or
    `README.md`), so keep the app's existing routes and methods. npm packages that
-   run on Cloudflare Workers are fine. Node-only code is not: `fs`, `child_process`, native
+   run in a worker are fine. Node-only code is not: `fs`, `child_process`, `node:module`, native
    addons, Express and other servers. Rewrite handlers against `Request`/`Response`.
    There is no filesystem and no long-running process.
 4. **Swap the storage:** files or a local database become `env.VIBE_STORAGE`,
@@ -191,7 +191,8 @@ settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug
 | `delete` | Prints the web link to delete the vibe |
 
 **Login:** run `vibe login --start`; it prints a link and a code. Give both to the
-user, ask them to approve in the browser, then run `vibe login --finish`. It works
+user, ask them to type the terminal code in the browser and click Approve, then
+run `vibe login --finish`. It works
 for Google and GitHub accounts too. A person at a terminal can just run
 `vibe login`.
 
@@ -206,6 +207,10 @@ retrying.
 don't work, and `/mcp` supports only `initialize`,
 `tools/list` and `tools/call`.
 Check those on preview. Local secrets go in `.dev.vars`.
+`vibe dev` runs the generation your vibe is on; `--generation props`
+runs the adapter over local KV/R2/D1 with the plan's per-request ceiling and outbound
+allowance, state in `.vibe-coded/dev` (`--reset` clears it). Local behaviour is a
+convenience, not authority: verify access, entitlement and error shape on hosted preview.
 
 ## 8. Writing worker code
 
@@ -228,10 +233,10 @@ Details and examples (including running SQL against a live vibe):
 - **KV `list()` lags new writes by up to a minute.** Don't build a list tool on
   `list()` alone; use the pattern in `references/platform-patterns.md` (the
   templates do), or use SQL.
-- Workers built or redeployed with shim v13 share 10,000 units per request
-  across KV and R2 calls: reads cost 1;
-  writes, lists and deletes cost 10 (R2 batch deletes count per key). Paginate
-  large jobs across requests.
+- KV, SQL and file calls share a per-request budget of 500 units on Free and 10,000 on Pro
+  and Pro+: a read costs 1, a write, list or delete 10 per key. Paginate large jobs
+  across requests. A handler must send its first byte within 30 seconds or the
+  platform answers 504.
 - Files and images go in R2, not base64 in KV.
 - Vue: use `createWebHashHistory()`, and keep `vite` in `devDependencies`.
 - Use one root worker: `worker.ts` or `worker.js`, not both, and not `src/worker.*`.

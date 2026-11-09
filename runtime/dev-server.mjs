@@ -3,10 +3,9 @@
  * vibe dev — local dev server for fullstack vibes.
  *
  * Runs the user's worker on the REAL Cloudflare runtime (workerd, via Miniflare)
- * with local D1 + KV + R2, composed behind the verbatim platform shim. This is
- * the same module layout the build-runner deploys (main_module = _platform-shim.js
- * importing ./worker.js), so local behaviour matches production by construction —
- * no hand-rolled storage emulation, no "works locally, breaks on deploy" drift.
+ * with local D1 + KV + R2, behind the platform shim or the client adapter and
+ * an in-process VibeStorage host. Local behaviour is a development convenience;
+ * hosted preview remains the authority for RPC errors and enforcement.
  *
  * Invoked by `bin/vibe dev`. Not meant to be run directly by users.
  *
@@ -32,6 +31,7 @@ import { isForwardableHeader } from './dispatch-header-policy.mjs';
 import { extractToolsWithWarnings } from './mcp-tools.mjs';
 import { _r2GetKey } from './platform-shim.js';
 import { getContentType } from './static-content-types.mjs';
+import { DISPATCH_COMPUTE_LIMITS } from './outbound-worker.js';
 
 export { extractTools, extractToolsWithWarnings } from './mcp-tools.mjs';
 
@@ -75,11 +75,12 @@ async function loadDeps() {
 
 // ── Args / manifest ───────────────────────────────────────────────────────────
 function parseArgs(argv) {
-  const opts = { port: 8787, reset: false, seed: null };
+  const opts = { port: 8787, reset: false, seed: null, generation: 'shim' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--port') opts.port = parseInt(argv[++i], 10);
     else if (a === '--reset') opts.reset = true;
+    else if (a === '--generation') opts.generation = argv[++i];
     else if (a === 'seed') {
       opts.seed = argv[++i];
       if (!opts.seed) {
@@ -88,6 +89,7 @@ function parseArgs(argv) {
       }
     }
   }
+  if (!['shim', 'props'].includes(opts.generation)) throw new Error('--generation must be shim or props');
   if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
     console.error('Error: --port must be an integer 1-65535');
     process.exit(1);
@@ -107,6 +109,7 @@ function loadManifest() {
     userSlug: m.userSlug,
     type: m.type || 'fullstack',
     storage: m.storage || 'kv',
+    kvAlias: m.kvAlias === true,
     // VIBE_ID is the R2 isolation boundary; the shim demands a positive integer.
     // Local has no real id, so default to 1 → keys land under vibes/1/.
     vibeId: String(m.vibeId || '1'),
@@ -192,14 +195,18 @@ export const DEV_PLATFORM_REFUSAL = {
   error: 'Signed file URLs (createUploadUrl, createDownloadUrl) are not available in vibe dev; env.VIBE_R2 put, get, list and delete work locally. Test signed URLs on the preview: vibe preview.',
 };
 
-export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken, port, plan = 'unknown') {
+export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken, port, plan = 'unknown', generation = 'shim') {
+  if (!['shim', 'props'].includes(generation)) throw new Error('--generation must be shim or props');
   // A Free deploy has no VIBE_D1 or VIBE_R2 binding (cf-api.ts). Without
   // VIBE_D1 the shim installs the binding that throws the plan error.
+  // Legacy offline development keeps its bindings on an unknown plan so existing
+  // projects still work. This local-only fail-open is not an entitlement verdict;
+  // props storage requires a known plan below.
   const sqlAndFiles = plan === 'free' ? {} : {
     d1Databases: { VIBE_D1: 'VIBE_D1' },
     r2Buckets: { VIBE_R2: 'VIBE_R2' },
   };
-  return {
+  const options = {
     // Explicit module graph (shim entry imports ./worker.js) — avoids Miniflare's
     // acorn-based auto-collection, which mis-parses the bundled worker.
     modulesRoot: devDir,
@@ -230,6 +237,44 @@ export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken, port,
       PLATFORM_API_URL: `http://127.0.0.1:${port}${DEV_PLATFORM_PREFIX}`,
     },
   };
+  if (generation === 'props') {
+    if (!['free', 'byov', 'pro'].includes(plan)) throw new Error('Local props storage requires a known account plan; sign in and retry vibe dev');
+    options.modules = ['_client-adapter.js', 'client-adapter.js', 'local-storage-host.mjs', 'local-outbound.mjs', 'dev-storage.js', 'sql-statements.mjs', 'worker.js']
+      .map(name => ({ type: 'ESModule', path: join(devDir, name) }));
+    options.compatibilityDate = '2026-04-21';
+    options.d1Databases = { ...sqlAndFiles.d1Databases, PLATFORM_DB: 'LOCAL_PLATFORM_DB' };
+    options.durableObjects = {
+      VIBE_STORAGE_DO: { className: 'VibeStorageDO', useSQLite: true },
+      BUDGET_DO: { className: 'AccountBudgetDO', useSQLite: true },
+    };
+    options.durableObjectsPersist = join(devDir, 'do');
+    options.bindings = { AUTHOR_ENV: secrets, LOCAL_CONFIG: { ...manifest, plan } };
+    options.name = 'vibe';
+    options.outboundService = 'vibe-outbound';
+    const { host, port: mfPort, kvPersist, d1Persist, r2Persist, durableObjectsPersist } = options;
+    return { host, port: mfPort, kvPersist, d1Persist, r2Persist, durableObjectsPersist, workers: [options, {
+      name: 'vibe-outbound', modulesRoot: devDir,
+      modules: ['local-outbound-service.mjs', 'outbound-worker.js'].map(name => ({ type: 'ESModule', path: join(devDir, name) })),
+      compatibilityDate: options.compatibilityDate,
+      bindings: { vibeId: Number(manifest.vibeId), plan,
+        allowance: DISPATCH_COMPUTE_LIMITS[plan].subRequests - 1, generation: 'props' },
+    }] };
+  }
+  return options;
+}
+
+export function stageRuntime(devDir, generation = 'shim', manifest = {}) {
+  if (generation === 'shim') copyFileSync(VENDORED_SHIM, join(devDir, '_platform-shim.js'));
+  else {
+    for (const name of ['client-adapter.js', 'local-storage-host.mjs', 'local-outbound.mjs', 'local-outbound-service.mjs', 'outbound-worker.js', 'dev-storage.js', 'sql-statements.mjs']) {
+      copyFileSync(join(SKILL_DIR, 'runtime', name), join(devDir, name));
+    }
+    // Only the adapter imports worker.js, dynamically after installing fetch.
+    const adapterPath = join(devDir, 'client-adapter.js');
+    writeFileSync(adapterPath, readFileSync(adapterPath, 'utf8').replace('kvAlias:!1', `kvAlias:${manifest.kvAlias === true}`));
+    writeFileSync(join(devDir, '_client-adapter.js'),
+      "import { withLocalStorage } from './local-storage-host.mjs';\nimport adapter from './client-adapter.js';\nexport { VibeStorageDO, AccountBudgetDO } from './local-storage-host.mjs';\nexport default withLocalStorage(adapter);\n");
+  }
 }
 
 // ── node http <-> workerd bridge ──────────────────────────────────────────────
@@ -386,8 +431,8 @@ async function serveR2File(req, pathname, res, mf, manifest) {
   let fullKey;
   try {
     if (!key || !/^[1-9]\d*$/.test(manifest.vibeId)) throw new Error('Invalid key');
-    // The local shim has no VIBE_ENV binding, so its R2 writes use vibes/<id>/.
-    fullKey = _r2GetKey(`vibes/${manifest.vibeId}/`, key);
+    // The legacy shim has no VIBE_ENV; props storage uses the preview tree.
+    fullKey = _r2GetKey(`${manifest.generation === 'props' ? 'vibes-preview' : 'vibes'}/${manifest.vibeId}/`, key);
   } catch {
     refuse(404, 'File not found');
     return;
@@ -468,6 +513,9 @@ export function needsViteBuild(dir) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const manifest = loadManifest();
+  manifest.generation = opts.generation;
+  // Local props dispatch cannot infer entitlement from an unavailable plan.
+  if (opts.generation === 'props' && PLAN === 'unknown') throw new Error('Local props storage requires a known account plan; sign in and retry vibe dev');
   if (opts.seed && PLAN === 'free') {
     console.error('Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use KV storage".');
     process.exit(1);
@@ -494,8 +542,7 @@ async function main() {
 
   const { Miniflare, chokidar } = await loadDeps();
 
-  // Compose the deployed module layout: vendored shim + bundled worker, co-located.
-  copyFileSync(VENDORED_SHIM, join(devDir, '_platform-shim.js'));
+  stageRuntime(devDir, opts.generation, manifest);
   let extraction = extractToolsWithWarnings(readFileSync(workerFile, 'utf8'));
   let tools = extraction.tools;
   printDroppedTools(extraction.warnings);
@@ -504,7 +551,7 @@ async function main() {
 
   const secrets = loadDevVars();
   const vibeAccessToken = randomBytes(32).toString('hex');
-  const mf = new Miniflare(buildMfOptions(devDir, manifest, secrets, vibeAccessToken, opts.port, PLAN));
+  const mf = new Miniflare(buildMfOptions(devDir, manifest, secrets, vibeAccessToken, opts.port, PLAN, opts.generation));
 
   // Forward a request to the worker via Miniflare.
   const dispatch = async (method, url, headers, body, internal) => {
@@ -625,7 +672,7 @@ async function main() {
       extraction = extractToolsWithWarnings(readFileSync(workerFile, 'utf8'));
       tools = extraction.tools;
       printDroppedTools(extraction.warnings);
-      await mf.setOptions(buildMfOptions(devDir, manifest, loadDevVars(), vibeAccessToken, opts.port, PLAN));
+      await mf.setOptions(buildMfOptions(devDir, manifest, loadDevVars(), vibeAccessToken, opts.port, PLAN, opts.generation));
       console.log(`↻ reloaded (${new Date().toLocaleTimeString()})`);
     } catch (err) {
       console.error(`✗ reload failed: ${err && err.message || err}`);

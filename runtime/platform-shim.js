@@ -71,6 +71,8 @@ const _setDelete = Set.prototype.delete;
 const _setForEach = Set.prototype.forEach;
 const _setSize = _getOwnPropertyDescriptor(Set.prototype, 'size').get;
 const _iterator = Symbol.iterator;
+const _symbolFor = Symbol.for;
+const _toStringTag = Symbol.toStringTag;
 const _decodeURIComponent = decodeURIComponent;
 const _Headers = Headers;
 const _Request = Request;
@@ -140,12 +142,70 @@ const _contextPropertyNames = ['props', 'exports'];
 let _serviceFetch;
 let _runtimeEnvInitialized = false;
 let _runtimeVibeToken;
+let _processModuleGuard;
+
+// nodejs_compat exposes a runtime loader that computed names can reach
+// without an import for the build-time scan to inspect.
+function guardBuiltinSockets(runtimeProcess) {
+  if (runtimeProcess && typeof runtimeProcess.getBuiltinModule === 'function') {
+    const nativeGetBuiltinModule = runtimeProcess.getBuiltinModule;
+    // The test pool evaluates the shim repeatedly in one isolate. The marker
+    // carries no capability and avoids redefining the already pinned wrapper.
+    const marker = _symbolFor('vibe-coded.shim.sockets-blocked');
+    if (_getOwnPropertyDescriptor(nativeGetBuiltinModule, marker)?.value !== true) {
+      const getBuiltinModule = function getBuiltinModule(...args) {
+        const id = args[0];
+        const name = typeof id === 'string' && _apply(_stringSlice, id, [0, 5]) === 'node:'
+          ? _apply(_stringSlice, id, [5]) : id;
+        if (name === 'cloudflare:sockets' || name === 'net' || name === 'tls') {
+          throw new _Error('Outbound sockets are unavailable in vibes');
+        }
+        return _apply(nativeGetBuiltinModule, this, args);
+      };
+      _defineProperty(getBuiltinModule, marker, { __proto__: null, value: true });
+      try {
+        _defineProperty(runtimeProcess, 'getBuiltinModule', {
+          __proto__: null, value: getBuiltinModule, writable: false, configurable: false,
+        });
+      } catch (_) {
+        // Some host objects allow replacing the value but reject changing its
+        // flags. Still install the guard, or fail closed if replacement fails.
+        _defineProperty(runtimeProcess, 'getBuiltinModule', { __proto__: null, value: getBuiltinModule });
+      }
+    }
+  }
+}
+
+async function guardProcessModule() {
+  let processModule;
+  try {
+    processModule = await import('node:process');
+  } catch (_) {
+    // Local hosts without node:process have no builtin loader to guard.
+    return;
+  }
+  // The module can expose a loader even when there is no global process.
+  // Default-export guard failures propagate before author code runs.
+  guardBuiltinSockets(processModule.default);
+  if (processModule !== processModule.default) {
+    try {
+      guardBuiltinSockets(processModule);
+    } catch (error) {
+      // Native ESM namespaces have immutable named bindings. Worker builds
+      // refuse namespace/dynamic imports and named or re-exported loaders,
+      // so author code only reaches the guarded default loader.
+      if (_getOwnPropertyDescriptor(processModule, _toStringTag)?.value !== 'Module') throw error;
+    }
+  }
+}
 
 // Author code only receives this wrapper, never the native fetch it closes
 // over. Replacing the global cannot recover the native network capability.
 // Host tools import pure helpers from this module; only Workers install the
 // network wrappers, before the lazy author import.
 if (typeof globalThis.WebSocketPair === 'function') {
+  guardBuiltinSockets(globalThis.process);
+
   const meteredFetch = async function fetch(input, init) {
     chargeAuthorSubrequest();
     const options = ownEnvCopy(init);
@@ -212,6 +272,33 @@ if (typeof globalThis.WebSocketPair === 'function') {
     }
   };
   replaceGlobalNetworkCapability('fetch', meteredFetch);
+
+  // Cache operations consume dispatch subrequests even when the runtime refuses
+  // them. Replace native methods before author import, including prototype
+  // aliases, so default caches and caches returned by open share the allowance.
+  if (typeof globalThis.caches === 'object' && globalThis.caches) {
+    const names = Object.getOwnPropertyNames;
+    const objectPrototype = Object.prototype;
+    const meterMethods = object => {
+      while (object && object !== objectPrototype) {
+        const keys = names(object);
+        for (let i = 0; i < keys.length; i++) {
+          const name = keys[i];
+          if (name === 'constructor') continue;
+          const descriptor = _getOwnPropertyDescriptor(object, name);
+          const native = descriptor.value;
+          if (typeof native !== 'function') continue;
+          _defineProperty(object, name, { __proto__: null, ...descriptor, value: async function (...args) {
+            chargeAuthorSubrequest();
+            return _apply(native, this, args);
+          } });
+        }
+        object = _getPrototypeOf(object);
+      }
+    };
+    meterMethods(globalThis.caches);
+    if (typeof globalThis.Cache === 'function') meterMethods(globalThis.Cache.prototype);
+  }
 
   // EventSource opens, redirects and reconnects outside the fetch wrapper.
   // Disable it, including the native prototype's constructor alias.
@@ -653,11 +740,10 @@ function chargeStorage(units, binding, category) {
 
 // Establish the request's access mode, then run `fn` inside it. PRIVATE and NOT
 // EXPORTED — this is the only way to enter 'write', and only fetch() calls it.
-// It is deliberately unreachable from user code: the shim deploys as the sibling
-// module `_platform-shim.js` next to the vibe's `worker.js` in the SAME Workers
-// script, so author code can `import('./_platform-shim.js')` (via a computed
-// specifier that survives bundling — verified) and reach any EXPORTED symbol
-// operating on this same private `als`. If a mode-setter were exported, a
+// The shim deploys as the sibling module `_platform-shim.js` next to the vibe's
+// `worker.js` in the same Workers script. Its exported symbols operate on this
+// same private `als`; build-time import restrictions do not replace runtime
+// privilege checks. If a mode-setter were exported, a
 // viewer's read-mode MCP call to an author-controlled tool could re-enter write
 // and mutate storage. So the module exports no way
 // to raise privilege; write is obtainable only through the platform-controlled
@@ -1919,6 +2005,11 @@ function createReadModeEnv(env) {
 
 export default {
   async fetch(request, env, ctx) {
+    // Share initialization across concurrent entries and finish it before any
+    // lazy author import. Hosts without Workers keep their native process.
+    if (typeof globalThis.WebSocketPair === 'function') {
+      await (_processModuleGuard ??= guardProcessModule());
+    }
     // Every read below goes to a null-prototype copy of the runtime env's own
     // data properties. The runtime env inherits from Object.prototype, where
     // author code (imported below and cached for later requests) can define a
