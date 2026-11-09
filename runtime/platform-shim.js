@@ -662,7 +662,7 @@ const D1_READ_ONLY_PLAN = 'This vibe\'s SQL data is read-only on the Free plan: 
 const D1_OVERQUOTA_PLAN = 'plan';
 
 const MISSING_FETCH_HANDLER = 'The worker has no default export with a fetch handler. Add `export default { async fetch(request, env) { … } }`'
-  + ' that routes /api/<name> to your functions; see the tools template.';
+  + ' that routes each API request to its function; see the tools template.';
 
 class D1EntitlementError extends Error {
   constructor(message = D1_ENTITLEMENT_REQUIRED) {

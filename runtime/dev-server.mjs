@@ -42,6 +42,9 @@ const MCP_PROTOCOL_VERSION = '2025-06-18';
 // The account plan bin/vibe read at start: free, byov (Pro) or pro (Pro+);
 // anything else is unknown (signed out, offline or a failed read).
 const PLAN = ['free', 'byov', 'pro'].includes(process.env.VIBE_DEV_PLAN) ? process.env.VIBE_DEV_PLAN : 'unknown';
+// Why bin/vibe could not read the plan: not signed in, an expired sign-in, a
+// network failure or a local temporary-file failure, as one sentence.
+const PLAN_ERROR = process.env.VIBE_DEV_PLAN_ERROR || 'You are signed out or offline; run vibe login.';
 
 // ── Lazy deps ─────────────────────────────────────────────────────────────────
 // bin/vibe installs the packages in a per-version cache outside the skill and
@@ -195,7 +198,7 @@ async function bundleWorker(entry, outFile) {
 // ── Default fetch handler (the build runner refuses the same bundles) ─────────
 export function missingFetchHandlerMessage(workerFile) {
   return `${workerFile} has no default export with a fetch handler. Add \`export default { async fetch(request, env) { … } }\``
-    + ' that routes /api/<name> to your functions; see the tools template.';
+    + ' that routes each API request to its function; see the tools template.';
 }
 
 // True when the bundle's default export cannot have a fetch method: none at
@@ -585,7 +588,7 @@ async function main() {
   const manifest = loadManifest();
   manifest.generation = opts.generation;
   // Local props dispatch cannot infer entitlement from an unavailable plan.
-  if (opts.generation === 'props' && PLAN === 'unknown') throw new Error('vibe dev could not read your plan (signed out or offline). Sign in with vibe login so vibe dev knows your plan, or pass --generation legacy');
+  if (opts.generation === 'props' && PLAN === 'unknown') throw new Error(`vibe dev could not read your plan, which sets the storage it runs. ${PLAN_ERROR} Then retry vibe dev, or pass --generation legacy`);
   if (opts.seed && PLAN === 'free') {
     console.error('Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use key-value storage".');
     process.exit(1);

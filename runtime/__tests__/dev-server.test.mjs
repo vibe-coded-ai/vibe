@@ -983,6 +983,11 @@ test('vibe dev --generation current (props) on an unknown plan names the next st
     const debug = run({ VIBE_DEBUG: '1' });
     assert.equal(debug.status, 1);
     assert.match(debug.stderr, /\n\s+at /);
+    // The cause bin/vibe found is reported in place of a sign-in guess.
+    const tmp = run({ VIBE_DEV_PLAN_ERROR: 'Could not create a temporary file in /missing (check that it exists, is writable and has free space).' });
+    assert.equal(tmp.status, 1);
+    assert.match(tmp.stderr, /vibe dev could not read your plan, which sets the storage it runs\. Could not create a temporary file in \/missing \(check that it exists, is writable and has free space\)\. Then retry vibe dev, or pass --generation legacy/);
+    assert.doesNotMatch(tmp.stderr, /signed out|offline|vibe login/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -1007,7 +1012,7 @@ test('vibe dev seed on Free refuses before starting Miniflare: the deployed vibe
 });
 
 const MISSING_FETCH = 'worker.js has no default export with a fetch handler. Add `export default { async fetch(request, env) { … } }`'
-  + ' that routes /api/<name> to your functions; see the tools template.';
+  + ' that routes each API request to its function; see the tools template.';
 
 function platformAcorn() {
   const canonicalPackage = resolve(RUNTIME_DIR, '../../../src/package.json');

@@ -170,10 +170,17 @@ _tmpfile_error() {
   echo "Error: Could not create a temporary file in ${TMPDIR:-/tmp} (check that it exists, is writable and has free space)." >&2
 }
 
+# Creates a temporary file in ${TMPDIR:-/tmp}, the directory _tmpfile_error
+# names (a bare mktemp on macOS ignores TMPDIR), and prints its path. Reports
+# a failure itself. Args: optional name prefix.
+_tmpfile() {
+  mktemp "${TMPDIR:-/tmp}/${1:-vibe}.XXXXXX" 2>/dev/null || { _tmpfile_error; return 1; }
+}
+
 _api() {
   local method="$1" path="$2" result http_status body headers retry_after curl_status=0
   shift 2
-  headers=$(mktemp) || { _tmpfile_error; return 1; }
+  headers=$(_tmpfile) || return 1
   # Pass Authorization header via curl --config stdin so the Bearer token
   # never appears in argv and is not visible to other users via `ps`.
   result=$(curl -s -K - -D "$headers" -X "$method" "${API_URL}${path}" \
@@ -998,8 +1005,8 @@ cmd_source() {
     # Encode each segment so filenames cannot inject a query or fragment.
     encoded=$(printf '%s' "$1" | jq -sRr 'split("/") | map(@uri) | join("/")')
     local out http_status retry_after="" attempt
-    out=$(mktemp) || { _tmpfile_error; exit 1; }
-    local hdrs; hdrs=$(mktemp) || { rm -f "$out"; _tmpfile_error; exit 1; }
+    out=$(_tmpfile) || exit 1
+    local hdrs; hdrs=$(_tmpfile) || { rm -f "$out"; exit 1; }
     # The same single pause as _api.
     for attempt in 1 2; do
       local curl_status=0
@@ -1353,7 +1360,7 @@ cmd_preview() {
   fi
 
   # Use tempfile + --data-binary @file so payload bypasses ARG_MAX (macOS: 1MB)
-  TMP_PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/vibe-upload.XXXXXX") || { _tmpfile_error; exit 1; }
+  TMP_PAYLOAD=$(_tmpfile vibe-upload) || exit 1
   printf '%s' "$PAYLOAD" > "$TMP_PAYLOAD" || { rm -f "$TMP_PAYLOAD"; _tmpfile_error; exit 1; }
   if ! UPLOAD=$(_api_wait_for_build POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/source" --data-binary "@$TMP_PAYLOAD"); then
     rm -f "$TMP_PAYLOAD"
@@ -1988,12 +1995,18 @@ cmd_fetch() {
   [ "$env" = "preview" ] && prefix="p--"
   local url="https://${prefix}${USER_SLUG}--${VIBE_SLUG}.vibe-coded.ai${path}"
   local out headers http_status
-  out=$(mktemp) || { _tmpfile_error; exit 1; }
-  headers=$(mktemp) || { rm -f "$out"; _tmpfile_error; exit 1; }
-  http_status=$(curl -K - -X "$method" "${request_args[@]}" -D "$headers" -o "$out" -w '%{http_code}' "$url" \
+  out=$(_tmpfile) || exit 1
+  headers=$(_tmpfile) || { rm -f "$out"; exit 1; }
+  # curl -X HEAD still waits for the Content-Length body a HEAD response never
+  # sends; --head reads headers only, and writes them to the output file too,
+  # which is emptied so the response has no body.
+  local method_args=(-X "$method")
+  [ "$method" = "HEAD" ] && method_args=(--head)
+  http_status=$(curl -K - "${method_args[@]}" "${request_args[@]}" -D "$headers" -o "$out" -w '%{http_code}' "$url" \
     -H "User-Agent: vibe-cli/1.0" \
     <<<"header = \"Authorization: Bearer ${TOKEN}\"") \
     || { rm -f "$out" "$headers"; echo "Error: request to $url failed" >&2; exit 1; }
+  [ "$method" != "HEAD" ] || : > "$out"
   if [ "$show_headers" = "1" ]; then
     awk '
       { sub(/\r$/, "") }
@@ -2197,6 +2210,16 @@ cmd_connect() {
   if ! echo "$result" | jq -e '.success == true and (.token | type == "string")' >/dev/null 2>&1; then
     if [ "$(echo "$result" | jq -r '._originalError // .error // empty')" = "Vibe not found" ]; then
       echo "Error: Vibe $CONNECT_OWNER/$VIBE_SLUG not found or not shared with you" >&2
+      exit 1
+    fi
+    # The platform mints nothing for an unpublished vibe, so nothing is
+    # registered or recorded here either.
+    if [ "$(echo "$result" | jq -r '.code // empty' 2>/dev/null)" = "not_published" ]; then
+      if [ "$CONNECT_OWNER" = "$USER_SLUG" ]; then
+        echo "Error: $CONNECT_OWNER/$VIBE_SLUG is not published yet, so it has no MCP server to connect to. Run: vibe publish, then $again" >&2
+      else
+        echo "Error: $CONNECT_OWNER/$VIBE_SLUG is not published yet, so it has no MCP server to connect to. Ask ${CONNECT_OWNER} to publish ${VIBE_SLUG}, then run: $again" >&2
+      fi
       exit 1
     fi
     echo "Error: $(echo "$result" | jq -r '.error // "could not create a connection token"' 2>/dev/null)" >&2
@@ -2583,9 +2606,9 @@ _login_password() {
   fi
 
   local cookie_jar body resp
-  cookie_jar=$(mktemp)
-  body=$(mktemp)
-  resp=$(mktemp)
+  cookie_jar=$(_tmpfile) || return 1
+  body=$(_tmpfile) || { rm -f "$cookie_jar"; return 1; }
+  resp=$(_tmpfile) || { rm -f "$cookie_jar" "$body"; return 1; }
 
   export PASSWORD
   jq -n --arg e "$email" '{email: $e, password: env.PASSWORD}' > "$body"
@@ -2758,7 +2781,7 @@ cmd_secrets() {
       # because the platform pages before the name filter applies.
       local name="${1:-}" offset=0 pages
       [ -z "$name" ] || _validate_secret_name "$name"
-      pages=$(mktemp)
+      pages=$(_tmpfile) || exit 1
       while :; do
         RESULT=$(_api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/secrets/_audit?includeSync=false&limit=100&offset=$offset") || { rm -f "$pages"; exit 1; }
         ( _check_success "$RESULT" "vibe secrets audit" ) || { rm -f "$pages"; exit 1; }
@@ -3126,6 +3149,9 @@ cmd_dev() {
         '{userSlug: $u, vibeSlug: $v, type: "fullstack", storage: $st, unregistered: true}')
       export VIBE_DEV_MANIFEST
     fi
+  elif [ ! -f .vibe-coded.json ]; then
+    echo "Error: nothing to run here. vibe dev runs in any folder with a worker.js, worker.ts or index.html, with no vibe init needed (init is only for vibe preview and vibe publish). Add one of those files here, or run vibe dev from the folder that has them." >&2
+    exit 1
   else
     _load_manifest
     type=$(jq -r '.type // "fullstack"' .vibe-coded.json)
@@ -3238,14 +3264,28 @@ NODE
   # legacy one keeps its offline bindings). The generation is the preview's,
   # or the current one that new vibes are built with when there is no preview
   # yet. --retry 0 keeps a ~/.curlrc retry setting from stretching the 5 s cap.
-  local plan="" generation="props" info
+  # VIBE_DEV_PLAN_ERROR carries why the plan is unknown, for the error the
+  # current generation reports.
+  local plan="" plan_error="You are not signed in; run vibe login." generation="props" info lookup
   if [ -f "$CREDS" ]; then
-    plan=$( (_load_creds && _API_NO_RETRY=1 _plan_lookup "" --retry 0 --connect-timeout 3 --max-time 5 | jq -r '.plan') 2>/dev/null ) || plan=""
+    plan_error=""
+    if lookup=$( (_load_creds && _API_NO_RETRY=1 _plan_lookup "" --retry 0 --connect-timeout 3 --max-time 5) 2>&1 ); then
+      plan=$(printf '%s' "$lookup" | jq -r '.plan' 2>/dev/null) || plan=""
+    else
+      # The first line the lookup printed: the temporary-file, network or API
+      # error as the other commands report it.
+      lookup="${lookup%%$'\n'*}"
+      case "$lookup" in
+        *expired*) plan_error="Your sign-in expired; run vibe login." ;;
+        *) plan_error="${lookup#Error: }" ;;
+      esac
+    fi
+    [ -n "$plan" ] || [ -n "$plan_error" ] || plan_error="The plan lookup returned no plan."
     if [ -z "$local_project" ] && info=$( (_load_creds && _API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" --retry 0 --connect-timeout 3 --max-time 5) 2>/dev/null ); then
       generation=$(printf '%s' "$info" | jq -r '.vibe.previewGeneration // "props"') || generation="props"
     fi
   fi
-  export VIBE_DEV_DEPS="$deps_dir" VIBE_DEV_PLAN="${plan:-unknown}"
+  export VIBE_DEV_DEPS="$deps_dir" VIBE_DEV_PLAN="${plan:-unknown}" VIBE_DEV_PLAN_ERROR="$plan_error"
 
   # The process keeps "vibe dev <args>" as its name, so pkill -f "vibe dev"
   # and pkill -f "vibe dev --port N" both find it.
