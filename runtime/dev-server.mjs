@@ -21,7 +21,7 @@
 import { createServer as createNetServer } from 'node:net';
 import { createServer } from 'node:http';
 import { readFileSync, existsSync, rmSync, mkdirSync, copyFileSync, writeFileSync, statSync, realpathSync } from 'node:fs';
-import { dirname, join, resolve, extname, relative, sep } from 'node:path';
+import { basename, dirname, join, resolve, extname, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import { execFileSync } from 'node:child_process';
@@ -101,14 +101,17 @@ function parseArgs(argv) {
   return opts;
 }
 
+// A folder without .vibe-coded.json gets its manifest from the CLI in
+// VIBE_DEV_MANIFEST (signed-in owner, folder slug, unregistered: true).
 function loadManifest() {
   const p = resolve('.vibe-coded.json');
-  if (!existsSync(p)) {
-    console.error("Error: No .vibe-coded.json in current directory. Run 'vibe init' first.");
+  if (!existsSync(p) && !process.env.VIBE_DEV_MANIFEST) {
+    console.error("Error: No .vibe-coded.json, worker.js or index.html in this folder. Run vibe dev from your project's folder.");
     process.exit(1);
   }
-  const m = JSON.parse(readFileSync(p, 'utf8'));
+  const m = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : JSON.parse(process.env.VIBE_DEV_MANIFEST);
   return {
+    unregistered: m.unregistered === true && !existsSync(p),
     vibeSlug: m.vibeSlug,
     userSlug: m.userSlug,
     type: m.type || 'fullstack',
@@ -187,6 +190,69 @@ async function bundleWorker(entry, outFile) {
     entryPoints: [entry], outfile: outFile, bundle: true,
     format: 'esm', platform: 'browser', target: 'esnext', sourcemap: 'inline',
   });
+}
+
+// ── Default fetch handler (the build runner refuses the same bundles) ─────────
+export function missingFetchHandlerMessage(workerFile) {
+  return `${workerFile} has no default export with a fetch handler. Add \`export default { async fetch(request, env) { … } }\``
+    + ' that routes /api/<name> to your functions; see the tools template.';
+}
+
+// True when the bundle's default export cannot have a fetch method: none at
+// all, or an object literal without a `fetch` key or a function, whose binding
+// is not referenced again (so no later assignment can add `fetch`). Classes,
+// call results and objects with spreads or computed keys are left to the
+// runtime, which answers with the same message when `fetch` is missing.
+export function lacksFetchHandler(parse, bundle) {
+  const references = new Map();
+  const declarations = new Map();
+  let found = null;
+  const program = parse(bundle, { ecmaVersion: 'latest', sourceType: 'module' });
+  const visit = node => {
+    if (Array.isArray(node)) return node.forEach(visit);
+    if (!node || typeof node.type !== 'string') return;
+    if (node.type === 'Identifier') references.set(node.name, (references.get(node.name) ?? 0) + 1);
+    if (node.type === 'VariableDeclarator' && node.id.type === 'Identifier' && node.init) declarations.set(node.id.name, node.init);
+    if (node.type === 'ExportDefaultDeclaration') found = node.declaration;
+    if (node.type === 'ExportNamedDeclaration') {
+      for (const { exported, local: binding } of node.specifiers) {
+        if ((exported.name ?? exported.value) === 'default') found = node.source ? node : binding;
+      }
+    }
+    for (const [key, value] of Object.entries(node)) if (key !== 'type' && value && typeof value === 'object') visit(value);
+  };
+  for (const statement of program.body) {
+    if (statement.type === 'FunctionDeclaration' && statement.id) declarations.set(statement.id.name, statement);
+  }
+  visit(program);
+  const lacksFetch = node => {
+    if (['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression'].includes(node.type)) return true;
+    if (node.type !== 'ObjectExpression') return false;
+    return !node.properties.some(property => property.type !== 'Property' || property.computed
+      // A `__proto__` initializer can supply an inherited fetch.
+      || ['fetch', '__proto__'].includes(property.key.name ?? property.key.value));
+  };
+  const possible = (node, depth = 0) => {
+    if (node.type === 'FunctionDeclaration') return Boolean(node.id) && references.get(node.id.name) > 1;
+    if (node.type !== 'Identifier') return node.type === 'ExportNamedDeclaration' || !lacksFetch(node);
+    const declaration = declarations.get(node.name);
+    // The declaration and the export (or alias) are the binding's only references.
+    if (!declaration || references.get(node.name) > 2) return true;
+    // Bundlers alias a named default (`var c = app; export { c as default }`).
+    if (declaration.type === 'Identifier' && depth < 8) return possible(declaration, depth + 1);
+    return !lacksFetch(declaration);
+  };
+  return !found || !possible(found);
+}
+
+// The parser ships with the dev dependencies; without it, the runtime's
+// answer to a request is the only report.
+async function checkFetchHandler(workerFile, bundlePath) {
+  let parse;
+  try { ({ parse } = await importDep('acorn')); } catch { return null; }
+  try {
+    return lacksFetchHandler(parse, readFileSync(bundlePath, 'utf8')) ? missingFetchHandlerMessage(basename(workerFile)) : null;
+  } catch { return null; }
 }
 
 // ── Miniflare options ─────────────────────────────────────────────────────────
@@ -552,6 +618,11 @@ async function main() {
   printDroppedTools(extraction.warnings);
   console.log(`Bundling ${workerFile}…`);
   await bundleWorker(workerFile, join(devDir, 'worker.js'));
+  const missingFetch = await checkFetchHandler(workerFile, join(devDir, 'worker.js'));
+  if (missingFetch) {
+    console.error(`Error: ${missingFetch}`);
+    process.exit(1);
+  }
 
   const secrets = loadDevVars();
   const vibeAccessToken = randomBytes(32).toString('hex');
@@ -673,6 +744,8 @@ async function main() {
     reloading = true;
     try {
       await bundleWorker(workerFile, join(devDir, 'worker.js'));
+      const missing = await checkFetchHandler(workerFile, join(devDir, 'worker.js'));
+      if (missing) throw new Error(missing);
       extraction = extractToolsWithWarnings(readFileSync(workerFile, 'utf8'));
       tools = extraction.tools;
       printDroppedTools(extraction.warnings);
@@ -711,6 +784,7 @@ const PLAN_LINES = {
 function printBanner(manifest, port, tools) {
   console.log('');
   console.log(`  vibe dev — ${manifest.userSlug}/${manifest.vibeSlug} (${manifest.storage === 'd1' ? 'sql' : manifest.storage === 'kv' ? 'key-value' : manifest.storage})`);
+  if (manifest.unregistered) console.log(`  Not on vibe-coded.ai yet. To preview it there: vibe init ${manifest.vibeSlug}`);
   console.log(`  Local:   http://127.0.0.1:${port}`);
   console.log(`  API:     http://127.0.0.1:${port}/api/<function>`);
   console.log(`  MCP:     http://127.0.0.1:${port}/mcp  (${tools.length} tool${tools.length === 1 ? '' : 's'})`);

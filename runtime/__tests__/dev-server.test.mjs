@@ -1006,6 +1006,62 @@ test('vibe dev seed on Free refuses before starting Miniflare: the deployed vibe
   }
 });
 
+const MISSING_FETCH = 'worker.js has no default export with a fetch handler. Add `export default { async fetch(request, env) { … } }`'
+  + ' that routes /api/<name> to your functions; see the tools template.';
+
+function platformAcorn() {
+  const canonicalPackage = resolve(RUNTIME_DIR, '../../../src/package.json');
+  return existsSync(canonicalPackage) ? dirname(createRequire(canonicalPackage).resolve('acorn/package.json')) : null;
+}
+
+test('lacksFetchHandler matches the build runner on emitted bundles', async (t) => {
+  const acornDir = platformAcorn();
+  if (!acornDir) { t.skip('acorn lives in the platform repo'); return; }
+  const { parse } = await import(pathToFileURL(createRequire(join(acornDir, 'package.json')).resolve('acorn')).href);
+  const { lacksFetchHandler } = await import('../dev-server.mjs');
+  for (const bundle of [
+    'export{r as default};var r={async addItem(){}};',
+    'var r={a:1};export{r as default,t as addItem};function t(){}',
+    'var e={async listItems(){}};var c=e;export{c as default};',
+    'export function addItem(){}',
+    'export default {};',
+    'export default async function(){}',
+    'async function h(){}\nexport { h as default };',
+  ]) assert.equal(lacksFetchHandler(parse, bundle), true, bundle);
+  for (const bundle of [
+    'var r={async fetch(){}};export{r as default};',
+    'var r={"fetch":()=>1};export{r as default};',
+    'var r={[k]:1};export{r as default};',
+    'var r={__proto__:{fetch(){}}};export{r as default};',
+    'var b={fetch(){}};export default {...b};',
+    'var a={};a.fetch=()=>1;export{a as default};',
+    'export{default}from"./elsewhere.js";',
+    'import{WorkerEntrypoint as W}from"cloudflare:workers";export default class extends W{}',
+    'function c(){return{fetch(){}}}export default c();',
+  ]) assert.equal(lacksFetchHandler(parse, bundle), false, bundle);
+});
+
+test('vibe dev refuses a worker with no default fetch handler before starting Miniflare', (t) => {
+  const acornDir = platformAcorn();
+  if (!acornDir) { t.skip('acorn lives in the platform repo'); return; }
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  try {
+    cpSync(acornDir, join(modules, 'acorn'), { recursive: true });
+    writeFileSync(join(modules, 'miniflare', 'index.js'), `
+      export class Miniflare { constructor() { console.log('Miniflare started'); } }
+    `);
+    writeFileSync(join(project, 'worker.js'), '/** @mcp-expose */\nexport async function add_item(args, env) { return args; }\n');
+    const result = spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs'))], {
+      cwd: project, encoding: 'utf8', timeout: 20000, env: { ...process.env, PATH: dirname(process.execPath) },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(result.stderr.trim().split('\n').at(-1), `Error: ${MISSING_FETCH}`);
+    assert.doesNotMatch(result.stdout, /Miniflare started/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('the Free bindings reach the worker through the shim as production does: env.VIBE_D1 throws the plan error, no env.VIBE_R2', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'vibe-dev-free-shim-'));
   try {

@@ -832,6 +832,18 @@ cmd_init() {
     fi
   fi
 
+  # An existing project keeps the SQL storage its manifest records. A template
+  # or --storage still decides.
+  local local_storage=""
+  if [ -f .vibe-coded.json ] && [ "$(jq -r '.storage // empty' .vibe-coded.json)" = "d1" ]; then
+    local_storage="d1"
+  fi
+  if [ -z "$template" ] && [ -z "$storage_flag" ] && [ -n "$local_storage" ]; then
+    storage="$local_storage"
+  fi
+  local storage_name="key-value"
+  [ "$storage" = "d1" ] && storage_name="SQL"
+
   if [ -n "$adopt" ]; then
     local existing existing_storage
     existing=$(_api GET "/api/v1/vibes/$USER_SLUG/$slug")
@@ -848,17 +860,26 @@ cmd_init() {
       _check_success "$retitled" "Title update"
       echo "Title set to: $title"
     fi
-    existing_storage=$(echo "$existing" | jq -r '(.vibe // .).storageType // "kv"')
+    # SQL once the platform holds a database for the vibe, else its recorded type.
+    existing_storage=$(echo "$existing" | jq -r "$STORAGE_IN_USE_JQ"' (.vibe // .)
+      | if storage_in_use | split(", ") | index("sql") then "d1" else (.storageType // "kv") end')
+    # The platform records SQL after the first preview of a worker that uses
+    # env.VIBE_D1, so a local SQL project is not relabelled key-value before then.
+    if [ -z "$template" ] && [ "$local_storage" = "d1" ]; then
+      existing_storage="d1"
+    fi
     [ "${title_given:-0}" = 1 ] || title=$(echo "$existing" | jq -r --arg slug "$slug" '(.vibe // .).title // $slug | strings')
+    local existing_name="key-value"
+    [ "$existing_storage" = "d1" ] && existing_name="SQL"
     if [ -n "$template" ] && [ "$existing_storage" != "$storage" ]; then
-      echo "Note: $slug uses $existing_storage storage; template '$template' expects $storage." >&2
+      echo "Note: $slug uses $existing_name storage; template '$template' expects $storage_name." >&2
     elif [ -n "$storage_flag" ] && [ "$storage_flag" != "$existing_storage" ]; then
-      echo "Note: --storage ${storage_flag/d1/sql} was ignored; $slug keeps its recorded storage (${existing_storage/d1/sql}). On Pro, a worker that uses env.VIBE_D1 gets SQL on its next vibe preview." >&2
+      echo "Note: --storage ${storage_flag/d1/sql} was ignored; $slug keeps its recorded storage ($existing_name). On Pro, a worker that uses env.VIBE_D1 gets SQL on its next vibe preview." >&2
     fi
     storage="$existing_storage"
-    echo "Using your existing vibe: $USER_SLUG/$slug"
+    echo "Using your existing vibe: $USER_SLUG/$slug (storage: $existing_name)"
   else
-    echo "Creating vibe: $slug (storage: $storage, visibility: $visibility)"
+    echo "Creating vibe: $slug (storage: $storage_name, visibility: $visibility)"
 
     # Create on platform
     RESULT=$(_api POST "/api/v1/vibes" \
@@ -880,6 +901,9 @@ cmd_init() {
       else
         if _is_entitlement_error "$RESULT" 2>/dev/null; then
           _entitlement_hint "$RESULT" "$init_command"
+          if [ -z "$template" ] && [ -z "$storage_flag" ] && [ "$storage" = "d1" ]; then
+            echo "This folder's .vibe-coded.json records SQL storage. To create the vibe with key-value storage instead: vibe init $slug --storage kv" >&2
+          fi
           exit 1
         fi
         local recovered
@@ -3066,13 +3090,48 @@ USAGE
   esac
 }
 
+# A slug for a folder that is not set up yet: its name, lowercased, with runs of
+# other characters joined into single hyphens, else "local".
+_folder_slug() {
+  local name
+  name=$(basename "$PWD" | tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+  name="${name:0:63}"
+  name="${name%-}"
+  printf '%s' "${name:-local}"
+}
+
 cmd_dev() {
   # Local dev. Runs offline without credentials; signed in, it reads the plan once.
-  _load_manifest
+  # A folder with a worker or index.html and no .vibe-coded.json runs as a local
+  # project: dev needs the account plan, not a vibe on the platform. The owner is
+  # the signed-in account, the slug comes from the folder name, and storage is
+  # SQL when the worker uses env.VIBE_D1.
+  local type storage local_project=""
+  if [ ! -f .vibe-coded.json ] && { _has_worker || [ -f index.html ]; }; then
+    local_project=1
+    type="fullstack"
+    _has_worker || type="static"
+    storage="kv"
+    local worker_file=worker.js
+    [ -f worker.ts ] && worker_file=worker.ts
+    if grep -qs 'env\.VIBE_D1' "$worker_file"; then storage="d1"; fi
+    if [ "$type" = "fullstack" ]; then
+      if [ ! -f "$CREDS" ]; then
+        echo "vibe dev reads your plan to run storage as it will be deployed, so sign in first: vibe login. Local dev needs no vibe on vibe-coded.ai; vibe init <slug> creates one when you are ready to preview." >&2
+        exit 1
+      fi
+      _load_creds
+      VIBE_SLUG=$(_folder_slug)
+      VIBE_DEV_MANIFEST=$(jq -cn --arg u "$USER_SLUG" --arg v "$VIBE_SLUG" --arg st "$storage" \
+        '{userSlug: $u, vibeSlug: $v, type: "fullstack", storage: $st, unregistered: true}')
+      export VIBE_DEV_MANIFEST
+    fi
+  else
+    _load_manifest
+    type=$(jq -r '.type // "fullstack"' .vibe-coded.json)
+    storage=$(jq -r '.storage // "kv"' .vibe-coded.json)
+  fi
   _ensure_gitignore
-  local type storage
-  type=$(jq -r '.type // "fullstack"' .vibe-coded.json)
-  storage=$(jq -r '.storage // "kv"' .vibe-coded.json)
 
   # Templates record "static", but a root worker added later still needs the server.
   if [ "$type" = "static" ] && [ ! -f worker.js ] && [ ! -f worker.ts ]; then
@@ -3182,7 +3241,7 @@ NODE
   local plan="" generation="props" info
   if [ -f "$CREDS" ]; then
     plan=$( (_load_creds && _API_NO_RETRY=1 _plan_lookup "" --retry 0 --connect-timeout 3 --max-time 5 | jq -r '.plan') 2>/dev/null ) || plan=""
-    if info=$( (_load_creds && _API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" --retry 0 --connect-timeout 3 --max-time 5) 2>/dev/null ); then
+    if [ -z "$local_project" ] && info=$( (_load_creds && _API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" --retry 0 --connect-timeout 3 --max-time 5) 2>/dev/null ); then
       generation=$(printf '%s' "$info" | jq -r '.vibe.previewGeneration // "props"') || generation="props"
     fi
   fi
@@ -3245,7 +3304,7 @@ _print_command_help() {
     templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates served by the platform." ;;
     list) printf '%s\n' "Usage: vibe list" "List your vibes; * marks the current folder's vibe. No manifest needed." ;;
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
-    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation legacy|current] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan and generation once (Free: no SQL or files). Runs the same runtime as your hosted preview, or the current one before the first preview; --generation overrides it." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
+    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation legacy|current] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state. Works before vibe init: the folder needs a worker or index.html." "Signed in, it reads your plan and generation once (Free: no SQL or files). Runs the same runtime as your hosted preview, or the current one before the first preview; --generation overrides it." "On first run of each skill version, installs miniflare, esbuild, chokidar and acorn with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
     preview|deploy) printf '%s\n' "Usage: vibe preview [--prune|--no-prune]" "Mirror local source to preview and wait for its build." "Uploads are limited to 30 an hour per account and address, separate from the build allowance." ;;
     publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." "Preview data does not carry to production; production keeps its own data." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." "--plan shows your plan instead: monthly calls, vibes, preview builds and source uploads used. No .vibe-coded.json needed." ;;

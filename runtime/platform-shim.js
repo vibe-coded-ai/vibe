@@ -661,6 +661,9 @@ const D1_READ_ONLY_PLAN = 'This vibe\'s SQL data is read-only on the Free plan: 
 // any other present value is a byte cap.
 const D1_OVERQUOTA_PLAN = 'plan';
 
+const MISSING_FETCH_HANDLER = 'The worker has no default export with a fetch handler. Add `export default { async fetch(request, env) { … } }`'
+  + ' that routes /api/<name> to your functions; see the tools template.';
+
 class D1EntitlementError extends Error {
   constructor(message = D1_ENTITLEMENT_REQUIRED) {
     super(message);
@@ -2103,6 +2106,10 @@ export default {
     // user top-level code; cache the RESOLVED handler so steady-state requests
     // skip the await entirely (the module registry already caches the import).
     const userWorker = _userWorker ??= (await import('./worker.js')).default;
+    if (typeof userWorker?.fetch !== 'function') {
+      return new Response(JSON.stringify({ success: false, error: MISSING_FETCH_HANDLER }),
+        { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
     // Built without a prototype: until the deletes below it holds the token and
     // the service binding, and no read or assignment on it may reach an
     // Object.prototype accessor. Author code gets an ordinary copy at the end.
