@@ -4,7 +4,7 @@ Start from the template that fits: through MCP read
 `vibe-coded://templates/<name>` and `push_source` its files; through the CLI run
 `vibe init --template <name> <slug>`.
 
-- `tools`: KV (every plan).
+- `tools`: key-value (every plan).
 - `tools-sql`: SQL (Pro or Pro+).
 
 ## Shape
@@ -61,7 +61,7 @@ worker runs; a wrong type is refused with `Argument 'x' must be ...`. A direct
 HTTP request to `/api/<name>` reaches the worker unchecked.
 
 - One root file, `./worker.js` or `./worker.ts`. Local modules and npm packages
-  that run on Cloudflare Workers are fine; Node-only modules (`fs`,
+  that run in the worker runtime are fine; Node-only modules (`fs`,
   `child_process`, `net`, `module`) are not.
 - Tool functions are snake_case `async function`s with `env` as the last
   parameter, and every tool has an entry in `apiFunctions`.
@@ -71,7 +71,7 @@ HTTP request to `/api/<name>` reaches the worker unchecked.
   (not the paths of the worker's source files or of root files such as `package.json`).
 - SQL: create tables from write paths (`CREATE TABLE IF NOT EXISTS`), and treat
   "no such table" on a read as empty; preview starts with an empty database.
-- KV: use the `rememberWrite` / `loadAll` helpers from the template for lists
+- Key-value: use the `rememberWrite` / `loadAll` helpers from the template for lists
   (see `platform-patterns.md`).
 
 ## Background work and logs

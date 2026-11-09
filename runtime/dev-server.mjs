@@ -74,13 +74,17 @@ async function loadDeps() {
 }
 
 // ── Args / manifest ───────────────────────────────────────────────────────────
+// --generation takes legacy|current; shim|props are accepted as aliases. The
+// runtime uses the internal names shim (legacy) and props (current).
+const GENERATIONS = Object.assign(Object.create(null), { legacy: 'shim', current: 'props', shim: 'shim', props: 'props' });
+
 function parseArgs(argv) {
   const opts = { port: 8787, reset: false, seed: null, generation: 'shim' };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--port') opts.port = parseInt(argv[++i], 10);
     else if (a === '--reset') opts.reset = true;
-    else if (a === '--generation') opts.generation = argv[++i];
+    else if (a === '--generation') opts.generation = GENERATIONS[argv[++i]];
     else if (a === 'seed') {
       opts.seed = argv[++i];
       if (!opts.seed) {
@@ -89,7 +93,7 @@ function parseArgs(argv) {
       }
     }
   }
-  if (!['shim', 'props'].includes(opts.generation)) throw new Error('--generation must be shim or props');
+  if (!opts.generation) throw new Error('--generation must be legacy or current');
   if (!Number.isInteger(opts.port) || opts.port < 1 || opts.port > 65535) {
     console.error('Error: --port must be an integer 1-65535');
     process.exit(1);
@@ -192,11 +196,11 @@ async function bundleWorker(entry, outFile) {
 export const DEV_PLATFORM_PREFIX = '/__vibe_dev_platform';
 export const DEV_PLATFORM_REFUSAL = {
   success: false,
-  error: 'Signed file URLs (createUploadUrl, createDownloadUrl) are not available in vibe dev; env.VIBE_R2 put, get, list and delete work locally. Test signed URLs on the preview: vibe preview.',
+  error: 'Signed file links are not available in vibe dev; test them on preview.',
 };
 
 export function buildMfOptions(devDir, manifest, secrets, vibeAccessToken, port, plan = 'unknown', generation = 'shim') {
-  if (!['shim', 'props'].includes(generation)) throw new Error('--generation must be shim or props');
+  if (!['shim', 'props'].includes(generation)) throw new Error('--generation must be legacy or current');
   // A Free deploy has no VIBE_D1 or VIBE_R2 binding (cf-api.ts). Without
   // VIBE_D1 the shim installs the binding that throws the plan error.
   // Legacy offline development keeps its bindings on an unknown plan so existing
@@ -515,7 +519,7 @@ async function main() {
   const manifest = loadManifest();
   manifest.generation = opts.generation;
   // Local props dispatch cannot infer entitlement from an unavailable plan.
-  if (opts.generation === 'props' && PLAN === 'unknown') throw new Error('vibe dev could not read your plan (signed out or offline). Sign in with vibe login so vibe dev knows your plan, or pass --generation shim');
+  if (opts.generation === 'props' && PLAN === 'unknown') throw new Error('vibe dev could not read your plan (signed out or offline). Sign in with vibe login so vibe dev knows your plan, or pass --generation legacy');
   if (opts.seed && PLAN === 'free') {
     console.error('Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use key-value storage".');
     process.exit(1);
@@ -566,7 +570,7 @@ async function main() {
     const db = await mf.getD1Database('VIBE_D1');
     const statements = splitSqlStatements(sql);
     for (const stmt of statements) await db.prepare(stmt).run();
-    console.log(`Seeded local D1 from ${opts.seed} (${statements.length} statement${statements.length === 1 ? '' : 's'}).`);
+    console.log(`Seeded local SQL database from ${opts.seed} (${statements.length} statement${statements.length === 1 ? '' : 's'}).`);
     await mf.dispose();
     return;
   }
@@ -696,7 +700,7 @@ async function main() {
 }
 
 const PLAN_LINES = {
-  free: ['Free — as deployed, env.VIBE_D1 throws the plan error and there is no env.VIBE_R2.',
+  free: ['Free — as deployed, env.VIBE_D1 and env.VIBE_R2 throw the plan error (code ENTITLEMENT_EXCEEDED).',
     'SQL and files need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing'],
   byov: ['Pro — SQL, key-value and files, as deployed.'],
   pro: ['Pro+ — SQL, key-value and files, as deployed.'],
@@ -710,8 +714,13 @@ function printBanner(manifest, port, tools) {
   console.log(`  Local:   http://127.0.0.1:${port}`);
   console.log(`  API:     http://127.0.0.1:${port}/api/<function>`);
   console.log(`  MCP:     http://127.0.0.1:${port}/mcp  (${tools.length} tool${tools.length === 1 ? '' : 's'})`);
+  console.log(`  Runtime: ${manifest.generation === 'props' ? 'current' : 'legacy'}`);
   console.log(`  State:   .vibe-coded/dev/  (${PLAN === 'free' ? 'key-value' : 'SQL, key-value and files'}, persisted)`);
-  PLAN_LINES[PLAN].forEach((line, i) => console.log(`  ${i ? '        ' : 'Plan:   '} ${line}`));
+  // The legacy runtime deploys Free vibes without a VIBE_R2 binding.
+  const planLines = PLAN === 'free' && manifest.generation === 'shim'
+    ? ['Free — SQL (env.VIBE_D1) and file storage (env.VIBE_R2) are not available.', ...PLAN_LINES.free.slice(1)]
+    : PLAN_LINES[PLAN];
+  planLines.forEach((line, i) => console.log(`  ${i ? '        ' : 'Plan:   '} ${line}`));
   console.log('  Watching worker for changes — Ctrl-C to stop.');
   if (needsViteBuild(process.cwd())) {
     console.log('');

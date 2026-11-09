@@ -187,11 +187,11 @@ function runCli(command, args = [], scenario = 'normal', detailResponse = {
     '  fi',
     'elif [[ "$method" = POST && "$url" == */api/v1/vibes ]]; then',
     '  if [ "$VIBE_TEST_SCENARIO" = vibecappro ]; then',
-    '    emit \'{"success":false,"error":"Vibe limit reached (25/25). Pro+ is the highest plan; free up room to continue. Delete a vibe you no longer need: https://vibe-coded.ai/account. Tell your agent: \\"delete an unused vibe, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":25,"used":25,"plan":"pro","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
+    '    emit \'{"success":false,"error":"Vibe limit reached (25/25). Pro+ is the highest plan. To make room, delete a vibe you no longer need on the website (vibes are deleted only there): https://vibe-coded.ai/account. Tell your agent: \\"I deleted a vibe on vibe-coded.ai; check my vibe count, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":25,"used":25,"plan":"pro","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
     '  elif [ "$VIBE_TEST_SCENARIO" = vibecapbyov ]; then',
-    '    emit \'{"success":false,"error":"Vibe limit reached (10/10). Pro+ ($20/mo) supports up to 25 vibes. Upgrade at https://vibe-coded.ai/billing. Tell your agent: \\"upgrade my vibe-coded.ai plan or delete an unused vibe, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":10,"used":10,"plan":"byov","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
+    '    emit \'{"success":false,"error":"Vibe limit reached (10/10). To make room, upgrade: Pro+ ($20/mo) supports up to 25 vibes, at https://vibe-coded.ai/billing. Or delete a vibe you no longer need on the website (vibes are deleted only there): https://vibe-coded.ai/account. Tell your agent: \\"I upgraded my plan or deleted a vibe on vibe-coded.ai; check my vibe count, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":10,"used":10,"plan":"byov","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
     '  elif [ "$VIBE_TEST_SCENARIO" = vibecap ]; then',
-    '    emit \'{"success":false,"error":"Vibe limit reached (5/5). Pro ($9/mo) supports up to 10 vibes; Pro+ ($20/mo) supports up to 25 vibes. Upgrade at https://vibe-coded.ai/billing. Or delete a vibe you no longer need: https://vibe-coded.ai/account. Tell your agent: \\"upgrade my vibe-coded.ai plan or delete an unused vibe, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":5,"used":5,"plan":"free","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
+    '    emit \'{"success":false,"error":"Vibe limit reached (5/5). To make room, upgrade: Pro ($9/mo) supports up to 10 vibes; Pro+ ($20/mo) supports up to 25 vibes, at https://vibe-coded.ai/billing. Or delete a vibe you no longer need on the website (vibes are deleted only there): https://vibe-coded.ai/account. Tell your agent: \\"I upgraded my plan or deleted a vibe on vibe-coded.ai; check my vibe count, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":5,"used":5,"plan":"free","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
     '  else',
     '    printf \'%s\\n\' \'{"success":true,"vibe":{"id":1}}\'',
     '  fi',
@@ -736,7 +736,7 @@ test('buildMfOptions points the shim at the local server for signed file URLs', 
 
   assert.equal(options.bindings.PLATFORM_API_URL, `http://127.0.0.1:8788${DEV_PLATFORM_PREFIX}`);
   assert.match(DEV_PLATFORM_REFUSAL.error, /not available in vibe dev/);
-  assert.match(DEV_PLATFORM_REFUSAL.error, /vibe preview/);
+  assert.match(DEV_PLATFORM_REFUSAL.error, /test them on preview/);
 });
 
 test('withDispatchHeaders proves write mode with the per-run token', () => {
@@ -921,7 +921,7 @@ test('vibe dev never serves a manifest scratch file', () => {
 for (const [plan, bound, lines] of [
   ['free', false, [
     '  State:   .vibe-coded/dev/  (key-value, persisted)',
-    '  Plan:    Free — as deployed, env.VIBE_D1 throws the plan error and there is no env.VIBE_R2.',
+    '  Plan:    Free — SQL (env.VIBE_D1) and file storage (env.VIBE_R2) are not available.',
     '           SQL and files need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing',
   ]],
   ['byov', true, ['  State:   .vibe-coded/dev/  (SQL, key-value and files, persisted)', '  Plan:    Pro — SQL, key-value and files, as deployed.']],
@@ -958,26 +958,26 @@ for (const [plan, bound, lines] of [
     assert.deepEqual(options.r2Buckets, bound ? { VIBE_R2: 'VIBE_R2' } : undefined);
     const output = server.output();
     assert.ok(output.includes('  vibe dev — tester/demo (sql)\n'), output);
-    assert.ok(output.includes(lines.join('\n') + '\n  Watching worker for changes'), output);
+    assert.ok(output.includes('  Runtime: legacy\n' + lines.join('\n') + '\n  Watching worker for changes'), output);
     const file = await fetch(server.base + '/files/logo.png');
     assert.equal(file.status, 404);
     assert.deepEqual(await file.json(), { success: false, error: 'File not found' });
   });
 }
 
-test('vibe dev props on an unknown plan names the next step and prints no stack unless VIBE_DEBUG is set', () => {
+test('vibe dev --generation current (props) on an unknown plan names the next step and prints no stack unless VIBE_DEBUG is set', () => {
   const { root, runtimeDir, project, modules } = setupDevRuntime();
   try {
     writeFileSync(join(modules, 'miniflare', 'index.js'), `
       export class Miniflare { constructor() { console.log('Miniflare started'); } }
     `);
-    const run = (extra) => spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), '--generation', 'props'], {
+    const run = (extra) => spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), '--generation', 'current'], {
       cwd: project, encoding: 'utf8', timeout: 10000, env: { ...process.env, VIBE_DEV_PLAN: '', VIBE_DEBUG: '', ...extra },
     });
     const plain = run({});
     assert.equal(plain.status, 1);
     assert.match(plain.stderr, /vibe login/);
-    assert.match(plain.stderr, /--generation shim/);
+    assert.match(plain.stderr, /--generation legacy/);
     assert.doesNotMatch(plain.stderr, /\n\s+at /);
     assert.doesNotMatch(plain.stdout, /Miniflare started/);
     const debug = run({ VIBE_DEBUG: '1' });
@@ -1283,7 +1283,7 @@ test('vibe-cap guidance only names plans that raise the limit', () => {
   assert.equal(pro.status, 1);
   assert.doesNotMatch(pro.stderr, /Pro \(\$9|upgrade/i);
   assert.match(pro.stderr, /Pro\+ is the highest plan/);
-  assert.match(pro.stderr, /Tell your agent:.*delete an unused vibe/);
+  assert.match(pro.stderr, /https:\/\/vibe-coded\.ai\/account\. Tell your agent: "I deleted a vibe on vibe-coded\.ai; check my vibe count, then retry vibe init fresh-vibe\."/);
 
   const byov = runCli('init', ['fresh-vibe'], 'vibecapbyov');
   assert.equal(byov.status, 1);
@@ -1847,11 +1847,12 @@ test('a network failure is reported, not silent', () => {
   assert.match(r.stderr, /could not reach .* \(network error\)/);
 });
 
-test('vibe dev selects the nested preview generation, retains the shim default and permits an explicit override', () => {
+test('vibe dev selects the nested preview generation, defaults to the current generation and permits an explicit override', () => {
   for (const [info, args, expected] of [
     [{ success: true, vibe: { previewGeneration: 'props' } }, [], '--generation props'],
-    [{ success: true, vibe: {} }, [], '--generation shim'],
-    [{ success: true, generation: 'props', previewGeneration: 'props' }, [], '--generation shim'],
+    [{ success: true, vibe: { previewGeneration: 'shim' } }, [], '--generation shim'],
+    [{ success: true, vibe: {} }, [], '--generation props'],
+    [{ success: true, generation: 'shim', previewGeneration: 'shim' }, [], '--generation props'],
     [{ success: true, vibe: { previewGeneration: 'props' } }, ['--generation', 'shim'], '--generation props seed local.sql --generation shim'],
   ]) {
     const result = runCli('dev', ['seed', 'local.sql', ...args], 'normal', info);
@@ -2110,7 +2111,7 @@ test('props local storage enforces the shared ceiling per request, including dir
 
 test('props refuses unknown plans and generations before starting the runtime', () => {
   assert.throws(() => buildMfOptions('/tmp/dev', {}, {}, '', 8787, 'unknown', 'props'), /requires a known account plan/);
-  assert.throws(() => buildMfOptions('/tmp/dev', {}, {}, '', 8787, 'pro', 'other'), /generation must be shim or props/);
+  assert.throws(() => buildMfOptions('/tmp/dev', {}, {}, '', 8787, 'pro', 'other'), /generation must be legacy or current/);
 });
 
 test('props local storage round-trips R2, metadata, allocation, D1 batches and sessions, and persists across restarts', async (t) => {

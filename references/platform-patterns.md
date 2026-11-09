@@ -15,18 +15,18 @@ The platform answers CORS preflights before the worker; a vibe's page calls its 
 
 What counts as an API call, and what the worker can connect to: [plan terms](plan-terms.md).
 
-`usage` reports account-wide KV, SQL and file storage; SQL includes preview and production databases.
+`usage` reports account-wide key-value, SQL and file storage; SQL includes preview and production databases.
 Outbound `fetch`, outbound WebSocket and `EventSource` are allowed: 5 per request on Free, 20 on Pro, 50 on Pro+. Fetch follows redirects; each hop uses one slot. Builds refuse `cloudflare:sockets`, `node:net`/`net`, `node:tls`/`tls`, `node:module`/`module` (and `createRequire` through it) and non-literal dynamic `import()`, naming the file and line; this covers dependencies and emitted bundles. Default `node:process`/`process` imports work; builds reject process namespace/dynamic imports, `require`, star re-exports and named `getBuiltinModule` imports. A handler must send its first byte within 30 seconds or the platform answers 504. Work registered with `ctx.waitUntil` before returning may run until 140 seconds after the request opened; its storage calls count against the same per-request budget (see `worker-template.md`). Inbound WebSocket upgrades are refused with HTTP 400.
-Monthly calls include API calls, builds and storage operations at list price; KV, SQL and file calls share 500 units per Free request or 10,000 on Pro/Pro+ (reads 1; writes/lists/deletes 10 per key). Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
+Monthly calls include API calls, builds and storage operations at list price; key-value, SQL and file calls share 500 storage operations per request on Free, 10,000 on paid plans (a read counts 1; a write, list or delete counts 10 per key). Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
 MCP `usage` returns the plan's call cost for each preview build or publish as `monthlyCalls.buildCallEquivalent`; `vibe status --plan` prints the same cost.
 At the monthly allowance, `usage` reports `monthlyCalls.paused: true` and `monthlyCalls.pauseMessage`; its text and `vibe status --plan` name the paused operations, UTC reset date, and how to upgrade or wait. `create_vibe` and `vibe init` include the same warning in their creation notes. Creation still uses a vibe slot; builds remain paused. No pause warning appears under the allowance. An unavailable ledger leaves the status unknown unless the existing budget verdict keeps the account paused.
 
-Measured KV/file/SQL storage pauses worker requests and MCP tools past twice the plan's limit, or past the lowest paid limit for storage the plan does not include; HTTP returns 429 with reason storage_quota.
+Measured key-value, file and SQL storage pauses worker requests and MCP tools past twice the plan's limit, or past the lowest paid limit for storage the plan does not include; HTTP returns 429 with reason storage_quota.
 Owner totals pause all vibes; a SQL database past its pause threshold pauses its environment. At or below that threshold, writes are refused at the plan cap; reads and deletes work, including after downgrades.
 Free space through platform storage APIs or delete an unused vibe; SQL deletion requires a plan with SQL storage. Upgrades recheck immediately.
-Hourly checks restore access at or below the pause threshold, plus up to 60 seconds of caching and KV propagation; failed measurements retain the prior verdict. Static assets and file reads keep their usual gates.
+Hourly checks restore access at or below the pause threshold, plus up to 60 seconds of caching and key-value propagation; failed measurements retain the prior verdict. Static assets and file reads keep their usual gates.
 
-## KV (`env.VIBE_STORAGE`, every plan)
+## Key-value storage (`env.VIBE_STORAGE`, every plan)
 
 Store JSON strings under colon-separated keys (`items:<id>`). `list()` can miss
 a key written in the last minute, so "add, then list" needs a small "recent ids"
@@ -65,7 +65,7 @@ Need strictly consistent queries? Use SQL.
 Preview and production have separate databases; preview starts empty.
 On Free, `env.VIBE_D1` is bound but every call throws an error with
 `code: 'ENTITLEMENT_EXCEEDED'`, so `if (env.VIBE_D1)` does not detect the plan;
-catch that error, or keep Free data in KV.
+catch that error, or keep Free data in key-value storage.
 
 ```javascript
 async function _ensureTable(env) {            // call from write paths only; no "done" flag
@@ -126,9 +126,16 @@ no subqueries or `WITH`. Vibes on the older shared database name tables
 
 ## Files (`env.VIBE_R2`, Pro or Pro+)
 
-On Free, `env.VIBE_R2` is undefined; a worker that may run on Free checks it before use.
+On Free, `env.VIBE_R2` is bound but every call throws an error with
+`code: 'ENTITLEMENT_EXCEEDED'` (a 403 if uncaught), so `if (env.VIBE_R2)` does not
+detect the plan; catch that error:
 
-Static/source uploads accept only web asset extensions (html, htm, css, js, mjs, ts/tsx/jsx, vue, svelte, json/xml/yaml/yml/toml/csv/tsv, images, fonts, md/txt/pdf, gitignore/npmrc/nvmrc, lock/map) and named extensionless project files; any other file type goes to R2 and is served from `/files/<key>`.
+```javascript
+try { await env.VIBE_R2.put(key, bytes); }
+catch (e) { if (e.code === 'ENTITLEMENT_EXCEEDED') return { success: false, error: 'File storage needs Pro' }; throw e; }
+```
+
+Static/source uploads accept only web asset extensions (html, htm, css, js, mjs, ts/tsx/jsx, vue, svelte, json/xml/yaml/yml/toml/csv/tsv, images, fonts, md/txt/pdf, gitignore/npmrc/nvmrc, lock/map) and named extensionless project files; any other file type goes to file storage and is served from `/files/<key>`.
 
 In the worker:
 
@@ -151,7 +158,7 @@ key with nothing stored is 404 `File not found`), so a `files/` folder in the
 project is never served. Each read counts as a request against the vibe's daily
 and monthly limits.
 
-**Uploading from the browser:** large uploads go straight to R2 with a signed
+**Uploading from the browser:** large uploads go straight to file storage with a signed
 URL the worker mints:
 
 ```javascript
@@ -181,10 +188,10 @@ invoke them with call_tool. For an operation the worker does not expose, add an
 
 ### CLI only: file commands
 
-From a terminal with the CLI installed and signed in, use `vibe files upload|download|ls|rm|url` (alias `vibe r2`) (MCP: expose a worker tool and invoke it with call_tool).
+From a terminal with the CLI installed and signed in, use `vibe files upload|download|ls|rm|url` (MCP: expose a worker tool and invoke it with call_tool).
 These default to production's files; add `--preview` for the preview tree.
 The preview host serves the preview tree and the production host the production tree; upload to both when a page needs the file in both.
-`vibe files usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; account `usage` reports KV, SQL and file storage.
+`vibe files usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; account `usage` reports key-value, SQL and file storage.
 Signed uploads count at once; files the worker writes with `put()` count within the hour.
 
 **Check a private vibe with curl:** the token in `~/.vibe-coded/credentials.json`
@@ -263,7 +270,7 @@ non-`/api` route has the following capabilities:
 | Interaction policy | Anonymous `POST /webhooks/inbox` |
 |---|---|
 | `public` | Reaches the worker with storage writes and secrets. |
-| `authenticated` | Also reaches this non-`/api` route with storage writes and secrets; sign-in is required on `/api` routes. |
+| `authenticated` | Also reaches this non-`/api` route with storage writes and secrets; `/api` routes require sign-in, and a signed-in caller without a grant gets read mode there. |
 | `public_read` | Reaches the worker in read mode: storage writes are refused and secrets are hidden. Outbound fetches still run. |
 | `invite_only` | Receives 401 before the worker runs. |
 

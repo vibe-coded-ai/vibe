@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.58
+version: 4.7.62
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -13,7 +13,7 @@ allowed-tools:
   - AskUserQuestion
 arguments:
   - name: action
-    description: "Action: login, init, templates, dev, preview, publish, status, fetch, call, connect, urls, logs, settings, access, secrets, r2, delete (deploy is alias for preview)"
+    description: "Action: login, init, templates, dev, preview, publish, status, fetch, call, connect, urls, logs, settings, access, secrets, files, delete (deploy is alias for preview)"
     required: false
   - name: slug
     description: "Vibe slug (used with most actions)"
@@ -37,7 +37,7 @@ Ask (with `AskUserQuestion`) only if the request doesn't make it obvious:
 
 | If the user wants… | Path | Start with |
 |---|---|---|
-| Something their AI can **remember, look up, or update** (a tracker, log, journal, notes) | **A. Your AI's data** (default) | `vibe init --template tools <slug>` (KV, every plan) or `--template tools-sql` (SQL, needs Pro); rename the note record and its fields to fit |
+| Something their AI can **remember, look up, or update** (a tracker, log, journal, notes) | **A. Your AI's data** (default) | `vibe init --template tools <slug>` (key-value, every plan) or `--template tools-sql` (SQL, needs Pro); rename the note record and its fields to fit |
 | A **page or site** with no data | **B. Site** | `vibe init --template site <slug>` |
 | A **web app with a build step** (Vue) | **B. Web app** | `vibe init --template vue <slug>` |
 | To **host a project that already exists** | **C. Existing app** | `vibe init <slug>` in the project folder |
@@ -45,7 +45,7 @@ Ask (with `AskUserQuestion`) only if the request doesn't make it obvious:
 `vibe templates` lists every template from the platform; `vibe init --template <name>`
 downloads its files. These commands need a network connection. Prefer a template
 over hand-written files.
-`vibe status --plan` shows the plan (SQL, R2 and secrets need Pro).
+`vibe status --plan` shows the plan (SQL, file storage and secrets need Pro).
 Publishing needs a verified email. Open the link in your verification email,
 or resend it from https://vibe-coded.ai/account (Resend verification email).
 
@@ -155,7 +155,8 @@ Two settings, both changed on the web (the CLI prints the link):
   - `invite_only`: only the owner and people they grant.
   - `public_read`: anyone can read; only the owner and invited writers can change
     data. Use this (with `public` visibility) for a public read-only server.
-  - `authenticated`: any signed-in account can read, and write through `/api`.
+  - `authenticated`: any signed-in account can read through `/api` and MCP;
+    changing data there needs the owner or an invited writer.
   - `public`: any visitor can read, and write through `/api`.
 
   Uninvited callers are always read-only over MCP; MCP writes need an owner,
@@ -176,7 +177,7 @@ settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug
 | `templates` | List templates |
 | `list` | List your vibes; marks the current folder's vibe |
 | `source [path]` | List deployed source paths, sizes and etags, or read a file's exact bytes |
-| `dev [--port N] [--reset]` | Run locally on `127.0.0.1:8787` with local KV, SQL and R2; `dev seed file.sql` loads local SQL |
+| `dev [--port N] [--reset]` | Run locally on `127.0.0.1:8787` with local key-value, SQL and file storage; `dev seed file.sql` loads local SQL |
 | `preview` | Upload, build, and deploy to the preview URL |
 | `publish` | Promote the preview to production |
 | `call <tool> ['{json}'] [--production]` | Call one tool as the owner (preview build; `--production` for production) |
@@ -188,7 +189,7 @@ settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug
 | `settings [--title T]` | View settings, change the title; visibility and interaction are web-only |
 | `access list` | List collaborators; grants and revokes are web-only |
 | `secrets list\|create\|update\|delete NAME` | Write-only secrets (Pro), read in the worker as `env.NAME` |
-| `files upload\|download\|ls\|rm\|url` | Stored files (upload: Pro); `r2` is an alias |
+| `files upload\|download\|ls\|rm\|url` | Stored files (upload: Pro) |
 | `delete` | Prints the web link to delete the vibe |
 
 **Login:** run `vibe login --start`; it prints a link and a code. Give both to the
@@ -204,12 +205,12 @@ Never ask the user to paste a secret into chat. Each value may be at most 5 KB (
 bytes); oversized creates and updates return HTTP 400. Shorten the value before
 retrying.
 
-**`vibe dev` vs production:** locally there are no access checks, R2 signed URLs
+**`vibe dev` vs production:** locally there are no access checks, signed file URLs
 don't work, and `/mcp` supports only `initialize`,
 `tools/list` and `tools/call`.
 Check those on preview. Local secrets go in `.dev.vars`.
-`vibe dev` runs the generation your vibe is on; `--generation props`
-runs the adapter over local KV/R2/D1 with the plan's per-request ceiling and outbound
+`vibe dev` runs the generation your vibe is on; `--generation current`
+runs the adapter over local key-value, SQL and file storage with the plan's per-request ceiling and outbound
 allowance, state in `.vibe-coded/dev` (`--reset` clears it). Local behaviour is a
 convenience, not authority: verify access, entitlement and error shape on hosted preview.
 
@@ -220,9 +221,9 @@ Details and examples (including running SQL against a live vibe):
 
 | Binding | Storage | Plan |
 |---|---|---|
-| `env.VIBE_STORAGE` | KV: `.get` `.put` `.delete` `.list({prefix})` | every plan |
-| `env.VIBE_D1` | SQL (D1): `.prepare(sql).bind(...).run()` / `.all()` | Pro or Pro+ |
-| `env.VIBE_R2` | Files (R2): `.put` `.get` `.delete` `.list`; served at `/files/<key>`; `createUploadUrl(key, {contentLength, contentType})` for browser uploads | Pro or Pro+ |
+| `env.VIBE_STORAGE` | Key-value: `.get` `.put` `.delete` `.list({prefix})` | every plan |
+| `env.VIBE_D1` | SQL: `.prepare(sql).bind(...).run()` / `.all()` | Pro or Pro+ |
+| `env.VIBE_R2` | Files: `.put` `.get` `.delete` `.list`; served at `/files/<key>`; `createUploadUrl(key, {contentLength, contentType})` for browser uploads | Pro or Pro+ |
 
 - **`@mcp-expose`** on an `async function` makes it an MCP tool, served at
   `POST /api/<tool_name>`. Function names are snake_case; `env` is the last
@@ -231,14 +232,14 @@ Details and examples (including running SQL against a live vibe):
 - The frontend calls the worker with relative `/api/` paths, never absolute URLs.
 - Create SQL tables in code (`CREATE TABLE IF NOT EXISTS`); preview starts empty.
   Any Pro vibe can switch to SQL: use `env.VIBE_D1` and rebuild.
-- **KV `list()` lags new writes by up to a minute.** Don't build a list tool on
+- **Key-value `list()` lags new writes by up to a minute.** Don't build a list tool on
   `list()` alone; use the pattern in `references/platform-patterns.md` (the
   templates do), or use SQL.
-- KV, SQL and file calls share a per-request budget of 500 units on Free and 10,000 on Pro
-  and Pro+: a read costs 1, a write, list or delete 10 per key. Paginate large jobs
+- Key-value, SQL and file calls share a budget of 500 storage operations per request on
+  Free, 10,000 on paid plans (a read counts 1; a write, list or delete counts 10). Paginate large jobs
   across requests. A handler must send its first byte within 30 seconds or the
   platform answers 504.
-- Files and images go in R2, not base64 in KV.
+- Files and images go in file storage, not base64 in key-value.
 - Vue: use `createWebHashHistory()`, and keep `vite` in `devDependencies`.
 - Use one root worker: `worker.ts` or `worker.js`, not both, and not `src/worker.*`.
 

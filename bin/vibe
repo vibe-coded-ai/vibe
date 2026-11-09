@@ -2,6 +2,18 @@
 # vibe — CLI for vibe-coded.ai
 set -euo pipefail
 
+# A reader that stops early (`vibe status | head -1`) must end the CLI quietly,
+# which needs the default SIGPIPE action: a handled or ignored SIGPIPE makes the
+# next echo print "write error: Broken pipe". So no EXIT trap stays set while
+# the CLI writes output (bash handles fatal signals to run one), and a CLI
+# started with SIGPIPE ignored, which bash cannot reset, restarts once with the
+# default action through perl.
+if [ -p /dev/stdout ] && [ -z "${_VIBE_SIGPIPE_DEFAULT:-}" ] && command -v perl >/dev/null 2>&1; then
+  export _VIBE_SIGPIPE_DEFAULT=1
+  exec perl -e '$SIG{PIPE} = "DEFAULT"; exec { $ARGV[0] } @ARGV or exit 127' "$BASH" "$0" "$@"
+fi
+unset _VIBE_SIGPIPE_DEFAULT
+
 CREDS="$HOME/.vibe-coded/credentials.json"
 API_BASE="https://api.vibe-coded.ai"
 WEB_BASE="https://vibe-coded.ai"
@@ -137,8 +149,6 @@ _print_tool_count() {
   fi
 }
 
-trap 'unset TOKEN 2>/dev/null' EXIT
-
 # A refused _api call leaves "__rate_limited <seconds> [address|account]" as
 # its output (the second word is whose counter ran out). True when $1 is that
 # marker; sleeps the delay (capped at 30 s) so a wait loop can poll again
@@ -155,20 +165,31 @@ _api_was_rate_limited() {
   sleep "$wait"
 }
 
+# Reports a failed mktemp, which would otherwise surface as a curl failure.
+_tmpfile_error() {
+  echo "Error: Could not create a temporary file in ${TMPDIR:-/tmp} (check that it exists, is writable and has free space)." >&2
+}
+
 _api() {
-  local method="$1" path="$2" result http_status body headers retry_after
+  local method="$1" path="$2" result http_status body headers retry_after curl_status=0
   shift 2
-  headers=$(mktemp)
+  headers=$(mktemp) || { _tmpfile_error; return 1; }
   # Pass Authorization header via curl --config stdin so the Bearer token
   # never appears in argv and is not visible to other users via `ps`.
-  if ! result=$(curl -s -K - -D "$headers" -X "$method" "${API_URL}${path}" \
+  result=$(curl -s -K - -D "$headers" -X "$method" "${API_URL}${path}" \
     -H "Content-Type: application/json" \
     -H "User-Agent: vibe-cli/1.0" \
     "$@" \
     -w $'\n%{http_code}' \
-    <<<"header = \"Authorization: Bearer ${TOKEN}\""); then
+    <<<"header = \"Authorization: Bearer ${TOKEN}\"") || curl_status=$?
+  if [ "$curl_status" -ne 0 ]; then
     rm -f "$headers"
-    echo "Error: could not reach ${API_URL} (network error). Check your connection and retry." >&2
+    # curl 23 (write) and 26 (read) are local file failures: the header file
+    # or an @file request body in the temporary directory.
+    case "$curl_status" in
+      23|26) _tmpfile_error ;;
+      *) echo "Error: could not reach ${API_URL} (network error). Check your connection and retry." >&2 ;;
+    esac
     return 1
   fi
   http_status="${result##*$'\n'}"
@@ -213,8 +234,8 @@ _api() {
     if _is_build_limit_error "$body" 2>/dev/null; then _build_limit_hint "$body"; fi
     # A per-minute bucket refilling within a minute is worth one pause; a build
     # cap or a longer Retry-After is the caller's to report.
-    if [ "${_API_RETRIED:-0}" = 0 ] && [ "${WAIT_FOR_BUILD_LIMIT:-0}" != 1 ] && [ "${_API_NO_RETRY:-0}" != 1 ] \
-       && [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -le 60 ] && ! _is_build_limit_error "$body" 2>/dev/null; then
+    if [ "${_API_RETRIED:-0}" = 0 ] && [ "${WAIT_FOR_BUILD_LIMIT:-0}" != 1 ] \
+       && _rate_limit_wait_ok "$retry_after" && ! _is_build_limit_error "$body" 2>/dev/null; then
       echo "Too many requests; retrying in $retry_after second$([ "$retry_after" = 1 ] || echo s)…" >&2
       sleep "$retry_after"
       _API_RETRIED=1 _api "$method" "$path" "$@"
@@ -229,6 +250,12 @@ _api() {
     return 1
   fi
   printf '%s' "$body"
+}
+
+# A 429 whose Retry-After is at most a minute is a request bucket refilling;
+# every API call waits it out once unless the caller asked for no retry.
+_rate_limit_wait_ok() {
+  [ "${_API_NO_RETRY:-0}" != 1 ] && [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -le 60 ]
 }
 
 # Plan gate (API code ENTITLEMENT_EXCEEDED): say what happened, what unlocks it,
@@ -947,20 +974,25 @@ cmd_source() {
     # Encode each segment so filenames cannot inject a query or fragment.
     encoded=$(printf '%s' "$1" | jq -sRr 'split("/") | map(@uri) | join("/")')
     local out http_status retry_after="" attempt
-    out=$(mktemp)
-    local hdrs; hdrs=$(mktemp)
-    # A per-minute bucket refilling within seconds is worth one pause, as in _api.
+    out=$(mktemp) || { _tmpfile_error; exit 1; }
+    local hdrs; hdrs=$(mktemp) || { rm -f "$out"; _tmpfile_error; exit 1; }
+    # The same single pause as _api.
     for attempt in 1 2; do
-      if ! http_status=$(curl -sS -K - -o "$out" -D "$hdrs" -w '%{http_code}' "${API_URL}${endpoint}/${encoded}" \
+      local curl_status=0
+      http_status=$(curl -sS -K - -o "$out" -D "$hdrs" -w '%{http_code}' "${API_URL}${endpoint}/${encoded}" \
         -H "User-Agent: vibe-cli/1.0" \
-        <<<"header = \"Authorization: Bearer ${TOKEN}\""); then
+        <<<"header = \"Authorization: Bearer ${TOKEN}\"") || curl_status=$?
+      if [ "$curl_status" -ne 0 ]; then
         rm -f "$out" "$hdrs"
-        echo "Error: could not reach ${API_URL} (network error). Check your connection and retry." >&2
+        # curl 23 is a failed write to the temporary output or header file.
+        if [ "$curl_status" -eq 23 ]; then _tmpfile_error
+        else echo "Error: could not reach ${API_URL} (network error). Check your connection and retry." >&2
+        fi
         exit 1
       fi
       [ "$http_status" = "429" ] || break
       retry_after=$(awk 'tolower($1) == "retry-after:" { value = $2; sub(/\r$/, "", value) } END { print value }' "$hdrs")
-      [ "$attempt" = 1 ] && [[ "$retry_after" =~ ^[0-9]+$ ]] && [ "$retry_after" -le 5 ] || break
+      [ "$attempt" = 1 ] && _rate_limit_wait_ok "$retry_after" || break
       echo "Too many requests; retrying in $retry_after second$([ "$retry_after" = 1 ] || echo s)…" >&2
       sleep "$retry_after"
     done
@@ -1297,8 +1329,8 @@ cmd_preview() {
   fi
 
   # Use tempfile + --data-binary @file so payload bypasses ARG_MAX (macOS: 1MB)
-  TMP_PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/vibe-upload.XXXXXX")
-  printf '%s' "$PAYLOAD" > "$TMP_PAYLOAD"
+  TMP_PAYLOAD=$(mktemp "${TMPDIR:-/tmp}/vibe-upload.XXXXXX") || { _tmpfile_error; exit 1; }
+  printf '%s' "$PAYLOAD" > "$TMP_PAYLOAD" || { rm -f "$TMP_PAYLOAD"; _tmpfile_error; exit 1; }
   if ! UPLOAD=$(_api_wait_for_build POST "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/source" --data-binary "@$TMP_PAYLOAD"); then
     rm -f "$TMP_PAYLOAD"
     # _api has already said why (network error or expired login). A refused
@@ -1537,8 +1569,8 @@ cmd_publish() {
   fi
 
   _check_success "$RESULT" "Publish"
-  # The promotion record and the preview build production serves, named as
-  # vibe status names them.
+  # The preview build production serves (get_vibe's productionBuildId) and
+  # the promotion record that put it there.
   local promoted served current=""
   promoted=$(printf '%s' "$RESULT" | jq -r '.promotionBuildId // empty | numbers' 2>/dev/null) || promoted=""
   [ -n "$promoted" ] || promoted="${promotion_id:-}"
@@ -1573,9 +1605,9 @@ cmd_publish() {
   fi
   [ -n "$served" ] || served=$(printf '%s' "$current" | jq -r '(.vibe.productionBuildId // .productionBuildId) // empty | numbers' 2>/dev/null) || served=""
   if [ -n "$promoted" ] && [ -n "$served" ]; then
-    echo "Production build $promoted (promoted from preview build $served)."
+    echo "Production serves preview build $served (promotion $promoted)."
   elif [ -n "$promoted" ]; then
-    echo "Production build $promoted."
+    echo "Promotion $promoted finished."
   elif [ -n "$served" ]; then
     echo "Production serves preview build $served."
   fi
@@ -1932,8 +1964,8 @@ cmd_fetch() {
   [ "$env" = "preview" ] && prefix="p--"
   local url="https://${prefix}${USER_SLUG}--${VIBE_SLUG}.vibe-coded.ai${path}"
   local out headers http_status
-  out=$(mktemp)
-  headers=$(mktemp)
+  out=$(mktemp) || { _tmpfile_error; exit 1; }
+  headers=$(mktemp) || { rm -f "$out"; _tmpfile_error; exit 1; }
   http_status=$(curl -K - -X "$method" "${request_args[@]}" -D "$headers" -o "$out" -w '%{http_code}' "$url" \
     -H "User-Agent: vibe-cli/1.0" \
     <<<"header = \"Authorization: Bearer ${TOKEN}\"") \
@@ -3131,26 +3163,27 @@ NODE
       [ -n "$waiting" ] || { waiting=1; echo "Waiting for another vibe dev to finish installing in $deps_dir …"; }
       sleep 1
     done
-    trap "rmdir $(printf '%q' "$lock") 2>/dev/null; unset TOKEN 2>/dev/null" EXIT
+    trap "rmdir $(printf '%q' "$lock") 2>/dev/null" EXIT
     if [ ! -f "$deps_dir/installed" ]; then
-      echo "First run: installing local dev dependencies (miniflare, esbuild, chokidar) in $deps_dir …"
+      echo "First run: installing local dev dependencies in $deps_dir …"
       mkdir -p "$deps_dir" && cp "$skill_dir/package.json" "$deps_dir/package.json" \
         && ( cd "$deps_dir" && npm install --silent ) && touch "$deps_dir/installed" \
         || { echo "Error: npm install failed in $deps_dir." >&2; exit 1; }
     fi
     rmdir "$lock"
-    trap 'unset TOKEN 2>/dev/null' EXIT
+    trap - EXIT
   fi
 
   # Storage is bound as the account's plan deploys it. Signed out, offline or
-  # on a failed read the plan is unknown (props refuses; the legacy shim keeps
-  # its offline bindings). --retry 0
-  # keeps a ~/.curlrc retry setting from stretching the 5 s cap.
-  local plan="" generation="shim" info
+  # on a failed read the plan is unknown (the current generation refuses; the
+  # legacy one keeps its offline bindings). The generation is the preview's,
+  # or the current one that new vibes are built with when there is no preview
+  # yet. --retry 0 keeps a ~/.curlrc retry setting from stretching the 5 s cap.
+  local plan="" generation="props" info
   if [ -f "$CREDS" ]; then
     plan=$( (_load_creds && _API_NO_RETRY=1 _plan_lookup "" --retry 0 --connect-timeout 3 --max-time 5 | jq -r '.plan') 2>/dev/null ) || plan=""
     if info=$( (_load_creds && _API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" --retry 0 --connect-timeout 3 --max-time 5) 2>/dev/null ); then
-      generation=$(printf '%s' "$info" | jq -r '.vibe.previewGeneration // "shim"') || generation="shim"
+      generation=$(printf '%s' "$info" | jq -r '.vibe.previewGeneration // "props"') || generation="props"
     fi
   fi
   export VIBE_DEV_DEPS="$deps_dir" VIBE_DEV_PLAN="${plan:-unknown}"
@@ -3212,7 +3245,7 @@ _print_command_help() {
     templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates served by the platform." ;;
     list) printf '%s\n' "Usage: vibe list" "List your vibes; * marks the current folder's vibe. No manifest needed." ;;
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
-    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation shim|props] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan and generation once (Free: no SQL or files). Runs the same runtime as your hosted preview; --generation overrides it." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
+    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation legacy|current] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state." "Signed in, it reads your plan and generation once (Free: no SQL or files). Runs the same runtime as your hosted preview, or the current one before the first preview; --generation overrides it." "On first run of each skill version, installs miniflare, esbuild and chokidar with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
     preview|deploy) printf '%s\n' "Usage: vibe preview [--prune|--no-prune]" "Mirror local source to preview and wait for its build." "Uploads are limited to 30 an hour per account and address, separate from the build allowance." ;;
     publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." "Preview data does not carry to production; production keeps its own data." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." "--plan shows your plan instead: monthly calls, vibes, preview builds and source uploads used. No .vibe-coded.json needed." ;;

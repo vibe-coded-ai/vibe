@@ -8,7 +8,7 @@ import { D1EntitlementError } from './client-adapter.js';
 
 export { VibeStorageDO, AccountBudgetDO };
 
-const SIGNED_URL_REFUSAL = 'Signed file URLs (createUploadUrl, createDownloadUrl) are not available in vibe dev; env.VIBE_R2 put, get, list and delete work locally. Test signed URLs on the preview: vibe preview.';
+const SIGNED_URL_REFUSAL = 'Signed file links are not available in vibe dev; test them on preview.';
 const INVALID_STATEMENT = 'Invalid SQL statement: prepare() takes a non-empty SQL string of at most 100,000 characters and at most 100 parameters';
 const INVALID_PARAMETER = 'Invalid SQL parameter: use strings, numbers, booleans, null or bytes (at most 100)';
 const INVALID_BATCH = 'batch() takes 1 to 100 statements made with prepare()';
@@ -38,9 +38,9 @@ async function initializeRegistry(env, config) {
 // retained Free database locally, so the broker's kept rules never apply here.
 function localD1(env, ctx, props) {
   function requireDatabase() {
-    if (!getPlan(props.plan)) throw new Error('D1 owner plan unavailable');
+    if (!getPlan(props.plan)) throw new Error('SQL is temporarily unavailable; retry shortly.');
     if (!planHasFeature(props.plan, 'd1_storage') || !env.VIBE_D1) throw new D1EntitlementError(D1_ENTITLEMENT_REQUIRED);
-    if (!env.BUDGET_DO) throw new Error('D1 usage accounting unavailable');
+    if (!env.BUDGET_DO) throw new Error('SQL is temporarily unavailable; retry shortly.');
     if (Date.now() > props.openedAt + 140_000) throw new Error('Storage usage reporting unavailable; further storage operations are refused');
   }
   function descriptor(value) {
