@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 4.7.67
+version: 4.7.71
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -209,9 +209,8 @@ retrying.
 don't work, and `/mcp` supports only `initialize`,
 `tools/list` and `tools/call`.
 Check those on preview. Local secrets go in `.dev.vars`.
-`vibe dev` runs the generation your vibe is on; `--generation current`
-runs the adapter over local key-value, SQL and file storage with the plan's per-request ceiling and outbound
-allowance, state in `.vibe-coded/dev` (`--reset` clears it). Local behaviour is a
+`vibe dev` applies the plan's per-request storage ceiling and outbound allowance and keeps
+state in `.vibe-coded/dev` (`--reset` clears it). Local behaviour is a
 convenience, not authority: verify access, entitlement and error shape on hosted preview.
 
 ## 8. Writing worker code
@@ -235,8 +234,9 @@ Details and examples (including running SQL against a live vibe):
 - **Key-value `list()` lags new writes by up to a minute.** Don't build a list tool on
   `list()` alone; use the pattern in `references/platform-patterns.md` (the
   templates do), or use SQL.
-- Key-value, SQL and file calls share a budget of 500 storage operations per request on
-  Free, 10,000 on paid plans (a read counts 1; a write, list or delete counts 10). Paginate large jobs
+- Key-value and file calls share a budget of 500 storage operations per request on
+  Free, 10,000 on paid plans (a read counts 1; a write, list or delete counts 10); SQL is
+  outside it, and SQL rows written count toward monthly calls. Paginate large jobs
   across requests. A handler must send its first byte within 30 seconds or the
   platform answers 504.
 - Files and images go in file storage, not base64 in key-value.

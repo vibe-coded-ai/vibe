@@ -147,7 +147,7 @@ export function withLocalStorage(adapter) { return {
       USER_SLUG: config.userSlug, VIBE_ENV: 'preview' };
     try {
       return await withLocalOutbound(props, () => adapter.fetch(new Request(request, { headers }), authorEnv, {
-        props: { STORAGE: storage }, waitUntil: task => ctx.waitUntil(task),
+        props: { STORAGE: storage, mode: props.mode }, waitUntil: task => ctx.waitUntil(task),
         passThroughOnException: () => ctx.passThroughOnException(),
       }));
     } catch (error) {

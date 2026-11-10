@@ -17,7 +17,7 @@ What counts as an API call, and what the worker can connect to: [plan terms](pla
 
 `usage` reports account-wide key-value, SQL and file storage; SQL includes preview and production databases.
 Outbound `fetch`, outbound WebSocket and `EventSource` are allowed: 5 per request on Free, 20 on Pro, 50 on Pro+. Fetch follows redirects; each hop uses one slot. Builds refuse `cloudflare:sockets`, `node:net`/`net`, `node:tls`/`tls`, `node:module`/`module` (and `createRequire` through it) and non-literal dynamic `import()`, naming the file and line; this covers dependencies and emitted bundles. Default `node:process`/`process` imports work; builds reject process namespace/dynamic imports, `require`, star re-exports and named `getBuiltinModule` imports. A handler must send its first byte within 30 seconds or the platform answers 504. Work registered with `ctx.waitUntil` before returning may run until 140 seconds after the request opened; its storage calls count against the same per-request budget (see `worker-template.md`). Inbound WebSocket upgrades are refused with HTTP 400.
-Monthly calls include API calls, builds and storage operations at list price; key-value, SQL and file calls share 500 storage operations per request on Free, 10,000 on paid plans (a read counts 1; a write, list or delete counts 10 per key). Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
+Monthly calls include API calls, builds, storage operations and SQL rows written. Key-value and file calls share 500 storage operations per request on Free, 10,000 on paid plans (a read counts 1; a write, list or delete counts 10 per key) and are charged to monthly calls in the same proportion; SQL calls are outside the per-request budget. Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
 MCP `usage` returns the plan's call cost for each preview build or publish as `monthlyCalls.buildCallEquivalent`; `vibe status --plan` prints the same cost.
 At the monthly allowance, `usage` reports `monthlyCalls.paused: true` and `monthlyCalls.pauseMessage`; its text and `vibe status --plan` name the paused operations, UTC reset date, and how to upgrade or wait. `create_vibe` and `vibe init` include the same warning in their creation notes. Creation still uses a vibe slot; builds remain paused. No pause warning appears under the allowance. An unavailable ledger leaves the status unknown unless the existing budget verdict keeps the account paused.
 
@@ -120,9 +120,7 @@ with the refreshed credentials. Never paste the token into output.
 
 `action` is `tables`, `query` (SELECT), `execute` (INSERT/UPDATE/DELETE),
 `schema` or `usage`. One statement per request, values as `?` with `params`,
-no subqueries or `WITH`. Vibes on the older shared database name tables
-`vibe_<id>_<table>` in raw SQL (`id` from `GET /api/v1/vibes/<user>/<slug>`);
-`tables` lists the short names.
+no subqueries or `WITH`.
 
 ## Files (`env.VIBE_R2`, Pro or Pro+)
 

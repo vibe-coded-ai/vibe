@@ -1907,17 +1907,15 @@ test('a network failure is reported, not silent', () => {
   assert.match(r.stderr, /could not reach .* \(network error\)/);
 });
 
-test('vibe dev selects the nested preview generation, defaults to the current generation and permits an explicit override', () => {
+test('vibe dev runs the current generation whatever the hosted vibe records and permits an explicit override', () => {
   for (const [info, args, expected] of [
-    [{ success: true, vibe: { previewGeneration: 'props' } }, [], '--generation props'],
-    [{ success: true, vibe: { previewGeneration: 'shim' } }, [], '--generation shim'],
-    [{ success: true, vibe: {} }, [], '--generation props'],
-    [{ success: true, generation: 'shim', previewGeneration: 'shim' }, [], '--generation props'],
-    [{ success: true, vibe: { previewGeneration: 'props' } }, ['--generation', 'shim'], '--generation props seed local.sql --generation shim'],
+    [{ success: true, vibe: { previewGeneration: 'props' } }, [], '--generation props seed local.sql'],
+    [{ success: true, vibe: { previewGeneration: 'shim' } }, [], '--generation props seed local.sql'],
+    [{ success: true, vibe: { previewGeneration: 'shim' } }, ['--generation', 'shim'], '--generation props seed local.sql --generation shim'],
   ]) {
     const result = runCli('dev', ['seed', 'local.sql', ...args], 'normal', info);
     assert.equal(result.status, 0, result.stderr);
-    assert.match(result.calls, /^GET\t[^\n]*\/tester\/demo\t/m);
+    assert.doesNotMatch(result.calls, /\/tester\/demo\t/);
     assert.ok(result.calls.includes(expected), result.calls);
   }
 });
@@ -2066,11 +2064,14 @@ test('vibe dev shim and props outbound parity', async (t) => {
     }
   });
   await t.test('the sixth Free fetch refuses with the allowance message and each request gets a fresh allowance', () => {
-    const error = 'Outbound subrequest limit exceeded: 5 per request; one platform slot is reserved for storage usage';
+    const errors = {
+      shim: 'Outbound subrequest limit exceeded: 5 per request; one platform slot is reserved for storage usage',
+      props: 'Outbound request limit reached: 5 per request on your plan.',
+    };
     for (const generation of ['shim', 'props']) for (const path of ['/limit', '/limit/again']) {
       const results = observed[generation][path];
       assert.deepEqual(results.slice(0, 5), Array(5).fill(success), generation + path);
-      assert.equal(results[5].error ?? JSON.parse(results[5].body).error, error, generation + path);
+      assert.equal(results[5].error ?? JSON.parse(results[5].body).error, errors[generation], generation + path);
       if (generation === 'props') assert.equal(results[5].status, 502);
     }
     assert.equal(observed.seen.filter(value => new URL(value.url).pathname === '/allowed').length, 20);
@@ -2154,11 +2155,12 @@ test('props local storage enforces the shared ceiling per request, including dir
       catch (error) { message = error.message; break; }
     }
     return Response.json({ completed, message, platformBinding: typeof env.BUDGET_DO,
-      token: typeof env.PLATFORM_VIBE_TOKEN, mode: request.headers.get('x-vibe-access-mode') });
+      token: typeof env.PLATFORM_VIBE_TOKEN, mode: request.headers.get('x-vibe-access-mode'), secret: env.LOCAL_SECRET });
   } };`);
+  writeFileSync(join(project, '.dev.vars'), 'LOCAL_SECRET=local-value');
   const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'free' }, ['--generation', 'props']);
   if (!server) return;
-  const expected = { completed: 500, platformBinding: 'undefined', token: 'undefined', mode: null };
+  const expected = { completed: 500, platformBinding: 'undefined', token: 'undefined', mode: null, secret: 'local-value' };
   for (let i = 0; i < 2; i++) {
     const { message, ...rest } = await (await fetch(server.base + '/api/ceiling')).json();
     assert.deepEqual(rest, expected);

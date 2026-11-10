@@ -93,6 +93,27 @@ test('a promotion the platform reports failed says failed', () => {
   assert.doesNotMatch(result.stdout, /Published!/);
 });
 
+test('a failed promotion whose message names the next command is not told to publish again', () => {
+  const result = runPublish([
+    ['/builds/2035', [build('building'), build('failed', { errorMessage: 'Not deployed: this preview cannot be published. Run vibe preview to build a new one, then publish that' })]],
+    ['/builds?limit=1', [BUILDS]],
+    ['/publish', [PENDING]],
+  ]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Publish failed: production promotion 2035 failed: Not deployed: this preview cannot be published\. Run vibe preview to build a new one, then publish that\.\n$/);
+  assert.doesNotMatch(result.stderr, /Run vibe publish again/);
+});
+
+test('a failed promotion whose message names no command is told to publish again', () => {
+  const result = runPublish([
+    ['/builds/2035', [build('failed', { errorMessage: 'Not deployed: the build service was at capacity and this publish did not start within 10 minutes' })]],
+    ['/builds?limit=1', [BUILDS]],
+    ['/publish', [PENDING]],
+  ]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /did not start within 10 minutes\. Run vibe publish again\.\n$/);
+});
+
 test('a promotion still running at the limit says still publishing, not failed', () => {
   const result = runPublish([
     ['/builds/2035', [build('building')]],

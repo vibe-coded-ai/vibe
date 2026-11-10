@@ -1446,12 +1446,14 @@ cmd_preview() {
     exit 0
   fi
 
-  # Poll for build. The platform caps a build at 10 minutes
-  # (build-runner TOTAL_BUILD_TIMEOUT_MS), so wait up to that, not 120s.
+  # Poll for build. A build first waits for any other build on the account and
+  # for the build service to start it, with no fixed limit on that wait, then
+  # runs for up to 10 minutes (build-runner TOTAL_BUILD_TIMEOUT_MS). max_wait
+  # is how long this command keeps polling, not a platform limit.
   # Only trust a build that is NEWER than the one that existed before this
   # upload — a stale prior build can otherwise read as an instant success.
-  echo "Waiting for build (up to 10 minutes)..."
-  local elapsed=0 interval=5 max_wait=600 started_build_id=""
+  echo "Waiting for build (it starts after any other build on your account, then runs for up to 10 minutes)..."
+  local elapsed=0 interval=5 max_wait=1260 started_build_id=""
   while [ "$elapsed" -lt "$max_wait" ]; do
     sleep "$interval"
     elapsed=$((elapsed + interval))
@@ -1512,7 +1514,7 @@ cmd_preview() {
       exit 1
     fi
   done
-  echo "Build still in progress after ${max_wait}s (platform limit is 10 minutes). Run 'vibe status' to check." >&2
+  echo "Build still in progress after ${max_wait}s. Run 'vibe status' to check." >&2
   exit 1
 }
 
@@ -1586,13 +1588,14 @@ cmd_publish() {
   done
 
   # The platform stops waiting after ~25s; a slow promotion is not a failure.
-  # Keep polling it, up to the 10-minute build limit.
+  # Keep polling for max_wait: a promotion can wait behind another build on
+  # the account before it runs.
   local pending_msg promotion_id
   pending_msg=$(echo "$RESULT" | jq -r 'select((.success // false) != true) | .error // empty' 2>/dev/null) || pending_msg=""
   if [[ "$pending_msg" =~ ^Production\ promotion\ ([0-9]+)\ is\ still\ in\ progress ]]; then
     promotion_id="${BASH_REMATCH[1]}"
     echo "Promotion $promotion_id is taking longer than 25 seconds; still waiting…"
-    local elapsed=25 interval=5 max_wait=600 build status waiting_reason
+    local elapsed=25 interval=5 max_wait=1260 build status waiting_reason detail
     while :; do
       if [ "$elapsed" -ge "$max_wait" ]; then
         echo "Still publishing (promotion $promotion_id). Production switches when it finishes; run 'vibe status' in a minute." >&2
@@ -1611,7 +1614,12 @@ cmd_publish() {
       case "$status" in
         succeeded) break ;;
         failed|canceled)
-          echo "Publish failed: production promotion $promotion_id $status: $(echo "$build" | jq -r '.build.errorMessage // "no detail"'). Run vibe publish again." >&2
+          # A message that names a vibe command carries its own next step.
+          detail=$(echo "$build" | jq -r '.build.errorMessage // "no detail"')
+          case "$detail" in
+            *"vibe preview"*|*"vibe publish"*) echo "Publish failed: production promotion $promotion_id $status: ${detail%.}." >&2 ;;
+            *) echo "Publish failed: production promotion $promotion_id $status: $detail. Run vibe publish again." >&2 ;;
+          esac
           exit 1
           ;;
       esac
@@ -3198,9 +3206,8 @@ cmd_dev() {
   # project: dev needs the account plan, not a vibe on the platform. The owner is
   # the signed-in account, the slug comes from the folder name, and storage is
   # SQL when the worker uses env.VIBE_D1.
-  local type storage local_project=""
+  local type storage
   if [ ! -f .vibe-coded.json ] && { _has_worker || [ -f index.html ]; }; then
-    local_project=1
     type="fullstack"
     _has_worker || type="static"
     storage="kv"
@@ -3330,12 +3337,10 @@ NODE
 
   # Storage is bound as the account's plan deploys it. Signed out, offline or
   # on a failed read the plan is unknown (the current generation refuses; the
-  # legacy one keeps its offline bindings). The generation is the preview's,
-  # or the current one that new vibes are built with when there is no preview
-  # yet. --retry 0 keeps a ~/.curlrc retry setting from stretching the 5 s cap.
-  # VIBE_DEV_PLAN_ERROR carries why the plan is unknown, for the error the
-  # current generation reports.
-  local plan="" plan_error="You are not signed in; run vibe login." generation="props" info lookup
+  # legacy one keeps its offline bindings). --retry 0 keeps a ~/.curlrc retry
+  # setting from stretching the 5 s cap. VIBE_DEV_PLAN_ERROR carries why the
+  # plan is unknown, for the error the current generation reports.
+  local plan="" plan_error="You are not signed in; run vibe login." lookup
   if [ -f "$CREDS" ]; then
     plan_error=""
     if lookup=$( (_load_creds && _API_NO_RETRY=1 _plan_lookup "" --retry 0 --connect-timeout 3 --max-time 5) 2>&1 ); then
@@ -3350,15 +3355,14 @@ NODE
       esac
     fi
     [ -n "$plan" ] || [ -n "$plan_error" ] || plan_error="The plan lookup returned no plan."
-    if [ -z "$local_project" ] && info=$( (_load_creds && _API_NO_RETRY=1 _api GET "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG" --retry 0 --connect-timeout 3 --max-time 5) 2>/dev/null ); then
-      generation=$(printf '%s' "$info" | jq -r '.vibe.previewGeneration // "props"') || generation="props"
-    fi
   fi
   export VIBE_DEV_DEPS="$deps_dir" VIBE_DEV_PLAN="${plan:-unknown}" VIBE_DEV_PLAN_ERROR="$plan_error"
 
   # The process keeps "vibe dev <args>" as its name, so pkill -f "vibe dev"
-  # and pkill -f "vibe dev --port N" both find it.
-  exec -a "vibe dev${*:+ $*}" node "$skill_dir/runtime/dev-server.mjs" --generation "$generation" "$@"
+  # and pkill -f "vibe dev --port N" both find it. The current generation is
+  # the default whatever the hosted vibe records; a --generation in the
+  # arguments comes later and wins.
+  exec -a "vibe dev${*:+ $*}" node "$skill_dir/runtime/dev-server.mjs" --generation props "$@"
 }
 
 _print_command_help() {
@@ -3413,7 +3417,7 @@ _print_command_help() {
     templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates served by the platform." ;;
     list) printf '%s\n' "Usage: vibe list" "List your vibes; * marks the current folder's vibe. No manifest needed." ;;
     source) printf '%s\n' "Usage: vibe source [path]" "List deployed source paths, sizes and etags, or write a file's exact bytes to stdout. Uses .vibe-coded.json." ;;
-    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation legacy|current] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state. Works before vibe init: the folder needs a worker or index.html." "Signed in, it reads your plan and generation once (Free: no SQL or files). Runs the same runtime as your hosted preview, or the current one before the first preview; --generation overrides it." "On first run of each skill version, installs miniflare, esbuild, chokidar and acorn with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
+    dev) printf '%s\n' "Usage: vibe dev [--port N] [--reset] [--generation legacy|current] | vibe dev seed <file.sql>" "Run the worker and local storage on this machine; --reset clears local state. Works before vibe init: the folder needs a worker or index.html." "Signed in, it reads your plan once (Free: no SQL or files). Runs the current runtime; --generation legacy runs the older one." "On first run of each skill version, installs miniflare, esbuild, chokidar and acorn with npm in ${XDG_CACHE_HOME:-$HOME/.cache}/vibe-coded/dev-runtime." ;;
     preview|deploy) printf '%s\n' "Usage: vibe preview [--prune|--no-prune]" "Mirror local source to preview and wait for its build." "Uploads are limited to 30 an hour per account and address, separate from the build allowance." ;;
     publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." "Preview data does not carry to production; production keeps its own data." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." "--plan shows your plan instead: monthly calls, vibes, preview builds and source uploads used. No .vibe-coded.json needed." ;;
