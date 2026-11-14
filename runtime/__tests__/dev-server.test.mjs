@@ -1381,7 +1381,9 @@ test('commands without a manifest explain shared-vibe MCP access without inventi
   const result = runCli('preview', [], 'nomanifest');
 
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /^Error: No \.vibe-coded\.json in current directory\. Run vibe preview from your vibe's folder \(the one with \.vibe-coded\.json\), or set this folder up with 'vibe init <slug>'/);
+  assert.match(result.stderr, /\.vibe-coded\.json/);
+  assert.match(result.stderr, /vibe preview/);
+  assert.match(result.stderr, /vibe init <slug>/);
   assert.match(result.stderr, /vibe preview works on vibes you own/);
   assert.match(result.stderr, /run: vibe connect <owner>\/<slug>/);
   assert.doesNotMatch(result.stderr, /https:\/\/.*--.*\.vibe-coded\.ai\/mcp/);

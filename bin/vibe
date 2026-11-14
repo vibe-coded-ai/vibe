@@ -3412,7 +3412,7 @@ _print_command_help() {
 
   case "$command" in
     login) printf '%s\n' "Usage: vibe login [email] [--start|--finish]" "Sign in through the browser flow, or use the password fallback with an email." ;;
-    logout) printf '%s\n' "Usage: vibe logout" "Remove local CLI credentials and attempt best-effort revocation." ;;
+    logout) printf '%s\n' "Usage: vibe logout" "Remove local CLI credentials. To revoke the token everywhere, use Revoke all on the account page." ;;
     init) printf '%s\n' "Usage: vibe init [--template <name>] <slug> [--title \"My App\"] [--storage kv|sql] [--visibility private] [--adopt]" "Create or adopt a vibe you own and write .vibe-coded.json." "For a vibe someone shared with you, vibe init <owner>/<slug> points you to: vibe connect <owner>/<slug>" ;;
     templates) printf '%s\n' "Usage: vibe templates" "List the runnable starter templates served by the platform." ;;
     list) printf '%s\n' "Usage: vibe list" "List your vibes; * marks the current folder's vibe. No manifest needed." ;;

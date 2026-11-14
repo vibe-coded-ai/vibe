@@ -35,7 +35,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 // Token checks, request sanitizing and platform POSTs use intrinsics captured
 // before author code loads. The meaning of each version is documented beside
 // SHIM_VERSION.
-const PLATFORM_SHIM_VERSION = 18;
+const PLATFORM_SHIM_VERSION = 19;
 void PLATFORM_SHIM_VERSION;
 
 // Capture these before any user module code executes. Invoking the captured
@@ -1043,6 +1043,24 @@ export function _r2GetKey(prefix, key) {
   return prefix + normalizedKey;
 }
 
+const r2PutOptionNames = ['onlyIf', 'httpMetadata', 'customMetadata', 'md5', 'sha1', 'sha256', 'sha384', 'sha512', 'ssecKey'];
+const r2GetOptionNames = ['onlyIf', 'range', 'ssecKey'];
+const r2ListOptionNames = ['limit', 'prefix', 'cursor', 'delimiter', 'startAfter', 'include'];
+
+// Only own data options reach R2. A private allowlist and indexed reads avoid
+// author-replaced Object/Array methods; null-prototype records avoid inherited
+// options and setters. Values retain their identity, including Headers.
+function r2BindingOptions(options, names) {
+  if (options == null) return undefined;
+  const result = { __proto__: null };
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    const value = ownValue(options, name);
+    if (value !== undefined) result[name] = value;
+  }
+  return result;
+}
+
 /**
  * Create an R2 bucket wrapper that auto-prefixes all keys with the vibe's
  * environment-specific tree (`vibes/{vibeId}/` or `vibes-preview/{vibeId}/`).
@@ -1129,7 +1147,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
         throw new Error(R2_STORAGE_FULL);
       }
       const fullKey = _r2GetKey(prefix, key);
-      return bucket.put(fullKey, body, options);
+      return bucket.put(fullKey, body, r2BindingOptions(options, r2PutOptionNames));
     },
 
     /**
@@ -1138,7 +1156,7 @@ export function createPrefixedR2(bucket, vibeId, env) {
     async get(key, options) {
       chargeStorage(1, bucket, 'r2ClassB');
       const fullKey = _r2GetKey(prefix, key);
-      return bucket.get(fullKey, options);
+      return bucket.get(fullKey, r2BindingOptions(options, r2GetOptionNames));
     },
 
     /**
@@ -1186,12 +1204,13 @@ export function createPrefixedR2(bucket, vibeId, env) {
      */
     async list(options) {
       chargeStorage(10, bucket, 'r2ClassA');
-      const opts = options || {};
+      const opts = r2BindingOptions(options, r2ListOptionNames) || { __proto__: null };
       const requested = ownValue(opts, 'prefix');
       if (requested != null && typeof requested !== 'string') {
         throw new TypeError('R2 list prefix must be a string');
       }
-      const result = await bucket.list({ ...opts, prefix: prefix + (requested == null ? '' : requested) });
+      opts.prefix = prefix + (requested == null ? '' : requested);
+      const result = await bucket.list(opts);
       return {
         ...result,
         objects: (result.objects || []).map(function(obj) {

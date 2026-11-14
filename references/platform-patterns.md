@@ -271,7 +271,7 @@ non-`/api` route has the following capabilities:
 | Interaction policy | Anonymous `POST /webhooks/inbox` |
 |---|---|
 | `public` | Reaches the worker with storage writes and secrets. |
-| `authenticated` | Also reaches this non-`/api` route with storage writes and secrets; `/api` routes require sign-in, and a signed-in caller without a grant gets read mode there. |
+| `authenticated` | Reaches this non-`/api` route in read mode: storage writes are refused and secrets are hidden. `/api` routes require sign-in, and a signed-in caller without a grant gets read mode on both. |
 | `public_read` | Reaches the worker in read mode: storage writes are refused and secrets are hidden. Outbound fetches still run. |
 | `invite_only` | Receives 401 before the worker runs. |
 
