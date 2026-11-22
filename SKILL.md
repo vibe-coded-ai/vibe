@@ -1,0 +1,251 @@
+---
+name: vibe-coded-ai
+version: 0.9.0
+description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - WebFetch
+  - AskUserQuestion
+arguments:
+  - name: action
+    description: "Action: login, init, templates, dev, preview, publish, status, fetch, call, connect, urls, logs, settings, access, secrets, files, delete (deploy is alias for preview)"
+    required: false
+  - name: slug
+    description: "Vibe slug (used with most actions)"
+    required: false
+---
+
+# vibe-coded.ai — build, host, and connect vibes
+
+You are helping someone build a **vibe**: an app hosted at
+`{userSlug}--{vibeSlug}.vibe-coded.app` with its own storage and, usually, MCP tools
+their AI can call. The CLI follows the API's `hostname` and `previewHostname`; older APIs without those fields fall back to `.app`. Old `{user}--{vibe}.vibe-coded.ai` addresses no longer serve vibes; use the `.app` address.
+
+**CLI:** run `vibe <action>` with Bash when `vibe` is on PATH (the installer puts
+it there); otherwise run this skill's `bin/vibe`. If a command says you're not signed in, run
+`login`. CLI errors are plain sentences: read them and do what they say. When a
+change is web-only, the CLI prints a link; give it to the user.
+
+## 1. Pick the path
+
+Ask (with `AskUserQuestion`) only if the request doesn't make it obvious:
+
+| If the user wants… | Path | Start with |
+|---|---|---|
+| Something their AI can **remember, look up, or update** (a tracker, log, journal, notes) | **A. Your AI's data** (default) | `vibe init --template tools <slug>` (key-value, every plan) or `--template tools-sql` (SQL, needs Pro); rename the note record and its fields to fit |
+| A **page or site** with no data | **B. Site** | `vibe init --template site <slug>` |
+| A **web app with a build step** (Vue) | **B. Web app** | `vibe init --template vue <slug>` |
+| To **host a project that already exists** | **C. Existing app** | `vibe init <slug>` in the project folder |
+
+`vibe templates` lists every template from the platform; `vibe init --template <name>`
+downloads its files. These commands need a network connection. Prefer a template
+over hand-written files.
+`vibe status --plan` shows the plan (SQL, file storage and secrets need Pro).
+Publishing needs a verified email. Open the link in your verification email,
+or resend it from https://vibe-coded.ai/account (Resend verification email).
+
+## 2. Path A — your AI's data
+
+1. **Scaffold:** `vibe init --template tools <slug>` in an empty folder. New vibes
+   are private: only the owner and people they invite can use them.
+2. **Model the data, then the tools** (see *Designing tools*).
+3. **Run locally:** `vibe dev`, then exercise every tool with curl
+   (`POST /api/<tool>` or `/mcp`). Fix before deploying.
+4. **Preview:** `vibe preview`. Check the reported tool count.
+5. **Publish:** `vibe publish`.
+6. **Prove it works — required.** `vibe call` calls a tool as the owner, on the
+   preview build by default; add `--production` for the published build. Create
+   a uniquely named record, read it back, then delete it by its `id`:
+   ```bash
+   TEST=$(vibe call add_x '{"name":"vibe verification test"}')
+   ID=$(printf '%s' "$TEST" | jq -r '.data.id')
+   vibe call list_x
+   vibe call delete_x "{\"id\":\"$ID\"}"
+   ```
+7. **Connect the user's AI.**
+   - **Claude Code:** run `vibe connect` yourself. It adds the vibe as an MCP
+     server and prints `Check: ✔ Connected`. The tools load in the next session.
+   - **claude.ai / Claude Desktop:** Settings → Connectors → Add custom connector →
+     `https://{userSlug}--{vibeSlug}.vibe-coded.app/mcp`. The user signs in in their
+     browser, so hand this step over.
+   - **Other MCP clients:** the same URL, with OAuth sign-in.
+
+   Give the user a first prompt that uses the vibe's tools ("log a 5-mile run, then
+   show this week's total"). You're done when `vibe call` works and the user's AI is
+   connected or has the connector steps.
+
+### Designing tools
+
+- **Record first.** Write down the fields before any code.
+- **One tool per thing the user will say:** `add_x`, `list_x` (with the filters
+  they'll use), `get_x`, `update_x`, and a narrow `delete_x(id)` so verification can
+  clean up. Skip tools nobody will ask for.
+- **Descriptions are for the AI.** `@description` and `@param` are what it reads;
+  say what the tool does and give example values. Optional params: `@param {number} [limit]`
+  (square brackets); `{?number}` means nullable, not optional.
+- **Return what the next step needs:** writes return the saved record with its
+  `id`; lists return newest first; errors are `{ success: false, error }` with a
+  sentence the AI can act on.
+- **Dates:** the worker runs in UTC. For records that belong to a day, take a
+  `date` parameter (`YYYY-MM-DD`, the user's local date) and fall back to UTC today.
+- **Don't build auth into tools.** The platform decides who can read and who can
+  write (see *Who can use a vibe*). For machine endpoints, Authorization and Cookie
+  never reach the worker; use `X-Webhook-Token` (see `references/platform-patterns.md`).
+
+## 3. Path B — a site or a web app
+
+- **Site:** `vibe init --template site <slug>`, edit `index.html`, `vibe preview`,
+  check it with `vibe fetch /`, then `vibe publish`. For `/api`
+  endpoints, add a root `worker.js` from `references/worker-template.md`.
+- **Web app (Vue/Vite):** `vibe init --template vue <slug>`, edit the starter
+  (see `references/vue-template.md`), and add a root `worker.ts` from
+  `references/worker-template.md` if it needs a backend. `vibe dev` runs the worker
+  only; use `npx vite` for the UI or check it on preview.
+
+## 4. Path C — bring an existing app
+
+1. **Survey first:** find the frontend, the backend entry, its storage and secrets,
+   and read the backend's imports.
+2. **Register in place:** `vibe init <slug>` (no template) leaves your files alone.
+3. **Backend → one root worker:** `./worker.js` or `./worker.ts` exporting
+   `{ async fetch(request, env) }` (`references/worker-template.md`). Requests
+   that don't match a static file go to the worker with their method (except the
+   paths of its source files and root project files such as `package.json` or
+   `README.md`), so keep the app's existing routes and methods. npm packages that
+   run in a worker are fine. Node-only code is not: `fs`, `child_process`, `node:module`, native
+   addons, Express and other servers. Rewrite handlers against `Request`/`Response`.
+   There is no filesystem and no long-running process.
+4. **Swap the storage:** files or a local database become `env.VIBE_STORAGE`,
+   `env.VIBE_D1` or `env.VIBE_R2`; `.env` values become `vibe secrets` (locally,
+   `.dev.vars`).
+5. **Frontend:** static files move as they are; a Vite app builds to `dist/`.
+6. **Keep only what you mean to publish** in the folder (next section).
+7. Add `@mcp-expose` tools if useful, then `vibe dev`, `vibe preview`, `vibe call`,
+   `vibe publish`.
+
+## 5. What gets uploaded and served
+
+`vibe preview` uploads the project folder, minus dependencies, build output, git,
+local secret files (`.env*`, `.dev.vars`) and agent/editor folders. If the project
+has a build step (a `build` script in `package.json`) and it writes `dist/`, only
+`dist/` is served. Otherwise, uploaded files are readable at their paths by anyone
+who can open the vibe; `vibe preview` lists them after a build that serves them.
+`.vibeignore` lists gitignore-style patterns relative to the project root to exclude
+files from preview uploads, local serving and watching, with `!` to re-include.
+Without this file, root README/REPORT/NOTES files and `*.md` are ignored by default.
+Uploads accept web asset types only (html, css, js/ts, json, images, fonts, md/txt/pdf
+and the usual project files); anything else is rejected. Store other files in
+`env.VIBE_R2` (Pro); they are served at `/files/<key>`, so that path is reserved.
+
+Preview has its own data, separate from production, and starts empty. Publishing
+doesn't copy data across. Outbound calls (email, webhooks) are real in preview too.
+
+## 6. Who can use a vibe
+
+Two settings, both changed on the web (the CLI prints the link):
+
+- **Visibility** — `private`, `unlisted` or `public`: who can see it.
+- **Interaction** — who can use it. A private vibe is always owner-and-invited
+  only; on a public or unlisted vibe:
+  - `invite_only`: only the owner and people they grant.
+  - `public_read`: anyone can read; only the owner and invited writers can change
+    data. Use this (with `public` visibility) for a public read-only server.
+  - `authenticated`: any signed-in account can read through `/api` and MCP;
+    changing data there needs the owner or an invited writer.
+  - `public`: any visitor can read, and write through `/api`.
+
+  Uninvited callers are always read-only over MCP; MCP writes need an owner,
+  writer or admin.
+
+Read-only callers can't write storage or see secrets, but outbound fetches still
+run, so guard email and webhooks yourself. Roles for invited people: `viewer`
+(read), `writer` (read and write), `admin`; only the owner manages access and
+settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug>`.
+
+## 7. Commands
+
+| Command | What it does |
+|---|---|
+| `login` | Sign in (browser flow, below) |
+| `logout` | Remove local credentials |
+| `init [--template T] <slug>` | Create a vibe and write `.vibe-coded.json`; `--adopt` reuses your existing slug |
+| `templates` | List templates |
+| `list` | List your vibes; marks the current folder's vibe |
+| `source [path]` | List deployed source paths, sizes and etags, or read a file's exact bytes |
+| `dev [--port N] [--reset]` | Run locally on `127.0.0.1:8787` with local key-value, SQL and file storage; `dev seed file.sql` loads local SQL |
+| `preview` | Upload, build, and deploy to the preview URL |
+| `publish` | Promote the preview to production |
+| `call <tool> ['{json}'] [--production]` | Call one tool as the owner (preview build; `--production` for production) |
+| `sql "<statement>" [--params json] [--production] [--write]` | Query the vibe's own SQL database as the owner; read-only unless `--write` (INSERT, UPDATE, DELETE, REPLACE); no schema changes |
+| `fetch <path> [--production] [--headers\|-i]` | Fetch a page or file from the preview build as the owner (`--production` for production); 2xx and 3xx succeed; redirects print Location without following it; `--headers` (`-i`) includes the status line and file-serving headers |
+| `connect [<owner>/<slug>] [--revoke]` | Connect Claude Code to a vibe (yours or one shared with you) |
+| `status [--plan]` | Live builds, tool counts, and plan (`--plan` also shows this month's usage against the plan's budget); upgrades are at vibe-coded.ai/billing |
+| `logs [build-id]` | Build logs |
+| `urls` | Preview, production and MCP URLs |
+| `settings [--title T]` | View settings, change the title; visibility and interaction are web-only |
+| `access list` | List collaborators; grants and revokes are web-only |
+| `secrets list\|create\|update\|delete NAME` | Write-only secrets (Pro), read in the worker as `env.NAME` |
+| `files upload\|download\|ls\|rm\|url` | Stored files (upload: Pro) |
+| `delete` | Prints the web link to delete the vibe |
+
+**Login:** run `vibe login --start`; it prints a link and a code. Give both to the
+user, ask them to type the terminal code in the browser and click Approve, then
+run `vibe login --finish`. It works
+for Google and GitHub accounts too. A person at a terminal can just run
+`vibe login`.
+
+**Secrets** use a hidden single-line prompt at a terminal. For multi-line values,
+redirect a file (`vibe secrets create NAME < file` or `vibe secrets update NAME < file`)
+or pipe the value: stdin is read through EOF and one final newline is removed.
+Never ask the user to paste a secret into chat. Each value may be at most 5 KB (5,120 UTF-8
+bytes); oversized creates and updates return HTTP 400. Shorten the value before
+retrying.
+
+**`vibe dev` vs production:** locally there are no access checks, signed file URLs
+don't work, and `/mcp` supports only `initialize`,
+`tools/list` and `tools/call`.
+Check those on preview. Local secrets go in `.dev.vars`.
+`vibe dev` applies the plan's per-request storage ceiling and outbound allowance and keeps
+state in `.vibe-coded/dev` (`--reset` clears it). Local behaviour is a
+convenience, not authority: verify access, entitlement and error shape on hosted preview.
+
+## 8. Writing worker code
+
+Details and examples (including running SQL against a live vibe):
+`references/platform-patterns.md`, `references/worker-template.md`.
+
+| Binding | Storage | Plan |
+|---|---|---|
+| `env.VIBE_STORAGE` | Key-value: `.get` `.put` `.delete` `.list({prefix})` | every plan |
+| `env.VIBE_D1` | SQL: `.prepare(sql).bind(...).run()` / `.all()` | Pro or Pro+ |
+| `env.VIBE_R2` | Files: `.put` `.get` `.delete` `.list`; served at `/files/<key>`; `createUploadUrl(key, {contentLength, contentType})` for browser uploads | Pro or Pro+ |
+
+- **`@mcp-expose`** on an `async function` makes it an MCP tool, served at
+  `POST /api/<tool_name>`. Function names are snake_case; `env` is the last
+  parameter.
+- Worker responses are `{ success: true, data }` or `{ success: false, error }`.
+- The frontend calls the worker with relative `/api/` paths, never absolute URLs.
+- Create SQL tables in code (`CREATE TABLE IF NOT EXISTS`); preview starts empty.
+  Any Pro vibe can switch to SQL: use `env.VIBE_D1` and rebuild.
+- **Key-value `list()` lags new writes by up to a minute.** Don't build a list tool on
+  `list()` alone; use the pattern in `references/platform-patterns.md` (the
+  templates do), or use SQL.
+- Key-value, file and SQL calls share a budget of 500 storage operations per request on
+  Free, 10,000 on paid plans (a read or SQL statement counts 1; a write, list or delete
+  counts 10); SQL rows read and written also count toward monthly calls. Paginate large jobs
+  across requests. A handler must send its first byte within 30 seconds or the
+  platform answers 504.
+- Files and images go in file storage, not base64 in key-value.
+- Vue: use `createWebHashHistory()`, and keep `vite` in `devDependencies`.
+- Use one root worker: `worker.ts` or `worker.js`, not both, and not `src/worker.*`.
+
+## 9. Trust
+
+The CLI token in `~/.vibe-coded/credentials.json` can build and publish but can't
+read secrets, change access or visibility, or delete vibes. Treat it like an SSH
+key. Install the skill only from `curl -fsSL https://vibe-coded.ai/install.sh | sh`.

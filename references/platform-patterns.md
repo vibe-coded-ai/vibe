@@ -1,0 +1,277 @@
+# Platform patterns
+
+## Access and owner checks
+
+New vibes start with visibility private and interaction policy invite_only. Publishing does not change these access settings.
+On private vibes, anonymous requests receive 401 before the worker runs, including webhook and cron requests. A host with no build yet answers 404 to everyone (production until the first publish).
+Visibility (private, unlisted, public) and interaction policy (public, public_read, authenticated, invite_only) change only on the website.
+Through MCP, get_vibe returns the manageUrl to give the owner; through the CLI, vibe settings prints the page.
+Check private vibes as the owner with `vibe call` (MCP: `call_tool`) or `vibe fetch` (MCP: `fetch_page`).
+MCP clients use query_sql and execute_sql for SQL data and worker tools for files; they do not need a CLI, a local credentials file or vibe files.
+
+The platform answers CORS preflights before the worker; a vibe's page calls its own /api same-origin, while a page on another origin cannot call that API from a browser (server-to-server calls are unaffected).
+
+## Account allowances
+
+What counts as an API call, and what the worker can connect to: [plan terms](plan-terms.md).
+
+`usage` reports account-wide key-value, SQL and file storage; SQL includes preview and production databases.
+Outbound `fetch`, outbound WebSocket and `EventSource` are allowed: 5 per request on Free, 20 on Pro, 50 on Pro+. Fetch follows redirects; each hop uses one slot. Builds refuse `cloudflare:sockets`, `node:net`/`net`, `node:tls`/`tls`, `node:module`/`module` (and `createRequire` through it) and non-literal dynamic `import()`, naming the file and line; this covers dependencies and emitted bundles. Default `node:process`/`process` imports work; builds reject process namespace/dynamic imports, `require`, star re-exports and named `getBuiltinModule` imports. A handler must send its first byte within 30 seconds or the platform answers 504. Work registered with `ctx.waitUntil` before returning may run until 140 seconds after the request opened; its storage calls count against the same per-request budget (see `worker-template.md`). Inbound WebSocket upgrades are refused with HTTP 400.
+Monthly calls include API calls, builds, storage operations and SQL rows read and written. Key-value, file and SQL calls share 500 storage operations per request on Free, 10,000 on paid plans (a read or SQL statement counts 1, a batch one per statement; a write, list or delete counts 10 per key) and are charged to monthly calls in the same proportion. Each preview build and each publish counts as about 2,222 calls on Free or 833 on Pro and Pro+ against the monthly allowance. Preview builds also count toward the hourly and daily build caps; publishing does not count toward these build caps.
+MCP `usage` returns the plan's call cost for each preview build or publish as `monthlyCalls.buildCallEquivalent`; `vibe status --plan` prints the same cost.
+At the monthly allowance, `usage` reports `monthlyCalls.paused: true` and `monthlyCalls.pauseMessage`; its text and `vibe status --plan` name the paused operations, UTC reset date, and how to upgrade or wait. `create_vibe` and `vibe init` include the same warning in their creation notes. Creation still uses a vibe slot; builds remain paused. No pause warning appears under the allowance. An unavailable ledger leaves the status unknown unless the existing budget verdict keeps the account paused.
+
+Measured key-value, file and SQL storage pauses worker requests and MCP tools past twice the plan's limit, or past the lowest paid limit for storage the plan does not include; HTTP returns 429 with reason storage_quota.
+Owner totals pause all vibes; a SQL database past its pause threshold pauses its environment. At or below that threshold, writes are refused at the plan cap; reads and deletes work, including after downgrades.
+Free space through platform storage APIs or delete an unused vibe. `execute_sql` runs a plain DELETE on any plan, including while storage is paused, unless the database has triggers, the table is a full-text search table, or a foreign key would SET NULL or SET DEFAULT; the refusal names the restriction. Upgrades recheck immediately.
+Hourly checks restore access at or below the pause threshold, plus up to 60 seconds of caching and key-value propagation; failed measurements retain the prior verdict. Static assets and file reads keep their usual gates.
+
+## Key-value storage (`env.VIBE_STORAGE`, every plan)
+
+Store JSON strings under colon-separated keys (`items:<id>`). `list()` can miss
+a key written in the last minute, so "add, then list" needs a small "recent ids"
+key merged into the listing. The templates do this:
+
+```javascript
+async function rememberWrite(env, prefix, id) {
+  const key = `recent:${prefix}`;
+  const recent = JSON.parse((await env.VIBE_STORAGE.get(key)) || '[]');
+  await env.VIBE_STORAGE.put(key, JSON.stringify([id, ...recent.filter((x) => x !== id)].slice(0, 100)));
+}
+
+async function loadAll(env, prefix) {
+  const ids = new Set();
+  let cursor;
+  do { // list() returns at most 1000 keys per page
+    const page = await env.VIBE_STORAGE.list({ prefix, cursor });
+    for (const k of page.keys) ids.add(k.name.slice(prefix.length));
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  for (const id of JSON.parse((await env.VIBE_STORAGE.get(`recent:${prefix}`)) || '[]')) ids.add(id);
+  const records = await Promise.all(
+    [...ids].map(async (id) => JSON.parse((await env.VIBE_STORAGE.get(`${prefix}${id}`)) || 'null'))
+  );
+  return records.filter(Boolean); // deleted records drop out
+}
+
+// After every put: await rememberWrite(env, 'items:', id);
+// To list:         const items = await loadAll(env, 'items:');
+```
+
+Need strictly consistent queries? Use SQL.
+
+## SQL (`env.VIBE_D1`, Pro or Pro+)
+
+Preview and production have separate databases; preview starts empty.
+On Free, `env.VIBE_D1` is bound but every call throws an error with
+`code: 'ENTITLEMENT_EXCEEDED'`, so `if (env.VIBE_D1)` does not detect the plan;
+catch that error, or keep Free data in key-value storage. A vibe downgraded to
+Free keeps its database: reads and deletes work (with triggers present, only SELECT and DROP TRIGGER), and statements that add data throw that error.
+
+```javascript
+async function _ensureTable(env) {            // call from write paths only; no "done" flag
+  await env.VIBE_D1.prepare(`CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP)`).run();
+}
+
+// Write
+await _ensureTable(env);
+await env.VIBE_D1.prepare('INSERT INTO items (name) VALUES (?)').bind(name).run();
+
+// Read: a read before the first write finds no table, which means empty
+let rows;
+try {
+  rows = (await env.VIBE_D1.prepare('SELECT * FROM items ORDER BY created_at DESC').all()).results;
+} catch (err) {
+  if (/no such table:\s*(?:main\.)?items\b/i.test(String(err?.message))) rows = [];
+  else throw err;
+}
+```
+
+Use `.prepare(...).run()` / `.all()`, `.first()` or `.batch()` for SQL; `.raw()`, `.exec()` and `.dump()` are refused, and each `prepare` takes one statement.
+
+To inspect stored data as the owner, run one SELECT with `query_sql`; to fix
+rows, run one INSERT, UPDATE, DELETE or REPLACE with `execute_sql`, which
+records each call in an audit log (`production: true` for the published
+database). Do this rather than adding an admin tool to the vibe, which anyone
+the vibe's access settings let in could call. Schema changes (CREATE, ALTER,
+DROP, PRAGMA) are refused: make those in the worker's code. When the account's
+storage is full, DELETE still runs, so it can free space. To list tables, run
+`SELECT name, sql FROM sqlite_master WHERE type = 'table'`; for a table's
+columns, `SELECT * FROM pragma_table_xinfo('items')`. Put values in `params` for `?`
+placeholders; numbers bind as numbers, so send a value for a TEXT column as a
+string (`"42"`, not `42`), and pass a whole number past 9007199254740991 as a
+string. The answer is the
+column names and one JSON array per row, so same-named columns both show.
+call_tool still exercises the worker's own SQL tools.
+
+### CLI only: SQL on live data
+
+`vibe sql "<statement>"` is the same tool: read-only, or `--write` for what
+`execute_sql` does; `--production`, `--params '[...]'`. `vibe dev seed <file.sql>` applies a SQL file to the local database.
+
+## Files (`env.VIBE_R2`, Pro or Pro+)
+
+On Free, `env.VIBE_R2` is bound but `put` and `createUploadUrl` throw an error with
+`code: 'ENTITLEMENT_EXCEEDED'` (a 403 if uncaught), so `if (env.VIBE_R2)` does not
+detect the plan; catch that error. Reads, lists, download links and deletes work on
+Free, so a vibe downgraded to Free keeps reading and deleting its files:
+
+```javascript
+try { await env.VIBE_R2.put(key, bytes); }
+catch (e) { if (e.code === 'ENTITLEMENT_EXCEEDED') return { success: false, error: 'File storage needs Pro' }; throw e; }
+```
+
+Static/source uploads accept only web asset extensions (html, htm, css, js, mjs, ts/tsx/jsx, vue, svelte, json/xml/yaml/yml/toml/csv/tsv, images, fonts, md/txt/pdf, gitignore/npmrc/nvmrc, lock/map) and named extensionless project files; any other file type goes to file storage and is served from `/files/<key>`.
+
+In the worker:
+
+```javascript
+await env.VIBE_R2.put('uploads/logo.png', bytes, { httpMetadata: { contentType: 'image/png' } });
+const obj = await env.VIBE_R2.get('uploads/logo.png');
+const metadata = await env.VIBE_R2.head('uploads/logo.png');
+const { objects } = await env.VIBE_R2.list({ prefix: 'uploads/' });
+await env.VIBE_R2.delete('uploads/logo.png');
+```
+
+**Serving:** every stored object is reachable at `/files/<key>` on the vibe's
+own origin, under the vibe's visibility and interaction settings, so an
+`<img src="/files/uploads/logo.png">` or `<video src="/files/clips/intro.mp4">`
+just works and the browser can seek (range requests) and cache. Images, audio,
+video, PDFs, plain text and fonts display inline; anything else is a download
+(HTML, SVG and XML as plain text). Preview and production have separate files.
+`/files/` is reserved on every vibe, Free included: the platform answers it (a
+key with nothing stored is 404 `File not found`), so a `files/` folder in the
+project is never served. Each read counts as a request against the vibe's daily
+and monthly limits.
+
+**Uploading from the browser:** large uploads go straight to file storage with a signed
+URL the worker mints:
+
+```javascript
+// Worker tool
+async function upload_url(key, contentType, contentLength, env) {
+  return { success: true, data: await env.VIBE_R2.createUploadUrl(key, { contentType, contentLength, ttl: 300 }) };
+}
+// Frontend: get the URL, PUT the file to it, then show it from /files/<key>
+```
+
+`createUploadUrl` returns `{ url, expiresAt }`. `contentLength` (the exact byte
+size) is required: the signed PUT pins the byte size, not the Content-Type. A
+client can store any type under the key, so a worker that cares checks the first
+bytes; `/files/<key>` serves scriptable types as plain text regardless. The worker
+decides who may upload and to which key.
+A 403 SignatureDoesNotMatch on the PUT means the bytes sent differ from contentLength.
+The browser's PUT to the signed URL is CORS-allowed from the vibe's own origin (preflight answers 204); no CORS setup is needed.
+
+**Downloading outside the page** (a script, another server): the worker
+mints `createDownloadUrl(key)`, a `/files/<key>?exp=…&sig=…` link on the vibe's
+own host that lasts at most 120 seconds. Until then anyone holding it can open
+that one file with GET or HEAD, whatever the vibe's access settings; each open
+counts as a file read. A page does not need this: use `/files/<key>`.
+
+Through MCP, expose file operations as worker tools and
+invoke them with call_tool. For an operation the worker does not expose, add an
+@mcp-expose tool, push_source (it waits for the build), then call_tool.
+
+### CLI only: file commands
+
+From a terminal with the CLI installed and signed in, use `vibe files upload|download|ls|rm|url` (MCP: expose a worker tool and invoke it with call_tool).
+These default to production's files; add `--preview` for the preview tree.
+`vibe files url <key>` prints the file's `/files/<key>` link on the vibe and who can open it.
+`vibe files url <key> --expires 7d` (30m, 12h, at most 7d) prints a link anyone can open until it expires, even on a private vibe; it opens only that file. `vibe dev` refuses `createDownloadUrl` and `createUploadUrl`; test them on preview.
+The preview host serves the preview tree and the production host the production tree; upload to both when a page needs the file in both.
+`vibe files usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; account `usage` reports key-value, SQL and file storage.
+Signed uploads count at once; files the worker writes with `put()` count within the hour.
+
+**Check a private vibe with curl:** the token in `~/.vibe-coded/credentials.json`
+works on the vibe host as `Authorization: Bearer <token>`, the same as the API.
+POST to `/api/<tool>` works the same way. `vibe fetch --headers /files/<key>` (MCP: fetch_page returns headers)
+shows how a file is served.
+
+## MCP tool annotations
+
+```javascript
+/**
+ * @mcp-expose
+ * @description Create a bookmark
+ * @param {string} url - The URL to bookmark
+ * @param {string} [title] - Optional title
+ * @param {?number} rating - Rating 1-5, or null
+ */
+async function create_bookmark(url, title, rating, env) { /* ... */ }
+```
+
+- `@mcp-expose` alone makes the function a tool; get_vibe through MCP or
+  `vibe status` through the CLI shows the count. Put `env` last in its parameters.
+- `[name]` marks an optional parameter; types are `string`, `number`, `boolean`,
+  `object`, `array`.
+- The platform decides who can write; annotations don't control access.
+
+## Endpoints for machines (webhooks, cron)
+
+For people, rely on the vibe's visibility, interaction and invites.
+MCP tool calls pass the same gate, so a tool needs no password or token argument; one would land in the client's call log.
+For anonymous webhooks or cron, the owner must choose public or unlisted visibility and public interaction on the website, then protect the endpoint with a dedicated secret.
+A worker token cannot bypass the platform's access gate. Gate the endpoint with
+the token stored as a secret, sent in an
+`X-Webhook-Token` header. Authorization and Cookie never reach your worker;
+provider signature headers (Stripe, Svix…) and any `X-Webhook-*` header do.
+
+```javascript
+// Create SYNC_TOKEN with set_secret through MCP or vibe secrets create through the CLI.
+function _checkToken(request, env) {
+  const expected = env.SYNC_TOKEN;
+  if (!expected) return false;                 // fail closed if unset
+  const got = request.headers.get('X-Webhook-Token') || '';
+  if (got.length !== expected.length) return false;
+  let diff = 0;                                // constant-time compare
+  for (let i = 0; i < got.length; i++) diff |= got.charCodeAt(i) ^ expected.charCodeAt(i);
+  return diff === 0;
+}
+```
+
+Use a dedicated secret (not the user's CLI token), and never echo it in responses
+or logs. Keys the worker calls out with (Stripe, OpenAI) are also secrets, read
+as `env.NAME`.
+
+### Webhook inbox recipe
+
+1. Add a root worker route for `POST /webhooks/inbox`, outside `/api`. Check
+   `_checkToken(request, env)` above before storing the payload or making outbound
+   calls; reject a missing or invalid token before any side effect.
+2. Create `SYNC_TOKEN` with MCP `set_secret` or CLI `vibe secrets create SYNC_TOKEN`.
+   Have the sender supply that dedicated secret in `X-Webhook-Token`.
+3. Build with MCP `push_source` or CLI `vibe preview`. Probe the route as the owner
+   with MCP `fetch_page` (`method: "POST"`, `headers`, `body`) or CLI
+   `vibe fetch /webhooks/inbox --method POST --header 'X-Webhook-Token: <dedicated secret>' --data '<payload>'`.
+   An owner probe does not prove anonymous access.
+4. **Website step:** give the owner `get_vibe`'s `manageUrl` (CLI: `vibe settings`).
+   For a public webhook inbox that stores messages, the owner chooses public or
+   unlisted visibility and public interaction on that page. Neither MCP nor the
+   CLI changes these settings; publishing does not change them either.
+5. Publish with MCP `publish` or CLI `vibe publish`, then verify an anonymous
+   server-to-server POST with the dedicated header. Preview data does not carry
+   to production; check the stored message in production.
+
+For a user vibe with public or unlisted visibility, an anonymous POST to this
+non-`/api` route has the following capabilities:
+
+| Interaction policy | Anonymous `POST /webhooks/inbox` |
+|---|---|
+| `public` | Reaches the worker with storage writes and secrets. |
+| `authenticated` | Reaches this non-`/api` route in read mode: storage writes are refused and secrets are hidden. `/api` routes require sign-in, and a signed-in caller without a grant gets read mode on both. |
+| `public_read` | Reaches the worker in read mode: storage writes are refused and secrets are hidden. Outbound fetches still run. |
+| `invite_only` | Receives 401 before the worker runs. |
+
+Private visibility returns 401 for anonymous requests under every interaction
+policy. A webhook token cannot grant storage writes or reveal secrets in read
+mode. Always verify the token before side effects; `authenticated` alone does
+not authenticate an anonymous caller to a non-`/api` route.
+
+## URLs
+
+- Preview: `p--{userSlug}--{vibeSlug}.vibe-coded.app`
+- Production: `{userSlug}--{vibeSlug}.vibe-coded.app`

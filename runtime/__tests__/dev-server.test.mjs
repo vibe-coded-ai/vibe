@@ -1,0 +1,2298 @@
+// Unit tests for the pure helpers in dev-server.mjs.
+// Run: node --test   (from skills/vibe-coded-ai/)
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:net';
+import { copyFileSync, cpSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { buildMfOptions, createVibeIgnore, DEV_PLATFORM_PREFIX, DEV_PLATFORM_REFUSAL, MCP_SUBPATH_MESSAGE, extractTools, extractToolsWithWarnings, printDroppedTools, withDispatchHeaders, ipv6PortTaken, needsViteBuild } from '../dev-server.mjs';
+import { splitSqlStatements } from '../sql-statements.mjs';
+
+const VIBE_BIN = resolve(dirname(fileURLToPath(import.meta.url)), '../../bin/vibe');
+const RUNTIME_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+function runCli(command, args = [], scenario = 'normal', detailResponse = {
+  success: true,
+  visibility: 'public',
+  previewMcpToolCount: 17,
+  productionMcpToolCount: 14,
+  mcpToolCount: 14,
+  previewBuildId: 42,
+  productionBuildId: 40,
+}) {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-cli-test-'));
+  const home = join(root, 'home');
+  const project = join(root, 'project');
+  const stubBin = join(root, 'bin');
+  const log = join(root, 'curl.log');
+  mkdirSync(join(home, '.vibe-coded'), { recursive: true });
+  mkdirSync(join(project, '.vibe-coded', 'dev'), { recursive: true });
+  mkdirSync(stubBin);
+  if (command === 'dev') {
+    const version = JSON.parse(readFileSync(resolve(RUNTIME_DIR, '../package.json'), 'utf8')).version;
+    const cache = join(home, '.cache/vibe-coded/dev-runtime', version);
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'installed'), '');
+    writeFileSync(join(stubBin, 'node'), '#!/usr/bin/env bash\nprintf "runtime\\t%s\\n" "$*" >> "$VIBE_TEST_LOG"\n', { mode: 0o755 });
+  }
+
+  writeFileSync(join(home, '.vibe-coded', 'credentials.json'), JSON.stringify({
+    token: 'synthetic-test-token',
+    userSlug: 'tester',
+    apiUrl: 'https://stub.invalid',
+    expiresAt: '2999-01-01T00:00:00Z',
+  }));
+  if (command !== 'init' || !args.includes('--template')) {
+    writeFileSync(join(project, 'index.html'), '<h1>demo</h1>');
+  }
+  writeFileSync(join(project, '.vibe-coded', 'dev', 'state.json'), '{}');
+  const extraLocalPaths = ['over20', 'upload20', 'upload21'].includes(scenario)
+    ? Array.from({ length: scenario === 'over20' ? 25 : scenario === 'upload20' ? 19 : 20 }, (_, i) => `local-${i}.html`)
+    : [];
+  for (const path of extraLocalPaths) writeFileSync(join(project, path), path);
+  if (scenario === 'withworker') writeFileSync(join(project, 'worker.js'), 'export default {};');
+  if (scenario === 'uploadnames') {
+    mkdirSync(join(project, 'assets'));
+    writeFileSync(join(project, 'assets', 'style.css'), 'body {}');
+    writeFileSync(join(project, 'file with spaces.txt'), 'hello');
+    writeFileSync(join(project, '.gitignore'), '.vibe-coded/');
+    writeFileSync(join(project, 'assets', '.gitignore'), '*.map');
+  }
+  // In a git worktree or submodule, .git is a file holding the local gitdir path.
+  if (scenario === 'gitfile') writeFileSync(join(project, '.git'), 'gitdir: /Users/someone/private/repo/.git/worktrees/demo');
+  if (scenario === 'dotdirs') {
+    for (const dir of ['.claude', '.cursor', '.codex', '.vscode']) mkdirSync(join(project, dir), { recursive: true });
+    writeFileSync(join(project, '.claude', 'settings.local.json'), '{"env":{"SECRET":"x"}}');
+    writeFileSync(join(project, '.cursor', 'rules.md'), 'x');
+    writeFileSync(join(project, '.codex', 'config.toml'), 'x');
+    writeFileSync(join(project, '.vscode', 'settings.json'), '{}');
+    mkdirSync(join(project, '.well-known'), { recursive: true });
+    writeFileSync(join(project, '.well-known', 'security.txt'), 'Contact: x');
+    mkdirSync(join(project, 'public', '.well-known'), { recursive: true });
+    writeFileSync(join(project, 'public', '.well-known', 'assetlinks.json'), '[]');
+    writeFileSync(join(project, '.npmrc'), 'legacy-peer-deps=true');
+  }
+  if (scenario === 'localfiles') {
+    writeFileSync(join(project, '.dev.vars'), 'LOCAL_SECRET=do-not-upload');
+    writeFileSync(join(project, 'schema.sql'), 'CREATE TABLE private_data (id INTEGER);');
+  }
+  if (scenario === 'neverserved') {
+    writeFileSync(join(project, 'package.json'), JSON.stringify({ name: 'x', dependencies: {} }));
+    writeFileSync(join(project, 'bun.lock'), '{}');
+    writeFileSync(join(project, 'wrangler.toml'), 'name = "x"');
+    writeFileSync(join(project, 'tsconfig.json'), '{}');
+    mkdirSync(join(project, 'data'));
+    writeFileSync(join(project, 'data', 'plants.json'), '[]');
+    mkdirSync(join(project, 'sub'));
+    writeFileSync(join(project, 'sub', 'yarn.lock'), '');
+    writeFileSync(join(project, 'sub', 'package.json'), '{}');
+  }
+  if (scenario === 'agentnotes') {
+    for (const file of ['AGENTS.md', 'claude.MD', 'GEMINI.md', 'MODEL.md', 'review-MODEL.md', 'OBSERVATIONS.md', 'SPEC.md', 'TODO.md', 'NOTES.md', 'README.md']) {
+      writeFileSync(join(project, file), file);
+    }
+    writeFileSync(join(project, 'worker.ts'), 'export default {}');
+    writeFileSync(join(project, 'package.json'), '{}');
+    writeFileSync(join(project, 'tsconfig.json'), '{}');
+    mkdirSync(join(project, 'content', 'posts'), { recursive: true });
+    writeFileSync(join(project, 'content', 'posts', 'MODEL.md'), 'published content');
+    writeFileSync(join(project, 'guide.md'), 'public site guide');
+  }
+  if (scenario === 'dualworker') {
+    writeFileSync(join(project, 'worker.ts'), 'export default {};');
+    writeFileSync(join(project, 'worker.js'), 'export default {};');
+  }
+  if (scenario === 'withdist' || scenario === 'staledist') {
+    mkdirSync(join(project, 'dist'));
+    writeFileSync(join(project, 'dist', 'index.html'), '<h1>built</h1>');
+  }
+  if (scenario === 'withdist') {
+    writeFileSync(join(project, 'package.json'), JSON.stringify({ scripts: { build: 'vite build' } }));
+  }
+  const remotePaths = scenario === 'guard'
+    ? ['index.html', 'old-a.html', 'old-b.html']
+    : scenario === 'over20'
+      ? ['index.html', ...extraLocalPaths, ...Array.from({ length: 21 }, (_, i) => `stale-${i}.html`)]
+      : ['index.html', 'stale.html'];
+  if (command !== 'init' && scenario !== 'nomanifest') {
+    writeFileSync(join(project, '.vibe-coded.json'), JSON.stringify({
+      vibeSlug: 'demo',
+      ...(['uploaded', 'guard', 'over20'].includes(scenario) ? { uploadedPaths: remotePaths } : {}),
+    }));
+  }
+  const listResponse = JSON.stringify({
+    success: true,
+    files: remotePaths.map(path => ({ path })),
+    truncated: false,
+  });
+
+  const curlStub = [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'method=GET',
+    'url=""',
+    'data=""',
+    'writeout=""',
+    'outfile=""',
+    'while [ "$#" -gt 0 ]; do',
+    '  case "$1" in',
+    '    -X) method="$2"; shift 2 ;;',
+    '    --data|--data-binary|-d) data="$2"; shift 2 ;;',
+    '    -w) writeout="$2"; shift 2 ;;',
+    '    -o) outfile="$2"; shift 2 ;;',
+    '    -H|-K) shift 2 ;;',
+    '    -s|-f) shift ;;',
+    '    http*) url="$1"; shift ;;',
+    '    *) shift ;;',
+    '  esac',
+    'done',
+    'payload="$data"',
+    'if [ "$data" = @- ]; then payload=$(cat); elif [[ "$data" == @* ]]; then payload=$(<"${data#@}"); fi',
+    'printf "%s\\t%s\\t%s\\n" "$method" "$url" "$payload" >> "$VIBE_TEST_LOG"',
+    'emit() { printf "%s" "$1"; if [ -n "$writeout" ]; then printf "\\n%s" "$2"; else printf "\\n"; fi; }',
+    'if [ "$VIBE_TEST_SCENARIO" = netdown ]; then exit 7; fi',
+    'if [ "$VIBE_TEST_SCENARIO" = auth401 ]; then',
+    '  emit \'{"success":false,"error":"Authentication required"}\' 401',
+    'elif [[ "$method" = GET && "$url" == */api/v1/templates/tools ]]; then',
+    '  emit \'{"name":"tools","storage":"kv","type":"fullstack","files":[{"path":"worker.js","content":"export default {};\\n"}]}\' 200',
+    'elif [[ "$method" = POST && "$url" == */auth/cli/start ]]; then',
+    '  emit \'{"success":true,"deviceCode":"synthetic-device-code","verificationUriComplete":"https://stub.invalid/approve","userCode":"TEST","interval":1,"expiresIn":600}\' 200',
+    'elif [[ "$method" = POST && "$url" == */auth/cli/poll ]]; then',
+    '  if [ "$VIBE_TEST_SCENARIO" = logindenied ]; then',
+    '    emit \'{"status":"denied"}\' 200',
+    '  else',
+    '    emit "$(jq -cn --arg token "$VIBE_TEST_LOGIN_TOKEN" \'{status:"approved",token:$token,userSlug:"tester"}\')" 200',
+    '  fi',
+    'elif [[ "$method" = GET && "$url" == */api/v1/vibes ]]; then',
+    '  emit \'{"success":true,"plan":"pro","vibes":[]}\' 200',
+    'elif [[ "$method" = GET && "$url" == *"/tester/demo" && "$VIBE_TEST_SCENARIO" = status401 ]]; then',
+    '  emit \'{"success":false,"error":"token revoked"}\' 401',
+    'elif [[ "$method" = GET && "$url" == *"/tester/demo" && "$VIBE_TEST_SCENARIO" = status403 ]]; then',
+    '  emit \'{"success":false,"error":"access denied"}\' 403',
+    'elif [[ "$method" = GET && "$url" == *"/tester/demo" && "$VIBE_TEST_SCENARIO" = status500 ]]; then',
+    '  emit \'{"success":false,"error":"service unavailable"}\' 500',
+    'elif [[ "$method" = GET && "$url" == *"/builds?limit="* ]]; then',
+    '  if [ "$VIBE_TEST_SCENARIO" = pendingpreflight ]; then',
+    '    emit \'{"success":true,"builds":[{"id":43,"status":"building","environment":"preview","createdAt":"2026-09-29T12:00:00Z"}]}\' 200',
+    '  elif [ "$VIBE_TEST_SCENARIO" = publishfailed ] || [ "$VIBE_TEST_SCENARIO" = publishrestored ]; then',
+    '    emit \'{"success":true,"builds":[{"id":43,"status":"failed","environment":"preview","createdAt":"2026-09-29T12:00:00Z"}]}\' 200',
+    '  elif [ "$VIBE_TEST_SCENARIO" = withworker ]; then',
+    '    emit \'{"success":true,"builds":[{"id":42,"status":"succeeded","environment":"preview","createdAt":"2026-09-29T12:00:00Z"}]}\' 200',
+    '  else',
+    '    emit \'{"success":true,"builds":[]}\' 200',
+    '  fi',
+    'elif [[ "$method" = POST && "$url" == */api/v1/vibes ]]; then',
+    '  if [ "$VIBE_TEST_SCENARIO" = vibecappro ]; then',
+    '    emit \'{"success":false,"error":"Vibe limit reached (25/25). Pro+ is the highest plan. To make room, delete a vibe you no longer need on the website (vibes are deleted only there): https://vibe-coded.ai/account. Tell your agent: \\"I deleted a vibe on vibe-coded.ai; check my vibe count, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":25,"used":25,"plan":"pro","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
+    '  elif [ "$VIBE_TEST_SCENARIO" = vibecapbyov ]; then',
+    '    emit \'{"success":false,"error":"Vibe limit reached (10/10). To make room, upgrade: Pro+ ($20/mo) supports up to 25 vibes, at https://vibe-coded.ai/billing. Or delete a vibe you no longer need on the website (vibes are deleted only there): https://vibe-coded.ai/account. Tell your agent: \\"I upgraded my plan or deleted a vibe on vibe-coded.ai; check my vibe count, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":10,"used":10,"plan":"byov","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
+    '  elif [ "$VIBE_TEST_SCENARIO" = vibecap ]; then',
+    '    emit \'{"success":false,"error":"Vibe limit reached (5/5). To make room, upgrade: Pro ($9/mo) supports up to 10 vibes; Pro+ ($20/mo) supports up to 25 vibes, at https://vibe-coded.ai/billing. Or delete a vibe you no longer need on the website (vibes are deleted only there): https://vibe-coded.ai/account. Tell your agent: \\"I upgraded my plan or deleted a vibe on vibe-coded.ai; check my vibe count, then retry.\\"","code":"ENTITLEMENT_EXCEEDED","limitType":"maxVibes","limit":5,"used":5,"plan":"free","upgradeUrl":"https://vibe-coded.ai/billing"}\' 403',
+    '  else',
+    '    printf \'%s\\n\' \'{"success":true,"vibe":{"id":1}}\'',
+    '  fi',
+    'elif [[ "$method" = POST && "$url" == *"/source" ]]; then',
+    '  if [ "$VIBE_TEST_SCENARIO" = upload401 ]; then',
+    '    emit \'{"success":false,"error":"Authentication required"}\' 401',
+    '  elif [ "$VIBE_TEST_SCENARIO" = buildlimit ]; then',
+    '    emit \'{"success":false,"error":"Free allows 10 builds an hour. Your next build is available in 14 minutes (at 14:32 UTC). Keep iterating with `vibe dev`, which has no build limit. Or upgrade to Pro ($9/mo, 30 an hour): https://vibe-coded.ai/pricing","reason":"hourly_limit","retryAt":"2026-09-29T14:32:00.000Z","retryAfterSeconds":810}\' 429',
+    '  elif [ "$VIBE_TEST_SCENARIO" = rejected ]; then',
+    '    printf \'%s\\n\' \'{"success":false,"uploaded":["index.html"],"errors":[{"path":"init.log","error":"File type .log not allowed"}]}\'',
+    '  else',
+    '    printf \'%s\\n\' \'{"success":true,"buildSkipped":true}\'',
+    '  fi',
+    'elif [[ "$method" = GET && "$url" == *"/source?limit=1000"* ]]; then',
+    '  if [ "$VIBE_TEST_SCENARIO" = listtimeout ]; then',
+    '    printf \'%s\\n\' \'{"success":false,"error":"Request timeout"}\'',
+    '  elif [ "$VIBE_TEST_SCENARIO" = invalid ]; then',
+    '    printf \'not-json\\n\'',
+    '  else',
+    '    printf \'%s\\n\' "$VIBE_TEST_LIST_RESPONSE"',
+    '  fi',
+    'elif [[ "$method" = DELETE && "$url" == *"/source" ]]; then',
+    '  printf \'%s\\n\' \'{"success":true,"buildSkipped":true}\'',
+    'elif [[ "$method" = POST && "$url" == *"/publish" && "$VIBE_TEST_SCENARIO" = publishfailed ]]; then',
+    '  emit \'{"success":false,"error":"Preview build 43 failed: worker.js:2:24 Expected identifier. Run vibe logs 43 for details, then preview again before publishing."}\' 409',
+    'elif [[ "$method" = POST && "$url" == *"/publish" ]]; then',
+    '  printf \'%s\\n\' \'{"success":true,"published":true,"buildId":42}\'',
+    'elif [[ "$method" = POST && "$url" == *"/mcp" ]]; then',
+    '  if [[ "$payload" == *unbuilt_rpc* ]]; then',
+    '    emit \'{"jsonrpc":"2.0","error":{"code":-32000,"message":"Vibe not found"},"id":null}\' 404',
+    '  elif [[ "$payload" == *unbuilt_tool* ]]; then',
+    '    emit \'{"success":false,"error":"Vibe not found"}\' 404',
+    '  elif [[ "$payload" == *no_such_tool* ]]; then',
+    '    emit \'{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"Tool not found"}}\' 404',
+    '  elif [[ "$payload" == *failing_tool* ]]; then',
+    '    emit "$(printf \'event: message\\ndata: %s\' \'{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"bad input"}],"isError":true}}\')" 200',
+    '  else',
+    '    emit "$(printf \'event: message\\ndata: %s\' \'{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\\"success\\":true}"}]}}\')" 200',
+    '  fi',
+    'elif [[ "$method" = POST && "$url" == *"/mcp-tokens" ]]; then',
+    '  if [ "$VIBE_TEST_SCENARIO" = mintfail ]; then',
+    '    printf \'%s\\n\' \'{"success":false,"error":"Only the owner can connect this vibe"}\'',
+    '  else',
+    '    printf \'%s\\n\' \'{"success":true,"token":"conn-tok","jti":"new-jti","expiresAt":"2026-12-26T00:00:00.000Z","url":"https://tester--demo.vibe-coded.app/mcp"}\'',
+    '  fi',
+    'elif [[ "$method" = GET && "$url" == *"/mcp-tokens" ]]; then',
+    '  emit \'{"success":true,"url":"https://alice--demo.vibe-coded.app/mcp"}\' 200',
+    'elif [[ "$method" = DELETE && "$url" == *"/mcp-tokens/"* ]]; then',
+    '  printf \'%s\\n\' \'{"success":true,"revoked":true}\'',
+    'elif [[ "$method" = GET && "$url" == https://*"tester--demo.vibe-coded.app"* ]]; then',
+    '  code=200; body="<h1>private owner view</h1>"',
+    '  [ "$VIBE_TEST_SCENARIO" = fetch401 ] && { code=401; body="{\\"error\\":\\"Authentication required\\"}"; }',
+    '  [ "$VIBE_TEST_SCENARIO" = fetch401worker ] && { code=401; body="{\\"success\\":false,\\"error\\":\\"invalid or missing X-Webhook-Token\\"}"; }',
+    '  [ "$VIBE_TEST_SCENARIO" = fetch404 ] && { code=404; body="Not found"; }',
+    '  if [ -n "$outfile" ]; then printf "%s\\n" "$body" > "$outfile"; else printf "%s\\n" "$body"; fi',
+    '  if [ -n "$writeout" ]; then printf "%s" "$code"; fi',
+    'elif [[ "$method" = GET && "$url" == *"/tester/demo" ]]; then',
+    '  emit "$VIBE_TEST_DETAIL_RESPONSE" 200',
+    'else',
+    '  printf \'%s\\n\' \'{"success":false,"error":"unexpected stub request"}\'',
+    'fi',
+  ].join('\n');
+  const curlPath = join(stubBin, 'curl');
+  writeFileSync(curlPath, curlStub, { mode: 0o755 });
+  // Never let a test reach the real Claude Code config: a stub `claude` is
+  // first on PATH, and the noclaude scenario drops every dir but the basics.
+  let path = `${stubBin}:${process.env.PATH}`;
+  if (scenario === 'noclaude') {
+    symlinkSync(execFileSync('which', ['jq'], { encoding: 'utf8' }).trim(), join(stubBin, 'jq'));
+    path = `${stubBin}:/usr/bin:/bin`;
+  } else {
+    writeFileSync(join(stubBin, 'claude'), [
+      '#!/usr/bin/env bash',
+      'printf "claude\\t%s\\n" "$*" >> "$VIBE_TEST_LOG"',
+      'if [ "$VIBE_TEST_SCENARIO" = claudefail ] && [ "$2" = add ]; then exit 1; fi',
+      'if [ "$2" = get ]; then',
+      '  if [ "$VIBE_TEST_SCENARIO" = unreachable ]; then',
+      '    printf "%s:\\n  Status: ✘ Failed to connect\\n  Issue: HTTP 404\\n" "$3"; exit 1',
+      '  else',
+      '    printf "%s:\\n  Scope: User config\\n  Status: ✔ Connected\\n" "$3"',
+      '  fi',
+      'fi',
+    ].join('\n'), { mode: 0o755 });
+  }
+  const connectionsPath = join(home, '.vibe-coded', 'connections.json');
+  if (command === 'login') {
+    writeFileSync(join(home, '.vibe-coded', 'pending-login.json'), JSON.stringify({
+      deviceCode: 'synthetic-device-code', interval: 1, expiresAt: 4070908800,
+    }));
+    if (['loginconnected', 'logindenied', 'loginstart'].includes(scenario)) {
+      writeFileSync(connectionsPath, JSON.stringify({
+        'tester--demo': { jti: 'synthetic-old-demo', name: 'demo' },
+        'alice--notes': { jti: 'synthetic-old-notes', name: 'notes' },
+      }));
+    } else if (scenario === 'loginempty') {
+      writeFileSync(connectionsPath, '{}');
+    }
+  }
+  if (scenario === 'nameclash' || scenario === 'samevibe') {
+    const url = scenario === 'nameclash' ? 'https://mcp.example.com/mcp' : 'https://tester--demo.vibe-coded.app/mcp';
+    writeFileSync(join(home, '.claude.json'), JSON.stringify({ mcpServers: { demo: { type: 'http', url } } }));
+  }
+  if (scenario === 'connected' || scenario === 'multiconnected') {
+    writeFileSync(connectionsPath, JSON.stringify({
+      'tester--demo': {
+        jti: 'old-jti', expiresAt: '2026-10-01T00:00:00.000Z', name: 'demo',
+        ...(scenario === 'multiconnected' ? { additionalJtis: ['printed-jti', 'another-jti'] } : {}),
+      },
+    }));
+  }
+
+  const result = spawnSync('bash', [VIBE_BIN, command, ...args], {
+    cwd: project,
+    encoding: 'utf8',
+    timeout: 10000,
+    env: {
+      ...process.env,
+      HOME: home,
+      PATH: path,
+      VIBE_NO_UPDATE_CHECK: '1',
+      VIBE_TEST_LOG: log,
+      VIBE_TEST_SCENARIO: scenario,
+      VIBE_TEST_LIST_RESPONSE: listResponse,
+      VIBE_TEST_DETAIL_RESPONSE: JSON.stringify(detailResponse),
+      VIBE_TEST_LOGIN_TOKEN: `synthetic.${Buffer.from(JSON.stringify({ slug: 'tester', exp: 4070908800 })).toString('base64url')}.synthetic`,
+    },
+  });
+  const calls = existsSync(log) ? readFileSync(log, 'utf8') : '';
+  const connections = existsSync(connectionsPath) ? JSON.parse(readFileSync(connectionsPath, 'utf8')) : null;
+  const gitignore = existsSync(join(project, '.gitignore')) ? readFileSync(join(project, '.gitignore'), 'utf8') : '';
+  rmSync(root, { recursive: true, force: true });
+  return { ...result, calls, connections, gitignore };
+}
+
+function runPreview(args = [], scenario = 'normal', detailResponse) {
+  return runCli('preview', args, scenario, detailResponse);
+}
+
+function getFreePort() {
+  return new Promise((resolvePort, reject) => {
+    const server = createServer();
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      server.close(() => resolvePort(address.port));
+    });
+  });
+}
+
+// depsDir: where the stub packages go, relative to the temp root (default: the skill).
+function setupDevRuntime(depsDir = 'skill') {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-dev-reset-test-'));
+  const skillDir = join(root, 'skill');
+  const modules = join(root, depsDir, 'node_modules');
+  const runtimeDir = join(skillDir, 'runtime');
+  const project = join(root, 'project');
+  const devDir = join(project, '.vibe-coded', 'dev');
+  const staleFile = join(devDir, 'stale-state');
+  mkdirSync(runtimeDir, { recursive: true });
+  mkdirSync(devDir, { recursive: true });
+  writeFileSync(staleFile, 'stale');
+  writeFileSync(join(project, '.vibe-coded.json'), JSON.stringify({
+    vibeSlug: 'demo', userSlug: 'tester', type: 'fullstack', storage: 'kv',
+  }));
+  writeFileSync(join(project, 'worker.js'), 'export default { fetch() { return new Response("ok"); } };');
+
+  for (const file of ['dev-server.mjs', 'mcp-tools.mjs', 'sql-statements.mjs', 'dispatch-header-policy.mjs', 'static-content-types.mjs', 'static-artifact-paths.js', 'client-adapter.js', 'dev-storage.js', 'r2-keys.js', 'outbound-worker.js', 'local-outbound.mjs', 'local-outbound-service.mjs', 'local-storage-host.mjs']) {
+    copyFileSync(join(RUNTIME_DIR, file), join(runtimeDir, file));
+  }
+  // esbuild stub: without bun on PATH the dev server bundles via esbuild; the stub
+  // copies the entry so this test doesn't depend on either being installed.
+  for (const packageName of ['miniflare', 'chokidar', 'esbuild']) {
+    const packageDir = join(modules, packageName);
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(join(packageDir, 'package.json'), JSON.stringify({ type: 'module', exports: './index.js' }));
+  }
+  writeFileSync(join(modules, 'miniflare', 'index.js'), `
+    export class Miniflare {
+      async dispatchFetch(url) {
+        return new URL(url).pathname.startsWith('/files')
+          ? new Response('worker files route') : new Response('not found', { status: 404 });
+      }
+      async getR2Bucket(name) {
+        if (name !== 'VIBE_R2') throw new Error('Wrong bucket');
+        const objects = {
+          'vibes-preview/1/uploads/logo.png': { body: 'preview bytes', type: 'image/png' },
+          'vibes/1/uploads/logo.png': { body: 'image bytes', type: 'image/png' },
+          'vibes-preview/1/page.html': { body: '<script>alert(1)</script>' },
+          'vibes-preview/1/drawing.svg': { body: '<svg/>', type: 'image/svg+xml; charset=utf-8' },
+          'vibes-preview/1/data.xml': { body: '<data/>', type: 'application/custom+xml' },
+          'vibes-preview/1/archive.zip': { body: 'archive bytes', type: 'application/zip' },
+          'vibes-preview/1/song.mp3': { body: 'audio bytes', type: 'audio/mpeg' },
+          'vibes-preview/1/movie.mp4': { body: 'video bytes', type: 'video/mp4' },
+          'vibes-preview/1/document.pdf': { body: 'pdf bytes', type: 'application/pdf' },
+          'vibes-preview/1/note.txt': { body: 'plain bytes', type: 'TEXT/PLAIN; charset=utf-8' },
+          'vibes-preview/1/font.woff2': { body: 'font bytes', type: 'font/woff2' },
+        };
+        const get = async key => {
+          const item = objects[key];
+          return item ? { size: Buffer.byteLength(item.body), httpEtag: '\"local-etag\"',
+            httpMetadata: { contentType: item.type },
+            async arrayBuffer() { return Buffer.from(item.body); } } : null;
+        };
+        return { get, head: get };
+      }
+      async dispose() {}
+      async setOptions() {}
+    }
+  `);
+  writeFileSync(join(modules, 'esbuild', 'index.js'), `
+    import { copyFileSync } from 'node:fs';
+    export async function build({ entryPoints, outfile }) { copyFileSync(entryPoints[0], outfile); }
+  `);
+  writeFileSync(join(modules, 'chokidar', 'index.js'), `
+    import assert from 'node:assert/strict';
+    import { statSync, writeFileSync, unlinkSync } from 'node:fs';
+    import { resolve } from 'node:path';
+    export default { watch(paths, options) {
+      const worker = resolve('worker.js');
+      const stats = statSync(worker);
+      assert.equal(options.ignored(worker, stats), false);
+      writeFileSync('.vibeignore', 'worker.js\\n');
+      assert.equal(options.ignored(worker, stats), true);
+      writeFileSync('.vibeignore', '*.js\\n!worker.js\\n');
+      assert.equal(options.ignored(worker, stats), false);
+      unlinkSync('.vibeignore');
+      return { on() { return this; }, async close() {} };
+    } };
+  `);
+  return { root, runtimeDir, project, devDir, staleFile, modules };
+}
+
+test('vibe dev --reset starts the server and honours ignore rules for serving and watching', async (t) => {
+  const { root, runtimeDir, project, devDir, staleFile } = setupDevRuntime();
+  let port;
+  try {
+    port = await getFreePort();
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    if (error?.code === 'EPERM') {
+      t.skip('loopback binding is not permitted in this environment');
+      return;
+    }
+    throw error;
+  }
+  const child = spawn(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), '--reset', '--port', String(port)], {
+    cwd: project,
+    env: { ...process.env, VIBE_DEV_PLAN: 'pro' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', chunk => { stdout += chunk; });
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  t.after(() => {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  await new Promise((resolveStarted, reject) => {
+    const timer = setTimeout(() => reject(new Error(`server did not start\nstdout:\n${stdout}\nstderr:\n${stderr}`)), 10000);
+    child.stdout.on('data', () => {
+      if (stdout.includes('Watching worker for changes')) {
+        clearTimeout(timer);
+        resolveStarted();
+      }
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      reject(new Error(`server exited before startup (${code ?? signal})\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    });
+  });
+
+  writeFileSync(join(project, 'REPORT.md'), 'private report');
+  writeFileSync(join(project, 'keep.md'), 'published markdown');
+  mkdirSync(join(project, 'docs'));
+  writeFileSync(join(project, 'docs', 'private.txt'), 'private docs');
+  const local = `http://127.0.0.1:${port}`;
+  assert.equal((await fetch(local + '/REPORT.md')).status, 404);
+  assert.equal(await (await fetch(local + '/docs/private.txt')).text(), 'private docs');
+  writeFileSync(join(project, '.vibeignore'), 'docs/\n*.md\n!keep.md\n');
+  assert.equal((await fetch(local + '/docs/private.txt')).status, 404);
+  assert.equal((await fetch(local + '/%64ocs/private.txt')).status, 404);
+  assert.equal(await (await fetch(local + '/keep.md')).text(), 'published markdown');
+  writeFileSync(join(project, '.vibeignore'), 'index.html\n');
+  writeFileSync(join(project, 'index.html'), 'private index');
+  assert.equal((await fetch(local + '/')).status, 404);
+  assert.equal((await fetch(local + '/missing')).status, 404);
+
+  mkdirSync(join(project, 'files', 'uploads'), { recursive: true });
+  writeFileSync(join(project, 'files', 'uploads', 'logo.png'), 'static shadow');
+  writeFileSync(join(project, 'index.html'), 'SPA fallback');
+  writeFileSync(join(project, '.vibeignore'), 'files/\n');
+  await t.test('/files serves local R2 before static, worker and SPA routes', async () => {
+    const image = await fetch(local + '/files/uploads/logo.png');
+    assert.equal(image.status, 200);
+    assert.equal(image.headers.get('content-type'), 'image/png');
+    assert.equal(image.headers.get('content-disposition'), null);
+    assert.equal(image.headers.get('content-security-policy'), 'sandbox');
+    assert.equal(await image.text(), 'preview bytes');
+    for (const key of ['song.mp3', 'movie.mp4', 'document.pdf', 'note.txt', 'font.woff2']) {
+      const response = await fetch(local + '/files/' + key);
+      assert.equal(response.status, 200, key);
+      assert.equal(response.headers.get('content-disposition'), null, key);
+      await response.text();
+    }
+  });
+  await t.test('/files serves HTML, SVG and XML as plain text attachments', async () => {
+    for (const key of ['page.html', 'drawing.svg', 'data.xml']) {
+      const response = await fetch(local + '/files/' + key);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('content-type'), 'text/plain');
+      assert.equal(response.headers.get('content-disposition'), `attachment; filename="${key}"`);
+      assert.equal(response.headers.get('content-security-policy'), 'sandbox');
+      assert.ok((await response.text()).startsWith('<'));
+    }
+    const archive = await fetch(local + '/files/archive.zip');
+    assert.equal(archive.headers.get('content-disposition'), 'attachment');
+    assert.equal(archive.headers.get('content-type'), 'application/zip');
+    await archive.text();
+  });
+  await t.test('/files returns the production missing-key response without a fallback', async () => {
+    for (const key of ['/files', '/files/', '/files/missing.png', '/files/%252e%252e%252fpage.html', '/files/bad%5ckey']) {
+      const response = await fetch(local + key);
+      assert.equal(response.status, 404, key);
+      assert.equal(response.headers.get('cache-control'), 'no-store');
+      assert.deepEqual(await response.json(), { success: false, error: 'File not found' });
+    }
+    const head = await fetch(local + '/files/page.html', { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal(head.headers.get('content-type'), 'text/plain');
+    assert.equal(await head.text(), '');
+    const post = await fetch(local + '/files/page.html', { method: 'POST' });
+    assert.equal(post.status, 405);
+    assert.equal(post.headers.get('allow'), 'GET, HEAD');
+    await post.text();
+  });
+
+  assert.equal(existsSync(staleFile), false);
+  assert.equal(existsSync(join(devDir, 'worker.js')), true);
+  child.kill('SIGTERM');
+  await new Promise(resolveExit => child.once('exit', resolveExit));
+});
+
+test('vibe dev reports a busy IPv4 or IPv6 port in one actionable line and exits 1', () => {
+  const { root, runtimeDir, project } = setupDevRuntime();
+  try {
+    // Emit Node server events without opening sockets or starting workerd.
+    const preload = join(root, 'busy-port.cjs');
+    writeFileSync(preload, `
+      const { EventEmitter } = require('node:events');
+      const http = require('node:http');
+      const net = require('node:net');
+      const { syncBuiltinESMExports } = require('node:module');
+      http.createServer = () => {
+        const server = new EventEmitter();
+        server.listen = (_port, _host, ready) => {
+          queueMicrotask(() => {
+            if (process.env.VIBE_TEST_PORT_FAMILY === 'ipv4') {
+              server.emit('error', Object.assign(new Error('listen EADDRINUSE'), { code: 'EADDRINUSE' }));
+            } else ready();
+          });
+          return server;
+        };
+        server.close = () => {};
+        return server;
+      };
+      net.createServer = () => {
+        const server = new EventEmitter();
+        server.listen = () => {
+          queueMicrotask(() => server.emit('error', Object.assign(new Error('listen EADDRINUSE'), { code: 'EADDRINUSE' })));
+          return server;
+        };
+        return server;
+      };
+      syncBuiltinESMExports();
+    `);
+    for (const family of ['ipv4', 'ipv6']) {
+      const result = spawnSync(process.execPath, ['--require', preload, realpathSync(join(runtimeDir, 'dev-server.mjs')), '--port', '8787'], {
+        cwd: project, encoding: 'utf8', timeout: 10000,
+        env: { ...process.env, VIBE_DEV_PLAN: 'pro', VIBE_TEST_PORT_FAMILY: family },
+      });
+      assert.equal(result.status, 1, `${family}: ${result.stderr}`);
+      assert.equal(result.stderr, 'Port 8787 is in use — run: vibe dev --port 8788 (or stop the other process).\n');
+      assert.doesNotMatch(result.stdout, /Watching worker/);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('splitSqlStatements: splits on semicolons, trims', () => {
+  const out = splitSqlStatements('CREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);');
+  assert.deepEqual(out, ['CREATE TABLE t (id INT)', 'INSERT INTO t VALUES (1)']);
+});
+
+test('splitSqlStatements: a -- line comment does NOT swallow the next statement (regression: finding #1)', () => {
+  const sql = `INSERT INTO t VALUES (1); -- first row\nINSERT INTO t VALUES (2);`;
+  const out = splitSqlStatements(sql);
+  assert.deepEqual(out, ['INSERT INTO t VALUES (1)', 'INSERT INTO t VALUES (2)']);
+});
+
+test('splitSqlStatements: leading header comment yields the real statements, not zero', () => {
+  const sql = `-- seed users\nINSERT INTO users (name) VALUES ('a');`;
+  const out = splitSqlStatements(sql);
+  assert.deepEqual(out, ["INSERT INTO users (name) VALUES ('a')"]);
+});
+
+test('splitSqlStatements: block comments stripped', () => {
+  const out = splitSqlStatements('/* header */ SELECT 1; /* mid */ SELECT 2;');
+  assert.deepEqual(out, ['SELECT 1', 'SELECT 2']);
+});
+
+test('splitSqlStatements: semicolons inside string literals are not split points', () => {
+  const out = splitSqlStatements("INSERT INTO t (s) VALUES ('a;b'); SELECT 1;");
+  assert.deepEqual(out, ["INSERT INTO t (s) VALUES ('a;b')", 'SELECT 1']);
+});
+
+test("splitSqlStatements: escaped '' inside a literal handled", () => {
+  const out = splitSqlStatements("INSERT INTO t (s) VALUES ('o''brien');");
+  assert.deepEqual(out, ["INSERT INTO t (s) VALUES ('o''brien')"]);
+});
+
+test('extractTools: parses @mcp-expose function with params', () => {
+  const src = `
+    /**
+     * @mcp-expose
+     * @mcp-scope write
+     * @description Create a thing
+     * @param {string} name - the name
+     * @param {number} [count] - optional count
+     */
+    async function create_thing(name, count, env) {}
+  `;
+  const tools = extractTools(src);
+  assert.equal(tools.length, 1);
+  assert.equal(tools[0].name, 'create_thing');
+  assert.equal(tools[0].description, 'Create a thing');
+  assert.equal(tools[0].inputSchema.properties.name.type, 'string');
+  assert.equal(tools[0].inputSchema.properties.count.type, 'number');
+  assert.deepEqual(tools[0].inputSchema.required, ['name']); // count is optional
+});
+
+test('extractTools: warns when annotated function forms are dropped like the platform extractor', () => {
+  const src = `
+/** @mcp-expose */
+const arrow_tool = async (env) => {};
+class Tools {
+  /** @mcp-expose */
+  async method_tool(env) {}
+}
+/** @mcp-expose */
+function sync_tool(env) {}
+`;
+  const result = extractToolsWithWarnings(src);
+  assert.equal(result.tools.length, 0);
+  assert.deepEqual(result.warnings.map(({ tool, severity }) => ({ tool, severity })), [
+    { tool: 'arrow_tool', severity: 'warning' },
+    { tool: 'method_tool', severity: 'warning' },
+    { tool: 'sync_tool', severity: 'warning' },
+  ]);
+  assert.match(result.warnings[0].issue, /arrow\/variable assignment/);
+  assert.match(result.warnings[1].issue, /class or object method/);
+  assert.match(result.warnings[2].issue, /non-async function/);
+
+  const messages = [];
+  const original = console.error;
+  console.error = (message) => messages.push(message);
+  try {
+    printDroppedTools(result.warnings);
+  } finally {
+    console.error = original;
+  }
+  assert.equal(messages.length, 3);
+  assert.match(messages[0], /MCP tool 'arrow_tool' was dropped/);
+  assert.match(messages[1], /MCP tool 'method_tool' was dropped/);
+  assert.match(messages[2], /MCP tool 'sync_tool' was dropped/);
+});
+
+test('extractTools: ignores functions without @mcp-expose', () => {
+  const src = `/**\n * @description helper\n */\nasync function _helper(env) {}`;
+  assert.equal(extractTools(src).length, 0);
+});
+
+test('extractTools: drops tools that production rejects and reports the reason', () => {
+  const src = `/**\n * @mcp-expose\n * @description Invalid camelCase tool\n */\nasync function addNote(env) {}`;
+  const result = extractToolsWithWarnings(src);
+  assert.deepEqual(result.tools, []);
+  assert.deepEqual(result.warnings, [{
+    tool: 'addNote',
+    issue: 'Tool name must be snake_case (lowercase letters, numbers, underscores only)',
+    severity: 'error',
+  }]);
+
+  const messages = [];
+  const original = console.error;
+  console.error = (message) => messages.push(message);
+  try {
+    printDroppedTools(result.warnings);
+  } finally {
+    console.error = original;
+  }
+  assert.deepEqual(messages, [
+    "Warning: MCP tool 'addNote' was dropped: Tool name must be snake_case (lowercase letters, numbers, underscores only)",
+  ]);
+});
+
+test('vibe dev refuses a worker under src because production only builds a root worker', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-dev-nested-worker-'));
+  mkdirSync(join(root, 'src'));
+  writeFileSync(join(root, '.vibe-coded.json'), JSON.stringify({ vibeSlug: 'demo', userSlug: 'tester' }));
+  writeFileSync(join(root, 'src', 'worker.ts'), 'export default { fetch() {} };');
+  try {
+    const result = spawnSync(process.execPath, [join(RUNTIME_DIR, 'dev-server.mjs')], { cwd: root, encoding: 'utf8' });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /move the worker to the project root/);
+    assert.match(result.stderr, /Production only builds a root worker/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('withDispatchHeaders proves write mode with the per-run token', () => {
+  const token = 'b'.repeat(64);
+  const headers = withDispatchHeaders({
+    'x-vibe-access-mode': 'read',
+    'x-vibe-access-token': 'client-forged-token',
+  }, {
+    vibeId: '1',
+    vibeSlug: 'app',
+    userSlug: 'alice',
+  });
+
+  assert.equal(headers.get('x-vibe-access-mode'), null);
+  assert.equal(headers.get('x-vibe-access-token'), null);
+});
+
+// vibe dev forwards only the headers production's dispatch forwards.
+const CLIENT_HEADERS = {
+  Accept: 'application/json',
+  Authorization: 'Bearer secret',
+  Cookie: 'vc_session=abc',
+  'X-Random': 'nope',
+  'Stripe-Signature': 't=1,v1=abc',
+  'X-Webhook-Token': 'shared-secret',
+  'x-mcp-call': 'true',
+  'x-forwarded-for': '1.2.3.4',
+  'cf-connecting-ip': '1.2.3.4',
+};
+const DEV_CONTEXT_HEADERS = ['x-client-ip', 'x-request-id',
+  'x-vibe-env', 'x-vibe-id', 'x-vibe-slug', 'x-vibe-user-slug'];
+
+test('withDispatchHeaders forwards only the production allowlist', () => {
+  const headers = withDispatchHeaders(CLIENT_HEADERS, { vibeId: '1', vibeSlug: 'app', userSlug: 'alice' });
+  assert.deepEqual([...headers.keys()].sort(),
+    ['accept', 'stripe-signature', 'x-webhook-token', ...DEV_CONTEXT_HEADERS].sort());
+  assert.equal(headers.get('stripe-signature'), 't=1,v1=abc');
+  assert.equal(headers.get('x-webhook-token'), 'shared-secret');
+});
+
+test('withDispatchHeaders keeps headers vibe dev adds itself, such as x-mcp-call on tool calls', () => {
+  const headers = withDispatchHeaders({ 'content-type': 'application/json' },
+    { vibeId: '1', vibeSlug: 'app', userSlug: 'alice' }, { 'x-mcp-call': 'true' });
+  assert.equal(headers.get('x-mcp-call'), 'true');
+  assert.equal(headers.get('content-type'), 'application/json');
+});
+
+test('withDispatchHeaders keeps a request id vibe dev supplies itself, and drops a client one', () => {
+  const manifest = { vibeId: '1', vibeSlug: 'app', userSlug: 'alice' };
+  const own = withDispatchHeaders({}, manifest, { 'x-request-id': 'dev-internal-1' });
+  assert.equal(own.get('x-request-id'), 'dev-internal-1');
+  const client = withDispatchHeaders({ 'x-request-id': 'client-forged' }, manifest);
+  assert.match(client.get('x-request-id'), /^dev-\d+$/);
+});
+
+test('vibe dev drops Authorization, Cookie and unknown headers before the worker sees them', async (t) => {
+  const { root, runtimeDir, project } = setupDevRuntime();
+  // Miniflare stub that echoes the headers the worker would receive.
+  writeFileSync(join(root, 'skill', 'node_modules', 'miniflare', 'index.js'), `
+    export class Miniflare {
+      async dispatchFetch(url, init) {
+        return Response.json(Object.fromEntries(new Headers(init.headers)));
+      }
+      async dispose() {}
+      async setOptions() {}
+    }
+  `);
+  let port;
+  try {
+    port = await getFreePort();
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    if (error?.code === 'EPERM') { t.skip('loopback binding is not permitted in this environment'); return; }
+    throw error;
+  }
+  const child = spawn(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), '--port', String(port)], {
+    cwd: project, env: { ...process.env, VIBE_DEV_PLAN: 'pro' }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { output += chunk; });
+  t.after(() => {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    rmSync(root, { recursive: true, force: true });
+  });
+  await new Promise((resolveStarted, reject) => {
+    const timer = setTimeout(() => reject(new Error(`server did not start\n${output}`)), 10000);
+    child.stdout.on('data', () => {
+      if (output.includes('Watching worker for changes')) { clearTimeout(timer); resolveStarted(); }
+    });
+    child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`server exited (${code})\n${output}`)); });
+  });
+
+  const seen = await (await fetch(`http://127.0.0.1:${port}/api/hook`, { method: 'POST', headers: CLIENT_HEADERS, body: '{}' })).json();
+  for (const name of ['authorization', 'cookie', 'x-random', 'x-mcp-call', 'x-forwarded-for', 'cf-connecting-ip', 'host']) {
+    assert.equal(seen[name], undefined, `${name} reached the worker`);
+  }
+  assert.equal(seen['stripe-signature'], 't=1,v1=abc');
+  assert.equal(seen['x-webhook-token'], 'shared-secret');
+  assert.equal(seen.accept, 'application/json');
+  child.kill('SIGTERM');
+  await new Promise(resolveExit => child.once('exit', resolveExit));
+});
+
+// Start dev-server.mjs and resolve once its banner is printed; null when the
+// environment forbids loopback binding (the test is then skipped).
+async function startDevServer(t, root, runtimeDir, project, env, args = []) {
+  let port;
+  try {
+    port = await getFreePort();
+  } catch (error) {
+    rmSync(root, { recursive: true, force: true });
+    if (error?.code === 'EPERM') { t.skip('loopback binding is not permitted in this environment'); return null; }
+    throw error;
+  }
+  const child = spawn(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), '--port', String(port), ...args], {
+    cwd: project, env: { ...process.env, VIBE_DEV_PLAN: 'pro', ...env }, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk; });
+  child.stderr.on('data', chunk => { output += chunk; });
+  t.after(() => {
+    if (child.exitCode === null) child.kill('SIGKILL');
+    rmSync(root, { recursive: true, force: true });
+  });
+  await new Promise((resolveStarted, reject) => {
+    const timer = setTimeout(() => reject(new Error(`server did not start\n${output}`)), 10000);
+    child.stdout.on('data', () => {
+      if (output.includes('Watching worker for changes')) { clearTimeout(timer); resolveStarted(); }
+    });
+    child.once('exit', (code) => { clearTimeout(timer); reject(new Error(`server exited (${code})\n${output}`)); });
+  });
+  return { base: `http://127.0.0.1:${port}`, output: () => output, async stop() {
+    if (child.exitCode !== null) return;
+    child.kill('SIGTERM');
+    await new Promise(resolveExit => child.once('exit', resolveExit));
+  } };
+}
+
+test('vibe dev loads miniflare, chokidar and esbuild from VIBE_DEV_DEPS, with nothing in the skill folder', async (t) => {
+  const { root, runtimeDir, project, devDir } = setupDevRuntime('cache');
+  assert.equal(existsSync(join(root, 'skill', 'node_modules')), false);
+  // No bun on PATH, so the worker is bundled with the esbuild package too.
+  const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_DEPS: join(root, 'cache'), PATH: '/usr/bin:/bin' });
+  if (!server) return;
+  assert.equal(existsSync(join(devDir, 'worker.js')), true);
+  assert.equal(existsSync(join(root, 'skill', 'node_modules')), false);
+});
+
+for (const via of ['NODE_PATH', 'an ancestor folder']) {
+  test(`vibe dev treats a package found through ${via} as not installed in its cache folder`, () => {
+    // The stub packages sit outside the cache: in another folder named by
+    // NODE_PATH, or in node_modules at the temp root above the cache.
+    const { root, runtimeDir, project, modules } = setupDevRuntime(via === 'NODE_PATH' ? 'elsewhere' : '.');
+    const cache = join(root, 'sub', 'cache');
+    try {
+      mkdirSync(join(cache, 'node_modules'), { recursive: true });
+      writeFileSync(join(project, 'seed.sql'), 'CREATE TABLE t (id INTEGER);');
+      const result = spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), 'seed', 'seed.sql'], {
+        cwd: project, encoding: 'utf8', timeout: 10000,
+        env: { ...process.env, VIBE_DEV_PLAN: 'pro', VIBE_DEV_DEPS: cache, ...(via === 'NODE_PATH' ? { NODE_PATH: modules } : {}) },
+      });
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.ok(result.stderr.startsWith(`Error: local dev dependencies could not be loaded from ${cache}.\nRemove ${cache} and run vibe dev again to reinstall them.\nCause: miniflare is not installed in ${realpathSync(join(cache, 'node_modules'))}`), result.stderr);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
+test('vibe dev never serves a manifest scratch file', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-dev-ignore-'));
+  try {
+    const isIgnored = createVibeIgnore(root);
+    for (const file of ['.vibe-coded.json', '.vibe-coded.json.AbC123', 'nested/.vibe-coded.json.x']) assert.equal(isIgnored(join(root, file)), true, file);
+    assert.equal(isIgnored(join(root, 'vibe-coded.json.txt')), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const [plan, bound, lines] of [
+  ['free', false, [
+    '  State:   .vibe-coded/dev/  (key-value, persisted)',
+    '  Plan:    Free — as deployed, env.VIBE_D1 and file writes on env.VIBE_R2 throw the plan error (code ENTITLEMENT_EXCEEDED).',
+    '           SQL and files need Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing',
+  ]],
+  ['byov', true, ['  State:   .vibe-coded/dev/  (SQL, key-value and files, persisted)', '  Plan:    Pro — SQL, key-value and files, as deployed.']],
+  ['pro', true, ['  State:   .vibe-coded/dev/  (SQL, key-value and files, persisted)', '  Plan:    Pro+ — SQL, key-value and files, as deployed.']],
+]) {
+  test(`vibe dev on plan ${plan ?? 'unknown'} binds ${bound ? 'SQL and files' : 'files but not SQL'} and says so in the banner`, async (t) => {
+    const { root, runtimeDir, project, modules } = setupDevRuntime();
+    const optionsFile = join(root, 'miniflare-options.json');
+    writeFileSync(join(modules, 'miniflare', 'index.js'), `
+      import { writeFileSync } from 'node:fs';
+      export class Miniflare {
+        constructor(options) { this.options = options.workers?.[0] ?? options; writeFileSync(${JSON.stringify(optionsFile)}, JSON.stringify(options.workers?.[0] ?? options)); }
+        async dispatchFetch() { return new Response('not found', { status: 404 }); }
+        async getR2Bucket(name) {
+          // Real Miniflare throws for a bucket it was not given.
+          if (!this.options.r2Buckets?.[name]) throw new Error(name + ' is not bound');
+          return { async get() { return null; }, async head() { return null; } };
+        }
+        async dispose() {}
+        async setOptions() {}
+      }
+    `);
+    writeFileSync(join(project, '.vibe-coded.json'), JSON.stringify({ vibeSlug: 'demo', userSlug: 'tester', type: 'fullstack', storage: 'd1' }));
+    const server = await startDevServer(t, root, runtimeDir, project, plan ? { VIBE_DEV_PLAN: plan } : {});
+    if (!server) return;
+    const options = JSON.parse(readFileSync(optionsFile, 'utf8'));
+    assert.deepEqual(options.kvNamespaces, { VIBE_STORAGE: 'VIBE_STORAGE' });
+    assert.deepEqual(options.d1Databases, { ...(bound ? { VIBE_D1: 'VIBE_D1' } : {}), PLATFORM_DB: 'LOCAL_PLATFORM_DB' });
+    assert.deepEqual(options.r2Buckets, { VIBE_R2: 'VIBE_R2' });
+    const output = server.output();
+    assert.ok(output.includes('  vibe dev — tester/demo (sql)\n'), output);
+    assert.ok(output.includes('  Runtime: current\n' + lines.join('\n') + '\n  Watching worker for changes'), output);
+    const file = await fetch(server.base + '/files/logo.png');
+    assert.equal(file.status, 404);
+    assert.deepEqual(await file.json(), { success: false, error: 'File not found' });
+  });
+}
+
+test('vibe dev --generation current (props) on an unknown plan names the next step and prints no stack unless VIBE_DEBUG is set', () => {
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  try {
+    writeFileSync(join(modules, 'miniflare', 'index.js'), `
+      export class Miniflare { constructor() { console.log('Miniflare started'); } }
+    `);
+    const run = (extra) => spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), '--generation', 'current'], {
+      cwd: project, encoding: 'utf8', timeout: 10000, env: { ...process.env, VIBE_DEV_PLAN: 'pro', VIBE_DEV_PLAN: '', VIBE_DEBUG: '', ...extra },
+    });
+    const plain = run({});
+    assert.equal(plain.status, 1);
+    assert.match(plain.stderr, /vibe login/);
+    assert.match(plain.stderr, /Then retry vibe dev/);
+    assert.doesNotMatch(plain.stderr, /\n\s+at /);
+    assert.doesNotMatch(plain.stdout, /Miniflare started/);
+    const debug = run({ VIBE_DEBUG: '1' });
+    assert.equal(debug.status, 1);
+    assert.match(debug.stderr, /\n\s+at /);
+    // The cause bin/vibe found is reported in place of a sign-in guess.
+    const tmp = run({ VIBE_DEV_PLAN_ERROR: 'Could not create a temporary file in /missing (check that it exists, is writable and has free space).' });
+    assert.equal(tmp.status, 1);
+    assert.match(tmp.stderr, /vibe dev could not read your plan, which sets the storage it runs\. Could not create a temporary file in \/missing \(check that it exists, is writable and has free space\)\. Then retry vibe dev/);
+    assert.doesNotMatch(tmp.stderr, /signed out|offline|vibe login/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('vibe dev seed on Free refuses before starting Miniflare: the deployed vibe has no SQL', () => {
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  try {
+    writeFileSync(join(modules, 'miniflare', 'index.js'), `
+      export class Miniflare { constructor() { console.log('Miniflare started'); } }
+    `);
+    writeFileSync(join(project, 'seed.sql'), 'CREATE TABLE t (id INTEGER);');
+    const result = spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs')), 'seed', 'seed.sql'], {
+      cwd: project, encoding: 'utf8', timeout: 10000, env: { ...process.env, VIBE_DEV_PLAN: 'pro', VIBE_DEV_PLAN: 'free' },
+    });
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr, 'Error: no local SQL database to seed: your plan is Free, and a Free vibe has no SQL storage once deployed. SQL requires Pro ($9/mo) or Pro+ ($20/mo): vibe-coded.ai/pricing. Tell your agent: "use key-value storage".\n');
+    assert.doesNotMatch(result.stdout, /Miniflare started/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+const MISSING_FETCH = 'worker.js has no default export with a fetch handler. Add `export default { async fetch(request, env) { … } }`'
+  + ' that routes each API request to its function; see the tools template.';
+
+function platformAcorn() {
+  const canonicalPackage = resolve(RUNTIME_DIR, '../../../src/package.json');
+  return existsSync(canonicalPackage) ? dirname(createRequire(canonicalPackage).resolve('acorn/package.json')) : null;
+}
+
+test('lacksFetchHandler matches the build runner on emitted bundles', async (t) => {
+  const acornDir = platformAcorn();
+  if (!acornDir) { t.skip('acorn lives in the platform repo'); return; }
+  const { parse } = await import(pathToFileURL(createRequire(join(acornDir, 'package.json')).resolve('acorn')).href);
+  const { lacksFetchHandler } = await import('../dev-server.mjs');
+  for (const bundle of [
+    'export{r as default};var r={async addItem(){}};',
+    'var r={a:1};export{r as default,t as addItem};function t(){}',
+    'var e={async listItems(){}};var c=e;export{c as default};',
+    'export function addItem(){}',
+    'export default {};',
+    'export default async function(){}',
+    'async function h(){}\nexport { h as default };',
+  ]) assert.equal(lacksFetchHandler(parse, bundle), true, bundle);
+  for (const bundle of [
+    'var r={async fetch(){}};export{r as default};',
+    'var r={"fetch":()=>1};export{r as default};',
+    'var r={[k]:1};export{r as default};',
+    'var r={__proto__:{fetch(){}}};export{r as default};',
+    'var b={fetch(){}};export default {...b};',
+    'var a={};a.fetch=()=>1;export{a as default};',
+    'export{default}from"./elsewhere.js";',
+    'import{WorkerEntrypoint as W}from"cloudflare:workers";export default class extends W{}',
+    'function c(){return{fetch(){}}}export default c();',
+  ]) assert.equal(lacksFetchHandler(parse, bundle), false, bundle);
+});
+
+test('vibe dev refuses a worker with no default fetch handler before starting Miniflare', (t) => {
+  const acornDir = platformAcorn();
+  if (!acornDir) { t.skip('acorn lives in the platform repo'); return; }
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  try {
+    cpSync(acornDir, join(modules, 'acorn'), { recursive: true });
+    writeFileSync(join(modules, 'miniflare', 'index.js'), `
+      export class Miniflare { constructor() { console.log('Miniflare started'); } }
+    `);
+    writeFileSync(join(project, 'worker.js'), '/** @mcp-expose */\nexport async function add_item(args, env) { return args; }\n');
+    const result = spawnSync(process.execPath, [realpathSync(join(runtimeDir, 'dev-server.mjs'))], {
+      cwd: project, encoding: 'utf8', timeout: 20000, env: { ...process.env, VIBE_DEV_PLAN: 'pro', PATH: dirname(process.execPath) },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(result.stderr.trim().split('\n').at(-1), `Error: ${MISSING_FETCH}`);
+    assert.doesNotMatch(result.stdout, /Miniflare started/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('vendored dispatch-header-policy.mjs is byte-identical to the platform copy', (t) => {
+  const canonical = resolve(RUNTIME_DIR, '../../../src/services/dispatch-header-policy.mjs');
+  if (!existsSync(canonical)) { t.skip('not running inside the platform repo'); return; }
+  assert.ok(readFileSync(join(RUNTIME_DIR, 'dispatch-header-policy.mjs')).equals(readFileSync(canonical)),
+    'skills/vibe-coded-ai/runtime/dispatch-header-policy.mjs drifted from src/services/; cp the platform copy over it');
+});
+
+test('local R2 fallback content types match production', async () => {
+  const { getContentType } = await import('../static-content-types.mjs');
+  const canonical = resolve(RUNTIME_DIR, '../../../src/utils/static-content-types.ts');
+  if (!existsSync(canonical)) return;
+  const entries = [...readFileSync(canonical, 'utf8').matchAll(/'([^']+)': '([^']+)'/g)];
+  for (const [, extension, contentType] of entries) {
+    assert.equal(getContentType(`file.${extension}`), contentType);
+  }
+});
+
+test('vibe preview prunes remote files absent from the upload manifest', () => {
+  const result = runPreview([], 'uploaded');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Removed remote file: stale\.html/);
+  assert.match(result.calls, /POST\thttps:\/\/stub\.invalid\/api\/v1\/vibes\/tester\/demo\/source\t.*"deletePaths":\["stale\.html"\]/);
+  assert.doesNotMatch(result.calls, /^DELETE\t[^\n]*\/source\t/m);
+  assert.equal((result.calls.match(/^POST\t[^\n]*\/source\t/gm) || []).length, 1);
+  assert.doesNotMatch(result.calls, /state\.json/);
+});
+
+test('vibe preview without upload history keeps remote files missing locally', () => {
+  const result = runPreview();
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /No upload history in this manifest/);
+  assert.match(result.stdout, /Kept 1 remote file\(s\).*stale\.html/);
+  assert.match(result.calls, /POST\t[^\n]*\/source\t.*"deletePaths":\[\]/);
+  assert.doesNotMatch(result.stdout, /Removed remote file:/);
+});
+
+test('vibe preview never uploads a .git file (worktree / submodule)', () => {
+  const result = runPreview([], 'gitfile');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.calls, /"index\.html":/);
+  assert.doesNotMatch(result.calls, /"\.git":/);
+});
+
+test('vibe preview excludes .gitignore and lists every uploaded filename for a small upload', () => {
+  const result = runPreview([], 'uploadnames');
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.calls, /"(?:assets\/)?\.gitignore":/);
+  assert.match(result.stdout, /Uploaded 3 files\.\n[\s\S]*With no build step, these 3 are publicly readable at their paths/);
+  for (const path of ['index.html', 'assets/style.css', 'file with spaces.txt']) {
+    assert.ok(result.stdout.includes(`  ${path}\n`), result.stdout);
+  }
+  assert.doesNotMatch(result.stdout, /…and/);
+});
+
+test('vibe preview lists at most 20 filenames and reports the remaining count', () => {
+  for (const [scenario, count] of [['upload20', 20], ['upload21', 21]]) {
+    const result = runPreview([], scenario);
+    assert.equal(result.status, 0, result.stderr);
+    const upload = result.calls.split('\n').find(line => line.startsWith('POST\t') && line.includes('/source\t'));
+    const paths = Object.keys(JSON.parse(upload.split('\t')[2]).files).sort();
+    const listed = result.stdout.split('\n').filter(line => paths.includes(line.trim())).map(line => line.trim());
+    assert.equal(paths.length, count);
+    assert.deepEqual(listed, paths.slice(0, 20));
+    if (count === 20) assert.doesNotMatch(result.stdout, /…and/);
+    else assert.match(result.stdout, /…and 1 more/);
+  }
+});
+
+test('vibe preview never uploads agent/editor folders, but keeps .well-known and build dotfiles', () => {
+  const result = runPreview([], 'dotdirs');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.calls, /"\.(claude|cursor|codex|vscode)\//);
+  assert.match(result.calls, /"\.well-known\/security\.txt":/);
+  assert.match(result.calls, /"public\/\.well-known\/assetlinks\.json":/);  // Vite copies public/ into dist/
+  assert.match(result.calls, /"\.npmrc":/);                                   // build config still uploads
+});
+
+test('vibe preview never uploads local secrets or SQL seed files', () => {
+  const result = runPreview([], 'localfiles');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.calls, /\.dev\.vars|schema\.sql|do-not-upload|private_data/);
+});
+
+test('vibe preview excludes root agent notes but uploads build inputs and nested Markdown', () => {
+  const result = runPreview([], 'agentnotes');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.calls, /"(?:AGENTS|claude|GEMINI|MODEL|review-MODEL|OBSERVATIONS|SPEC|TODO|NOTES|README)\.md":/);
+  assert.match(result.calls, /"worker\.ts":/);
+  assert.match(result.calls, /"package\.json":/);
+  assert.match(result.calls, /"tsconfig\.json":/);
+  assert.match(result.calls, /"content\/posts\/MODEL\.md":/);
+  assert.doesNotMatch(result.calls, /"guide\.md":/);
+});
+
+// The readable list leaves out what the platform never serves
+// (isRootStaticFileExcluded + lockfiles at any depth), though they upload.
+test('vibe preview does not list never-served files as readable', () => {
+  const result = runPreview([], 'neverserved');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.calls, /"package\.json":/);   // still uploaded (build input)
+  const listed = result.stdout.split('\n').filter(line => line.startsWith('  ')).map(line => line.trim());
+  for (const hidden of ['package.json', 'bun.lock', 'wrangler.toml', 'tsconfig.json', 'sub/yarn.lock']) {
+    assert.ok(!listed.includes(hidden), `${hidden} listed: ${result.stdout}`);
+  }
+  assert.ok(listed.includes('data/plants.json'), result.stdout);
+  assert.ok(listed.includes('sub/package.json'), result.stdout);
+});
+
+test('vibe preview without a build step describes which uploaded paths can be served', () => {
+  const result = runPreview([], 'uploadnames');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.stdout.includes('With no build step, these 3 are publicly readable at their paths (any the worker imports are bundled and not served):\n'), result.stdout);
+  assert.doesNotMatch(result.stdout, /only dist\/ is served/);
+  assert.equal(result.stderr.includes('Warning'), false, result.stderr);
+});
+
+test('vibe preview describes file access using the vibe visibility and reuses the detail lookup', () => {
+  for (const visibility of ['private', 'public', 'unlisted']) {
+    for (const nested of [false, true]) {
+      const detail = { visibility, mcpToolCount: 0 };
+      const result = runPreview([], 'uploadnames', { success: true, ...(nested ? { vibe: detail } : detail) });
+      assert.equal(result.status, 0, result.stderr);
+      const access = visibility === 'private'
+        ? 'readable at their paths by anyone who can open this vibe'
+        : 'publicly readable at their paths';
+      assert.ok(result.stdout.includes(`With no build step, these 3 are ${access} (any the worker imports`), result.stdout);
+      if (visibility === 'private') assert.doesNotMatch(result.stdout, /publicly readable/);
+      assert.equal((result.calls.match(/^GET\thttps:\/\/stub\.invalid\/api\/v1\/vibes\/tester\/demo\t/gm) || []).length, 1);
+    }
+  }
+});
+
+test('vibe preview still uploads when the vibe-details lookup fails', () => {
+  const result = runPreview([], 'status500');
+  assert.match(result.calls, /^POST\t[^\n]*\/source\t/m);
+  assert.match(result.stdout, /anyone who can open this vibe \(public vibes: anyone\)/);
+});
+
+test('vibe preview with an unknown visibility still uploads, with neutral wording', () => {
+  const result = runPreview([], 'normal', { success: true });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /anyone who can open this vibe \(public vibes: anyone\)/);
+  assert.match(result.calls, /^POST\t[^\n]*\/source\t/m);
+});
+
+test('vibe preview with a build step says only the built dist/ is served and never uploads dist/', () => {
+  const result = runPreview([], 'withdist');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /The platform runs your build and serves only its dist\/ output/);
+  assert.doesNotMatch(result.stdout, /With no build step/);
+  assert.doesNotMatch(result.calls, /"dist\//);
+});
+
+test('a local dist/ without a build step does not change the contract (dist/ is never uploaded)', () => {
+  const result = runPreview([], 'staledist');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /this 1 is publicly readable at its path /);
+});
+
+test('vibe preview refuses ambiguous root worker.ts + worker.js before any request', () => {
+  const result = runPreview([], 'dualworker');
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Both worker\.ts and worker\.js exist/);
+  assert.equal(result.calls, '');
+});
+
+test('vibe preview refuses an active build before saying files were uploaded', () => {
+  const result = runPreview([], 'pendingpreflight');
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Build 43 is still building/);
+  assert.doesNotMatch(result.stdout, /Upload(?:ing|ed)/);
+  assert.doesNotMatch(result.calls, /^POST\t[^\n]*\/source\t/m);
+});
+
+test('vibe init creates private invite-only vibes and protects local state in .gitignore', () => {
+  const result = runCli('init', ['fresh-vibe']);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.calls, /POST\thttps:\/\/stub\.invalid\/api\/v1\/vibes\t/);
+  assert.match(result.calls, /"visibility": "private"/);
+  assert.match(result.calls, /"interactionPolicy": "invite_only"/);
+  assert.equal(result.gitignore, '.vibe-coded/\n.dev.vars\n');
+});
+
+test('vibe init rejects public and unlisted before any request and accepts private as a no-op', () => {
+  for (const visibility of ['public', 'unlisted']) {
+    const result = runCli('init', ['fresh-vibe', '--visibility', visibility]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stderr.trim(), 'Set visibility on the website after init: https://vibe-coded.ai/account (vibe settings). init creates private vibes.');
+    assert.equal(result.calls, '');
+  }
+  const result = runCli('init', ['fresh-vibe', '--visibility', 'private']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.calls, /"visibility": "private"/);
+  assert.doesNotMatch(result.calls, /^PATCH\t/m);
+  const help = runCli('init', ['--help']);
+  assert.match(help.stdout, /--visibility private/);
+  assert.doesNotMatch(help.stdout, /public|unlisted/);
+});
+
+test('vibe init renders a vibe-cap response through the plan gate', () => {
+  const result = runCli('init', ['fresh-vibe'], 'vibecap');
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Vibe limit reached \(5\/5\)/);
+  assert.match(result.stderr, /Pro \(\$9\/mo\).*Pro\+ \(\$20\/mo\)/);
+  assert.match(result.stderr, /https:\/\/vibe-coded\.ai\/account/);
+  assert.match(result.stderr, /Tell your agent:.*then retry vibe init fresh-vibe\./);
+  assert.equal(result.stderr.trim().split('\n').length, 1);
+  assert.doesNotMatch(result.stderr, /Limit reached on the free plan/);
+});
+
+test('vibe init prints one agent instruction with every original option on a vibe cap', () => {
+  const args = ['fresh-vibe', '--template', 'tools', '--title', 'Fresh Tracker', '--visibility', 'private', '--storage', 'kv'];
+  for (const scenario of ['vibecap', 'vibecapbyov', 'vibecappro']) {
+    const result = runCli('init', args, scenario);
+
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal((result.stderr.match(/Tell your agent:/g) || []).length, 1, result.stderr);
+    assert.match(result.stderr, /Tell your agent:.*--template tools/);
+    const retryCommand = result.stderr.match(/then retry (vibe init .*?)(?:\.?)"\s*$/)?.[1];
+    assert.ok(retryCommand, result.stderr);
+    const replay = spawnSync('bash', ['-c', `vibe() { printf '%s\\0' "$@"; }\n${retryCommand}`], { encoding: 'utf8' });
+    assert.equal(replay.status, 0, replay.stderr);
+    assert.deepEqual(replay.stdout.split('\0').slice(0, -1), ['init', ...args]);
+  }
+});
+
+test('vibe-cap guidance only names plans that raise the limit', () => {
+  const pro = runCli('init', ['fresh-vibe'], 'vibecappro');
+  assert.equal(pro.status, 1);
+  assert.doesNotMatch(pro.stderr, /Pro \(\$9|upgrade/i);
+  assert.match(pro.stderr, /Pro\+ is the highest plan/);
+  assert.match(pro.stderr, /https:\/\/vibe-coded\.ai\/account\. Tell your agent: "I deleted a vibe on vibe-coded\.ai; check my vibe count, then retry vibe init fresh-vibe\."/);
+
+  const byov = runCli('init', ['fresh-vibe'], 'vibecapbyov');
+  assert.equal(byov.status, 1);
+  assert.doesNotMatch(byov.stderr, /Pro \(\$9/);
+  assert.match(byov.stderr, /https:\/\/vibe-coded\.ai\/billing/);
+  assert.match(byov.stderr, /Pro\+ \(\$20\/mo\)/);
+});
+
+test('vibe init rejects platform-invalid slugs before making an API call', () => {
+  for (const slug of ['my--app', 'trailing-', 'a'.repeat(64)]) {
+    const result = runCli('init', [slug]);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /no '--' or trailing hyphen/);
+    assert.equal(result.calls, '');
+  }
+});
+
+test('vibe init owner/slug checks the vibe is shared, then points a collaborator to its MCP URL', () => {
+  const result = runCli('init', ['alice/demo', '--adopt']);
+
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /vibe init works on vibes you own/);
+  assert.match(result.stderr, /https:\/\/alice--demo\.vibe-coded\.app\/mcp/);
+  assert.match(result.stderr, /run: vibe connect alice\/demo/);
+  assert.equal(result.calls, 'GET\thttps://stub.invalid/api/v1/vibes/alice/demo/mcp-tokens\t\n');
+});
+
+test('vibe init with your own owner/slug behaves like a plain slug', () => {
+  const result = runCli('init', ['tester/fresh-vibe']);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.calls, /"slug": "fresh-vibe"/);
+});
+
+test('commands without a manifest explain shared-vibe MCP access without inventing a URL', () => {
+  const result = runCli('preview', [], 'nomanifest');
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /\.vibe-coded\.json/);
+  assert.match(result.stderr, /vibe preview/);
+  assert.match(result.stderr, /vibe init <slug>/);
+  assert.match(result.stderr, /vibe preview works on vibes you own/);
+  assert.match(result.stderr, /run: vibe connect <owner>\/<slug>/);
+  assert.doesNotMatch(result.stderr, /https:\/\/.*--.*\.vibe-coded\.ai\/mcp/);
+});
+
+test('vibe call --production makes a real MCP tools/call on the production vibe and prints the result', () => {
+  const result = runCli('call', ['add_note', '{"text":"hi"}', '--production']);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /\{"success":true\}/);
+  assert.match(result.calls, /POST\thttps:\/\/tester--demo\.vibe-coded\.app\/mcp\t.*"method":"tools\/call".*"name":"add_note".*"text":"hi"/);
+});
+
+test('vibe call targets the preview host by default and with --preview; tool errors and unknown tools exit 1', () => {
+  assert.match(runCli('call', ['list_notes']).calls, /https:\/\/p--tester--demo\.vibe-coded\.app\/mcp/);
+  assert.match(runCli('call', ['list_notes', '--preview']).calls, /https:\/\/p--tester--demo\.vibe-coded\.app\/mcp/);
+  const failing = runCli('call', ['failing_tool']);
+  assert.equal(failing.status, 1);
+  assert.match(failing.stderr, /bad input/);
+  assert.equal(failing.stdout, '');
+  const unknown = runCli('call', ['no_such_tool']);
+  assert.equal(unknown.status, 1);
+  assert.match(unknown.stderr, /Tool not found/);
+});
+
+test('vibe preview prints the preview build MCP tool count', () => {
+  const result = runPreview([], 'withworker');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /MCP Tools:\s+17/);
+  assert.doesNotMatch(result.stdout, /MCP Tools:\s+14/);
+});
+
+test('vibe preview falls back to mcpToolCount from older API responses', () => {
+  const result = runPreview([], 'withworker', { success: true, visibility: 'private', mcpToolCount: 9 });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /MCP Tools:\s+9/);
+});
+
+test('vibe status prints preview and production MCP tool counts when they differ', () => {
+  const result = runCli('status', [], 'withworker');
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /MCP Tools:\s+17 preview · 14 production — run vibe publish/);
+  assert.match(result.stdout, /Preview:\s+build 42/);
+  assert.match(result.stdout, /Production: build 40/);
+});
+
+test('static vibes omit MCP warnings, endpoints and connection instructions on preview, publish and status', () => {
+  for (const command of ['preview', 'publish', 'status']) {
+    const result = runCli(command, [], 'normal', {
+      success: true, vibe: { visibility: 'private', previewBuildId: 42, productionBuildId: 40, mcpToolCount: 0 },
+    });
+    assert.equal(result.status, 0, `${command}: ${result.stderr}`);
+    assert.doesNotMatch(result.stdout + result.stderr, /MCP|@mcp-expose|vibe connect|\/mcp|Connectors/);
+    assert.match(result.stdout, /https:\/\/(?:p--)?tester--demo\.vibe-coded\.app/);
+  }
+});
+
+test('worker vibes keep MCP endpoints, warnings and production connection instructions', () => {
+  for (const command of ['preview', 'publish', 'status']) {
+    const result = runCli(command, [], 'withworker', {
+      success: true, vibe: { visibility: 'private', previewBuildId: 42, productionBuildId: 40, mcpToolCount: 0 },
+    });
+    assert.equal(result.status, 0, `${command}: ${result.stderr}`);
+    assert.match(result.stdout, /MCP:\s+https:\/\//);
+    if (command === 'preview' || command === 'status') assert.match(result.stderr, /Warning: no MCP tools/);
+    if (command === 'publish' || command === 'status') assert.match(result.stdout, /vibe connect/);
+  }
+});
+
+test('vibe urls labels preview URLs and only prints production URLs after publishing', () => {
+  for (const detail of [
+    { success: true, vibe: { previewBuildId: 42, productionBuildId: null } },
+    { success: true, previewBuildId: 42 },
+  ]) {
+    const result = runCli('urls', [], 'withworker', detail);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /Production: not published yet \(run vibe publish\)/);
+    assert.match(result.stdout, /Preview:\s+https:\/\/p--tester--demo\.vibe-coded\.app/);
+    assert.doesNotMatch(result.stdout, /Production:\s+https:\/\/|https:\/\/tester--demo\.vibe-coded\.app|vibe connect/);
+  }
+  for (const detail of [
+    { success: true, vibe: { productionBuildId: 40 } },
+    { success: true, productionBuildId: 40 },
+  ]) {
+    const result = runCli('urls', [], 'withworker', detail);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /\n  Production: https:\/\/tester--demo\.vibe-coded\.app\n/);
+    // Both blocks are labelled the same way, with no bare heading line.
+    assert.doesNotMatch(result.stdout, /^Production:$/m);
+    assert.match(result.stdout, /vibe connect/);
+    assert.doesNotMatch(result.stdout, /not published yet|Production:\s+https:\/\/p--/);
+  }
+});
+
+test('vibe urls fails when publication status cannot be fetched', () => {
+  for (const scenario of ['netdown', 'status401', 'status403', 'status500']) {
+    const result = runCli('urls', [], scenario);
+    assert.equal(result.status, 1, result.stderr);
+    assert.doesNotMatch(result.stdout, /https:\/\/tester--demo\.vibe-coded\.app|not published yet/);
+  }
+});
+
+test('completed login tells users which recorded connections need new tokens', () => {
+  const result = runCli('login', ['--finish'], 'loginconnected');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /If a connection shows HTTP 401, re-run vibe connect for: alice\/notes, tester\/demo/);
+  assert.doesNotMatch(result.stdout + result.stderr, /synthetic-old-demo|synthetic-old-notes|Authorization:/);
+  assert.equal(Object.keys(result.connections).length, 2);
+});
+
+test('login without connections, a denied login and login --start omit the reconnect notice', () => {
+  for (const [scenario, args, status] of [
+    ['normal', ['--finish'], 0],
+    ['loginempty', ['--finish'], 0],
+    ['logindenied', ['--finish'], 1],
+    ['loginstart', ['--start'], 0],
+  ]) {
+    const result = runCli('login', args, scenario);
+    assert.equal(result.status, status, result.stderr);
+    assert.doesNotMatch(result.stdout + result.stderr, /re-run vibe connect/);
+  }
+});
+
+test('vibe publish leaves a failed build to the platform: relays its 409, and publishes once the source was restored', () => {
+  const failed = runCli('publish', [], 'publishfailed');
+  assert.equal(failed.status, 1);
+  assert.match(failed.calls, /^POST\t[^\n]*\/publish\t/m);
+  assert.match(failed.stderr, /Preview build 43 failed: worker\.js:2:24/);
+  assert.match(failed.stderr, /vibe logs 43/);
+
+  // Latest build failed, but the source was restored: the platform publishes.
+  const restored = runCli('publish', [], 'publishrestored');
+  assert.equal(restored.status, 0);
+  assert.match(restored.calls, /^POST\t[^\n]*\/publish\t/m);
+  assert.match(restored.stdout, /Published!|may not be live yet/);
+});
+
+test('vibe status prints API errors and exits non-zero', () => {
+  const unauthorized = runCli('status', [], 'status401');
+  assert.equal(unauthorized.status, 1);
+  assert.match(unauthorized.stderr, /Your login expired or was revoked — run: vibe login/);
+  assert.doesNotMatch(unauthorized.stdout, /unknown|run 'vibe preview'/);
+
+  for (const [scenario, message] of [['status403', 'access denied'], ['status500', 'service unavailable']]) {
+    const result = runCli('status', [], scenario);
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, new RegExp(`Status failed: ${message}`));
+    assert.doesNotMatch(result.stdout, /unknown|run 'vibe preview'/);
+  }
+});
+
+test('authenticated commands map every HTTP 401 to the revoked-login message', () => {
+  for (const [command, args] of [
+    ['preview', []],
+    ['publish', []],
+    ['call', ['list_notes']],
+    ['secrets', ['list']],
+  ]) {
+    const result = runCli(command, args, 'auth401');
+    assert.equal(result.status, 1, `${command}: ${result.stderr}`);
+    assert.match(result.stderr, /Your login expired or was revoked — run: vibe login/);
+    assert.doesNotMatch(result.stderr, /Authentication required/);
+    assert.doesNotMatch(result.stderr, /reach the API|network error/, `${command}: a 401 is not a network failure`);
+  }
+});
+
+test('vibe preview requires --prune when more than half the remote files would be removed', () => {
+  const guarded = runPreview([], 'guard');
+  assert.notEqual(guarded.status, 0);
+  assert.match(guarded.stderr, /Pruning would remove 2 of 3 remote source files/);
+  assert.doesNotMatch(guarded.calls, /^DELETE\t/m);
+
+  const confirmed = runPreview(['--prune'], 'guard');
+  assert.equal(confirmed.status, 0, confirmed.stderr);
+  assert.match(confirmed.stdout, /Removed remote file: old-a\.html/);
+  assert.match(confirmed.stdout, /Removed remote file: old-b\.html/);
+  assert.match(confirmed.calls, /"deletePaths":\["old-a\.html","old-b\.html"\]/);
+  assert.doesNotMatch(confirmed.calls, /^DELETE\t/m);
+});
+
+test('vibe preview requires --prune when more than 20 remote files would be removed', () => {
+  const result = runPreview([], 'over20');
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Pruning would remove 21 of 47 remote source files/);
+  assert.doesNotMatch(result.calls, /^DELETE\t/m);
+});
+
+test('vibe preview reports a failed listing request as an error to retry, not an invalid listing', () => {
+  const result = runPreview([], 'listtimeout');
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /could not read the remote file list \(Request timeout\)\. Nothing was uploaded; run vibe preview again\./);
+  assert.doesNotMatch(result.stderr, /listing was invalid/);
+  assert.doesNotMatch(result.calls, /^(DELETE|POST)\t/m);
+});
+
+test('vibe preview fails closed when the remote source listing is invalid', () => {
+  const result = runPreview([], 'invalid');
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Remote source listing was invalid; no files were pruned/);
+  assert.doesNotMatch(result.calls, /^DELETE\t/m);
+});
+
+test('vibe preview --no-prune skips listing and deletion', () => {
+  const result = runPreview(['--no-prune']);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.calls, /^GET\t[^\n]*\/source\?/m);
+  assert.doesNotMatch(result.calls, /^DELETE\t/m);
+});
+
+test('ipv6PortTaken detects another program on the same port over IPv6 (localhost → ::1)', async (t) => {
+  const { createServer: netServer } = await import('node:net');
+  const other = netServer();
+  const listening = await new Promise((resolveL) => {
+    other.once('error', () => resolveL(false));
+    other.listen(0, '::1', () => resolveL(true));
+  });
+  if (!listening) { t.skip('no IPv6 loopback on this machine'); return; }
+  const port = other.address().port;
+  try {
+    assert.equal(await ipv6PortTaken(port), true);
+  } finally {
+    await new Promise((r) => other.close(r));
+  }
+  assert.equal(await ipv6PortTaken(port), false);
+});
+
+test('vibe call identifies the target and relays missing-vibe errors', () => {
+  for (const tool of ['unbuilt_tool', 'unbuilt_rpc']) {
+    for (const preview of [false, true]) {
+      const result = runCli('call', [tool, ...(preview ? [] : ['--production'])]);
+      assert.equal(result.status, 1);
+      assert.equal(result.stderr, `→ tester/demo (${preview ? 'preview' : 'production'})\nError: Vibe not found\n`);
+      assert.equal(result.stdout, '');
+    }
+  }
+});
+
+test('vibe fetch reads a private deployed path with the owner token transport', () => {
+  const production = runCli('fetch', ['/docs/guide.html', '--production']);
+  assert.equal(production.status, 0, production.stderr);
+  assert.match(production.stdout, /private owner view/);
+  assert.match(production.calls, /^GET\thttps:\/\/tester--demo\.vibe-coded\.app\/docs\/guide\.html\t/m);
+  assert.doesNotMatch(production.calls, /synthetic-test-token/);
+
+  const preview = runCli('fetch', ['image.png', '--preview']);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.calls, /^GET\thttps:\/\/p--tester--demo\.vibe-coded\.app\/image\.png\t/m);
+});
+
+test('vibe fetch says the login expired on 401 and reports other HTTP errors', () => {
+  const expired = runCli('fetch', ['/x'], 'fetch401');
+  assert.equal(expired.status, 1);
+  assert.match(expired.stderr, /Your login expired or was revoked — run: vibe login/);
+  assert.equal(expired.stdout, '');
+
+  const missing = runCli('fetch', ['/x'], 'fetch404');
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /HTTP 404/);
+  assert.equal(missing.stdout, '');
+
+  // The worker's own 401 is the vibe refusing the request, not a lost login.
+  const worker = runCli('fetch', ['/webhook', '--header', 'X-Webhook-Token: wrong'], 'fetch401worker');
+  assert.equal(worker.status, 1);
+  assert.match(worker.stderr, /HTTP 401/);
+  assert.doesNotMatch(worker.stderr, /login expired/);
+});
+
+test('vibe fetch accepts an absolute URL only on this vibe\'s own hosts', () => {
+  const own = runCli('fetch', ['https://tester--demo.vibe-coded.app/api/items?x=1']);
+  assert.equal(own.status, 0, own.stderr);
+  assert.match(own.calls, /^GET\thttps:\/\/tester--demo\.vibe-coded\.app\/api\/items\?x=1\t/m);
+
+  const preview = runCli('fetch', ['https://p--tester--demo.vibe-coded.app/']);
+  assert.equal(preview.status, 0, preview.stderr);
+  assert.match(preview.stderr, /\(preview\)/);
+  assert.match(preview.calls, /^GET\thttps:\/\/p--tester--demo\.vibe-coded\.app\/\t/m);
+
+  const other = runCli('fetch', ['https://someone--else.vibe-coded.app/']);
+  assert.equal(other.status, 1);
+  assert.match(other.stderr, /reaches only this vibe/);
+  assert.match(other.stderr, /someone--else\.vibe-coded\.app is another site/);
+  assert.equal(other.calls, 'GET\thttps://stub.invalid/api/v1/vibes/tester/demo\t\n');
+
+  const scheme = runCli('fetch', ['javascript:alert(1)']);
+  assert.equal(scheme.status, 1);
+  assert.match(scheme.stderr, /takes a path on this vibe/);
+  assert.equal(scheme.calls, '');
+});
+
+test('vibe preview names each rejected file instead of "unknown"', () => {
+  const result = runPreview([], 'rejected');
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /init\.log: File type \.log not allowed/);
+  assert.doesNotMatch(result.stderr, /unknown/);
+});
+
+test('vibe preview prints build-limit guidance once and exits non-zero', () => {
+  const result = runPreview([], 'buildlimit');
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Free allows 10 builds an hour\. Your next build is available in 14 minutes \(at 14:32 UTC\)\./);
+  assert.match(result.stderr, /Keep iterating with `vibe dev`, which has no build limit\./);
+  assert.match(result.stderr, /Don't retry before 14:32 UTC\./);
+  assert.doesNotMatch(result.stderr, /Upload failed:/);
+  assert.equal((result.calls.match(/^POST\thttps:\/\/stub\.invalid\/api\/v1\/vibes\/tester\/demo\/source\t/gm) || []).length, 1);
+});
+
+test('vibe connect mints a vibe-only token, retires the old one, and registers it with Claude Code', () => {
+  const r = runCli('connect', [], 'connected');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.calls, /^POST\thttps:\/\/stub\.invalid\/api\/v1\/vibes\/tester\/demo\/mcp-tokens\t/m);
+  assert.match(r.calls, /^DELETE\thttps:\/\/stub\.invalid\/api\/v1\/vibes\/tester\/demo\/mcp-tokens\/old-jti\t/m);
+  assert.match(r.calls, /^claude\tmcp remove demo -s user$/m);
+  assert.match(r.calls, /^claude\tmcp add --transport http -s user demo https:\/\/tester--demo\.vibe-coded\.app\/mcp --header Authorization: Bearer conn-tok$/m);
+  assert.match(r.stdout, /Connected 'demo'/);
+  assert.match(r.calls, /^claude\tmcp get demo$/m);
+  assert.match(r.stdout, /Expires 2026-12-26T00:00:00\.000Z \(no later than your CLI login does\)\. To renew after that: vibe login, then vibe connect\./);
+  assert.match(r.stdout, /Check: ✔ Connected/);
+  assert.doesNotMatch(r.stdout, /conn-tok/);
+  assert.deepEqual(r.connections, { 'tester--demo': { jti: 'new-jti', expiresAt: '2026-12-26T00:00:00.000Z', name: 'demo' } });
+  // The deploy token is only ever sent to the API, never handed to Claude Code.
+  assert.doesNotMatch(r.calls, /synthetic-test-token/);
+});
+
+test('vibe connect prints the command when Claude Code is not installed', () => {
+  const r = runCli('connect', [], 'noclaude');
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.calls, /^claude\t/m);
+  assert.match(r.stdout, /not on PATH/);
+  assert.match(r.stdout, /claude mcp add --transport http -s user demo https:\/\/tester--demo\.vibe-coded\.app\/mcp --header "Authorization: Bearer conn-tok"/);
+});
+
+test('vibe connect --print preserves an existing Claude Code token and records the new one', () => {
+  const r = runCli('connect', ['--print', '--name', 'new-name'], 'connected');
+  assert.equal(r.status, 0, r.stderr);
+  assert.doesNotMatch(r.calls, /^DELETE\t|^claude\t/m);
+  assert.match(r.stdout, /claude mcp add --transport http -s user new-name /);
+  assert.ok(r.stdout.includes("Your existing Claude Code connection 'demo' keeps working with its current token. 'vibe connect --revoke' revokes both tokens."));
+  assert.deepEqual(r.connections['tester--demo'], {
+    jti: 'old-jti', expiresAt: '2026-10-01T00:00:00.000Z', name: 'demo', additionalJtis: ['new-jti'],
+  });
+});
+
+test('vibe connect --revoke and plain connect retire every recorded token', () => {
+  for (const args of [['--revoke'], []]) {
+    const r = runCli('connect', args, 'multiconnected');
+    assert.equal(r.status, 0, r.stderr);
+    for (const jti of ['old-jti', 'printed-jti', 'another-jti']) {
+      assert.ok(r.calls.includes(`/mcp-tokens/${jti}\t`), r.calls);
+    }
+    if (args.length) assert.deepEqual(r.connections, {});
+    else assert.deepEqual(r.connections['tester--demo'], {
+      jti: 'new-jti', expiresAt: '2026-12-26T00:00:00.000Z', name: 'demo',
+    });
+  }
+});
+
+test('vibe connect surfaces a refused mint and changes nothing', () => {
+  const r = runCli('connect', [], 'mintfail');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /Only the owner can connect this vibe/);
+  assert.doesNotMatch(r.calls, /^claude\t/m);
+  assert.equal(r.connections, null);
+});
+
+test('vibe connect revokes the new token when claude mcp add fails', () => {
+  const r = runCli('connect', [], 'claudefail');
+  assert.equal(r.status, 1);
+  assert.match(r.calls, /^DELETE\t[^\t]*\/mcp-tokens\/new-jti\t/m);
+  assert.deepEqual(r.connections, {});
+});
+
+test('vibe connect --revoke revokes the recorded token and removes the server', () => {
+  const r = runCli('connect', ['--revoke'], 'connected');
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.calls, /^DELETE\t[^\t]*\/mcp-tokens\/old-jti\t/m);
+  assert.match(r.calls, /^claude\tmcp remove demo -s user$/m);
+  assert.deepEqual(r.connections, {});
+  const none = runCli('connect', ['--revoke']);
+  assert.equal(none.status, 1);
+  assert.match(none.stderr, /No connection recorded/);
+});
+
+test('vibe connect rejects unsafe names and other clients', () => {
+  assert.match(runCli('connect', ['--name', 'a b;rm']).stderr, /--name may use/);
+  assert.match(runCli('connect', ['--client', 'claude-ai']).stderr, /only --client claude-code/);
+  const missing = runCli('connect', ['--name']);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /Error: --name requires a value/);
+});
+
+test('vibe connect never replaces an unrelated Claude Code server with the same name', () => {
+  const clash = runCli('connect', [], 'nameclash');
+  assert.equal(clash.status, 1);
+  assert.match(clash.stderr, /already has a server named 'demo' \(https:\/\/mcp\.example\.com\/mcp\)/);
+  assert.doesNotMatch(clash.calls, /mcp-tokens|^claude\t/m);
+  // The same vibe added earlier (e.g. via OAuth) is replaced.
+  const same = runCli('connect', [], 'samevibe');
+  assert.equal(same.status, 0, same.stderr);
+  assert.match(same.calls, /^claude\tmcp add /m);
+});
+
+test('vibe connect fails loudly when Claude Code cannot reach the vibe', () => {
+  const r = runCli('connect', [], 'unreachable');
+  assert.equal(r.status, 1);
+  assert.match(r.stderr, /Check failed: ✘ Failed to connect HTTP 404/);
+  assert.match(r.stderr, /Is the vibe published\?/);
+});
+
+test('needsViteBuild spots Vite apps that vibe dev cannot render', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-vite-detect-'));
+  try {
+    const mk = (name, files) => {
+      const d = join(root, name);
+      mkdirSync(d);
+      for (const [f, c] of Object.entries(files)) writeFileSync(join(d, f), c);
+      return d;
+    };
+    assert.equal(needsViteBuild(mk('config', { 'vite.config.ts': 'export default {}', 'index.html': '<div id="app"></div>' })), true);
+    assert.equal(needsViteBuild(mk('ts-entry', { 'index.html': '<script type="module" src="/src/main.ts"></script>' })), true);
+    assert.equal(needsViteBuild(mk('cjs', { 'vite.config.cjs': 'module.exports = {}' })), true);
+    assert.equal(needsViteBuild(mk('plain', { 'index.html': '<script src="/app.js"></script>' })), false);
+    assert.equal(needsViteBuild(mk('worker-only', { 'worker.js': '' })), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('every CLI command accepts -h/--help without credentials or side effects', () => {
+  for (const command of ['login', 'logout', 'init', 'templates', 'dev', 'preview', 'publish', 'status', 'urls', 'fetch', 'call', 'connect', 'logs', 'settings', 'access', 'secrets', 'r2', 'delete']) {
+    const result = runCli(command, ['--help']);
+    assert.equal(result.status, 0, `${command}: ${result.stderr}`);
+    assert.match(result.stdout, /^Usage: vibe /);
+    assert.ok(result.stdout.trim().split('\n').length > 1, `${command}: help should explain the command`);
+    assert.equal(result.calls, '', command);
+  }
+});
+
+test('settings help lists every interaction policy including public_read', () => {
+  const result = runCli('settings', ['--help']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /--interaction public\|public_read\|authenticated\|invite_only/);
+  assert.equal(result.calls, '');
+});
+
+test('nested CLI help never runs the subcommand', () => {
+  for (const [command, args, usage] of [
+    ['secrets', ['create', '--help'], 'vibe secrets create'],
+    ['access', ['grant', '-h'], 'vibe access grant'],
+    ['r2', ['upload', '--help'], 'vibe files upload'],
+    ['files', ['upload', '--help'], 'vibe files upload'],
+    ['dev', ['seed', '--help'], 'vibe dev seed'],
+  ]) {
+    const result = runCli(command, args);
+    assert.equal(result.status, 0, `${command}: ${result.stderr}`);
+    assert.match(result.stdout, new RegExp(`^Usage: ${usage}`));
+    assert.equal(result.calls, '', command);
+  }
+});
+
+test('web-only refusals print the dashboard link and exit non-zero', () => {
+  for (const [command, args, panel] of [
+    ['settings', ['--visibility', 'public'], 'settings'],
+    ['settings', ['--interaction', 'public_read'], 'settings'],
+    ['access', ['grant'], 'access'],
+    ['delete', [], 'delete'],
+  ]) {
+    const result = runCli(command, args);
+    assert.equal(result.status, 1, `${command}: ${result.stderr}`);
+    assert.match(result.stderr, new RegExp(`panel=${panel}`));
+  }
+});
+
+test('signed-out commands point people and agents to vibe login', () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-cli-signed-out-'));
+  try {
+    const result = spawnSync('bash', [VIBE_BIN, 'status'], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, VIBE_DEV_PLAN: 'pro', HOME: join(root, 'home') },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Not signed in\. Run: vibe login   \(agents: vibe login --start, give the user the link, then vibe login --finish\)/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('vibe call supplies its bearer token through curl config stdin, not argv', () => {
+  const cli = readFileSync(VIBE_BIN, 'utf8');
+  const callBody = cli.slice(cli.indexOf('cmd_call()'), cli.indexOf('# vibe connect'));
+  assert.match(callBody, /curl -sS -K -/);
+  assert.doesNotMatch(callBody, /-H "Authorization: Bearer \$TOKEN"/);
+});
+
+test('vibe r2 url prints the file link on the vibe host and ignores --ttl', () => {
+  const result = runCli('r2', ['url', 'docs/manual.pdf', '--ttl', '3600']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /--ttl is ignored/);
+  assert.equal(result.stdout.split('\n')[0], 'https://tester--demo.vibe-coded.app/files/docs/manual.pdf');
+  assert.match(result.stdout, /Anyone with this link can open it \(the vibe is public\)/);
+  assert.doesNotMatch(result.stdout, /signed\.invalid|Expires at/);
+  assert.doesNotMatch(result.calls, /download-url/);
+});
+
+test('vibe --version prints the skill version', () => {
+  const version = JSON.parse(readFileSync(resolve(dirname(VIBE_BIN), '../package.json'), 'utf8')).version;
+  for (const flag of ['--version', '-V', 'version']) {
+    const r = spawnSync('bash', [VIBE_BIN, flag], { encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout.trim(), `vibe ${version}`);
+  }
+});
+
+test('a network failure is reported, not silent', () => {
+  const r = runCli('status', [], 'netdown');
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /could not reach .* \(network error\)/);
+});
+
+test('vibe dev runs the current generation whatever the hosted vibe records and permits an explicit override', () => {
+  for (const [info, args, expected] of [
+    [{ success: true, vibe: { previewGeneration: 'props' } }, [], '--generation props seed local.sql'],
+    [{ success: true, vibe: { previewGeneration: 'shim' } }, [], '--generation props seed local.sql'],
+    [{ success: true, vibe: { previewGeneration: 'shim' } }, ['--generation', 'shim'], '--generation props seed local.sql --generation shim'],
+  ]) {
+    const result = runCli('dev', ['seed', 'local.sql', ...args], 'normal', info);
+    assert.equal(result.status, 0, result.stderr);
+    assert.doesNotMatch(result.calls, /\/tester\/demo\t/);
+    assert.ok(result.calls.includes(expected), result.calls);
+  }
+});
+
+function useRealMiniflare(modules) {
+  const canonicalPackage = resolve(RUNTIME_DIR, '../../../src/package.json');
+  const entry = createRequire(canonicalPackage).resolve('miniflare');
+  writeFileSync(join(modules, 'miniflare/index.js'), `
+    import { Miniflare as Native } from ${JSON.stringify(pathToFileURL(entry).href)};
+    export class Miniflare extends Native {
+      constructor(options) {
+        const deny = () => { throw new Error('Unexpected outbound request'); };
+        super(options.workers ? { ...options, workers: options.workers.map(worker =>
+          worker.name === 'vibe-outbound' ? { ...worker, outboundService: deny } : worker) }
+          : { ...options, outboundService: deny });
+      }
+    }
+  `);
+}
+
+test('vibe dev props outbound parity', async (t) => {
+  const packagePath = resolve(RUNTIME_DIR, '../../../src/package.json');
+  if (!existsSync(packagePath)) { t.skip('native runtime dependency lives in the platform repo'); return; }
+  const require = createRequire(packagePath);
+  const workerd = join(dirname(require.resolve('workerd/package.json')), 'bin/workerd');
+  const { stageRuntime } = await import('../dev-server.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'vibe-dev-outbound-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const manifest = { vibeId: '1', userSlug: 'tester', vibeSlug: 'demo' };
+  const services = [];
+  for (const generation of ['props']) {
+    const dir = join(root, generation);
+    mkdirSync(dir);
+    stageRuntime(dir, generation, manifest);
+    writeFileSync(join(dir, 'worker.js'), `const alias = fetch;
+      async function call(path, fetcher = fetch, redirect = 'follow') {
+        try {
+          const response = await fetcher('https://upstream.example' + path, {
+            method: 'POST', redirect, body: 'author payload', cf: { authorOption: 'kept' },
+            headers: { 'content-type': 'text/plain', 'x-author': 'kept', authorization: 'local fixture',
+              'proxy-authorization': 'local fixture', cookie: 'local=fixture' },
+          });
+          return { status: response.status, header: response.headers.get('x-upstream'), body: await response.text() };
+        } catch (error) { return { error: error.message }; }
+      }
+      export default { async fetch(request) {
+        const path = new URL(request.url).pathname;
+        if (path === '/limit') {
+          const results = [];
+          for (let i = 0; i < 6; i++) results.push(await call('/allowed'));
+          return Response.json(results);
+        }
+        return Response.json(await call(path, path.startsWith('/alias') ? alias : fetch,
+          path.endsWith('/error') ? 'error' : 'follow'));
+      } };`);
+    const options = buildMfOptions(dir, manifest, {}, 8787, 'free', generation);
+    const workers = options.workers;
+    if (generation === 'props') {
+      // Registry initialization is the only storage operation in this fetch test.
+      writeFileSync(join(dir, 'entry.js'), `import runtime from './_client-adapter.js';
+        const db = { prepare() { return { bind() { return this; }, async run() {} }; } };
+        export default { fetch(request, env, ctx) { return runtime.fetch(request, { ...env, PLATFORM_DB: db }, ctx); } };`);
+      workers[0].modules.unshift({ path: join(dir, 'entry.js') });
+      workers[0].name = generation;
+    }
+    for (const worker of workers) {
+      const modules = worker.modules.map(({ path }) =>
+        `(name = ${JSON.stringify(path.slice(dir.length + 1))}, esModule = embed ${JSON.stringify(path.slice(root.length + 1))})`);
+      const bindings = Object.entries(worker.bindings).map(([name, value]) =>
+        `(name = ${JSON.stringify(name)}, ${typeof value === 'string' ? 'text' : 'json'} = ${JSON.stringify(typeof value === 'string' ? value : JSON.stringify(value))})`);
+      services.push(`(name = "${worker.name}", worker = (compatibilityDate = "2026-01-11", compatibilityFlags = ["nodejs_compat"],
+        modules = [${modules}], bindings = [${bindings}], globalOutbound = "${worker.outboundService ?? 'upstream'}"))`);
+    }
+  }
+  writeFileSync(join(root, 'upstream.js'), `const seen = [];
+    export default { async fetch(request) {
+      const url = new URL(request.url);
+      if (url.pathname === '/observed') return Response.json(seen);
+      const value = { url: request.url, method: request.method, body: await request.text(),
+        headers: Object.fromEntries(request.headers), cf: request.cf };
+      seen.push(value);
+      if (url.pathname.endsWith('/start') || url.pathname.endsWith('/error')) {
+        return new Response('redirect body', { status: 302, headers: {
+          location: url.pathname.startsWith('/cross') ? 'https://other.example/final' : '/final' } });
+      }
+      return new Response('final response', { status: 201, headers: { 'x-upstream': 'local fixture' } });
+    } };`);
+  const headers = Object.fromEntries(withDispatchHeaders({}, manifest));
+  headers['x-vibe-subrequests'] = '5';
+  writeFileSync(join(root, 'driver.js'), `export default { async test(_controller, env) {
+    const outcomes = {};
+    for (const generation of ['props']) {
+      outcomes[generation] = {};
+      for (const path of ['/fetch', '/alias', '/follow/start', '/error', '/cross/start', '/alias/error', '/limit', '/limit']) {
+        const response = await env[generation].fetch('https://author.example' + path, { headers: ${JSON.stringify(headers)} });
+        outcomes[generation][path + (outcomes[generation][path] ? '/again' : '')] = await response.json();
+      }
+    }
+    outcomes.seen = await (await env.UPSTREAM.fetch('https://upstream.example/observed')).json();
+    console.log('FETCH_PARITY=' + JSON.stringify(outcomes));
+  } };`);
+  writeFileSync(join(root, 'config.capnp'), `using Workerd = import "/workerd/workerd.capnp";
+    const config :Workerd.Config = (services = [
+      (name = "driver", worker = (compatibilityDate = "2026-01-11", modules = [(name = "driver.js", esModule = embed "driver.js")],
+        bindings = [(name = "props", service = "props"), (name = "UPSTREAM", service = "upstream")])),
+      ${services},
+      (name = "upstream", worker = (compatibilityDate = "2026-01-11", modules = [(name = "upstream.js", esModule = embed "upstream.js")])),
+      (name = "internet", network = (allow = []))
+    ]);`);
+  const result = spawnSync(workerd, ['test', join(root, 'config.capnp'), 'driver'], { encoding: 'utf8', timeout: 20_000 });
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}${result.error?.message ?? ''}`;
+  assert.equal(result.status, 0, output);
+  const observed = JSON.parse(output.match(/^FETCH_PARITY=(.+)$/m)?.[1] ?? 'null');
+  assert.ok(observed, output);
+  const success = { status: 201, header: 'local fixture', body: 'final response' };
+  await t.test('ordinary and module-scope captured fetches reach the upstream', () => {
+    for (const generation of ['props']) {
+      assert.deepEqual(observed[generation]['/fetch'], success, generation);
+      assert.deepEqual(observed[generation]['/alias'], success, generation);
+    }
+  });
+  await t.test('follow through a 302 returns the final response', () => {
+    for (const generation of ['props']) assert.deepEqual(observed[generation]['/follow/start'], success, generation);
+  });
+  await t.test('error mode throws, including a module-scope captured alias', () => {
+    for (const generation of ['props']) for (const path of ['/error', '/alias/error']) {
+      assert.deepEqual(observed[generation][path], { error: 'Fetch redirect mode is error' }, generation + path);
+    }
+  });
+  await t.test('cross-origin redirects drop credentials and preserve author data', () => {
+    for (const generation of ['props']) assert.deepEqual(observed[generation]['/cross/start'], success, generation);
+    const initial = observed.seen.filter(value => new URL(value.url).pathname === '/cross/start');
+    const final = observed.seen.filter(value => new URL(value.url).hostname === 'other.example');
+    assert.equal(initial.length, 1);
+    assert.equal(final.length, 1);
+    for (const value of initial) for (const name of ['authorization', 'proxy-authorization', 'cookie']) assert.ok(value.headers[name]);
+    for (const value of final) {
+      for (const name of ['authorization', 'proxy-authorization', 'cookie']) assert.equal(value.headers[name], undefined);
+      assert.equal(value.headers['x-author'], 'kept');
+      assert.equal(value.method, 'GET');
+      assert.equal(value.body, '');
+    }
+    for (const value of observed.seen) {
+      assert.equal(value.cf?.localVibeInvocation, undefined);
+      assert.equal(value.cf?.vibeOutboundRedirect, undefined);
+    }
+  });
+  await t.test('the sixth Free fetch refuses with the allowance message and each request gets a fresh allowance', () => {
+    const errors = {
+      props: 'Outbound request limit reached: 5 per request on your plan.',
+    };
+    for (const generation of ['props']) for (const path of ['/limit', '/limit/again']) {
+      const results = observed[generation][path];
+      assert.deepEqual(results.slice(0, 5), Array(5).fill(success), generation + path);
+      assert.equal(results[5].error ?? JSON.parse(results[5].body).error, errors[generation], generation + path);
+      if (generation === 'props') assert.equal(results[5].status, 502);
+    }
+    assert.equal(observed.seen.filter(value => new URL(value.url).pathname === '/allowed').length, 10);
+  });
+});
+
+function normalizeOutcome(value) {
+  if (Array.isArray(value)) return value.map(normalizeOutcome);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, val]) =>
+    [key, ['id', 'deleted', 'createdAt', 'updatedAt'].includes(key) ? '<generated>' : normalizeOutcome(val)]));
+  return value;
+}
+
+async function outcome(response) {
+  let body = await response.text();
+  try { body = normalizeOutcome(JSON.parse(body)); } catch {}
+  return { status: response.status, headers: Object.fromEntries([...response.headers].filter(([name]) =>
+    ['content-type', 'access-control-allow-origin', 'access-control-allow-methods', 'access-control-allow-headers'].includes(name))), body };
+}
+
+for (const template of ['site', 'tools', 'tools-sql', 'vue']) {
+  test(`vibe dev props answer identically for the ${template} template`, async (t) => {
+    const templates = resolve(RUNTIME_DIR, '../../../templates');
+    if (!existsSync(templates)) { t.skip('template fixtures live in the platform repo'); return; }
+    const outputs = [];
+    for (const generation of ['props']) {
+      const { root, runtimeDir, project, modules } = setupDevRuntime();
+      useRealMiniflare(modules);
+      cpSync(join(templates, template), project, { recursive: true, filter: path => !path.split('/').some(part => ['node_modules', 'dist'].includes(part)) });
+      // Static templates use a 404 worker to exercise the local origin's fallback.
+      if (['site', 'vue'].includes(template)) writeFileSync(join(project, 'worker.js'), 'export default { fetch() { return new Response("Not found", { status: 404 }); } };');
+      const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'pro' }, ['--generation', generation]);
+      if (!server) return;
+      const observed = [];
+      const call = (path, method = 'GET', args) => fetch(server.base + path, { method,
+        ...(args === undefined ? {} : { body: JSON.stringify(args), headers: { 'content-type': 'application/json' } }) });
+      for (const [path, method, args] of [
+        ['/', 'GET'], ['/', 'HEAD'], ['/missing', 'GET'], ['/api/missing', 'POST', {}],
+        ...(template.startsWith('tools') ? [
+          ['/api/add_note', 'OPTIONS'], ['/api/add_note', 'GET'], ['/api/add_note', 'POST', {}],
+          ['/api/add_note', 'POST', { text: 'x', tag: 1 }], ['/api/update_note', 'POST', {}],
+          ['/api/delete_note', 'POST', {}],
+        ] : []),
+        ...(template === 'vue' ? [['/src/main.ts', 'GET'], ['/src/App.vue', 'GET']] : []),
+      ]) observed.push(await outcome(await call(path, method, args)));
+      if (template.startsWith('tools')) {
+        const created = await call('/api/add_note', 'POST', { text: 'first', tag: 'parity' });
+        assert.equal(created.status, 200);
+        const note = await created.json();
+        assert.equal(note.success, true);
+        const id = note.data.id;
+        observed.push(normalizeOutcome(note));
+        observed.push(await outcome(await call('/api/list_notes', 'POST', { tag: 'parity' })));
+        observed.push(await outcome(await call('/api/update_note', 'POST', { id, text: 'second' })));
+        observed.push(await outcome(await call('/api/delete_note', 'POST', { id })));
+        observed.push(await outcome(await call('/api/list_notes', 'POST', { tag: 'parity' })));
+        const rpc = await call('/mcp', 'POST', { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'list_notes', arguments: {} } });
+        observed.push(await outcome(rpc));
+      }
+      outputs.push(observed);
+      await server.stop();
+    }
+    assert.equal(outputs.length, 1);
+  });
+}
+
+test('props local storage enforces the shared ceiling per request, including direct and waitUntil calls', async (t) => {
+  if (!existsSync(resolve(RUNTIME_DIR, '../../../src/package.json'))) { t.skip('native runtime dependency lives in the platform repo'); return; }
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  useRealMiniflare(modules);
+  writeFileSync(join(project, 'worker.js'), `export default { async fetch(request, env, ctx) {
+    const path = new URL(request.url).pathname;
+    if (path === '/api/check') return Response.json({ value: await env.VIBE_STORAGE.get('background') });
+    if (path === '/api/background') {
+      ctx.waitUntil(ctx.props.STORAGE.put('background', 'saved'));
+      return new Response('queued');
+    }
+    let completed = 0, message;
+    for (let i = 0; i < 501; i++) {
+      try { await ctx.props.STORAGE.get('absent'); completed++; }
+      catch (error) { message = error.message; break; }
+    }
+    return Response.json({ completed, message, platformBinding: typeof env.BUDGET_DO,
+      token: typeof env.PLATFORM_VIBE_TOKEN, mode: request.headers.get('x-vibe-access-mode'), secret: env.LOCAL_SECRET });
+  } };`);
+  writeFileSync(join(project, '.dev.vars'), 'LOCAL_SECRET=local-value');
+  const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'free' }, ['--generation', 'props']);
+  if (!server) return;
+  const expected = { completed: 500, platformBinding: 'undefined', token: 'undefined', mode: null, secret: 'local-value' };
+  for (let i = 0; i < 2; i++) {
+    const { message, ...rest } = await (await fetch(server.base + '/api/ceiling')).json();
+    assert.deepEqual(rest, expected);
+    assert.match(message, /\b500 reads\b.*\b50 writes\b/);
+  }
+  assert.equal(await (await fetch(server.base + '/api/background')).text(), 'queued');
+  assert.deepEqual(await (await fetch(server.base + '/api/check')).json(), { value: 'saved' });
+  await server.stop();
+});
+
+test('props refuses unknown plans and generations before starting the runtime', () => {
+  assert.throws(() => buildMfOptions('/tmp/dev', {}, {}, 8787, 'unknown', 'props'), /requires a known account plan/);
+  assert.throws(() => buildMfOptions('/tmp/dev', {}, {}, 8787, 'pro', 'other'), /generation must be current/);
+});
+
+test('props local storage round-trips R2, metadata, allocation, D1 batches and sessions, and persists across restarts', async (t) => {
+  if (!existsSync(resolve(RUNTIME_DIR, '../../../src/package.json'))) { t.skip('native runtime dependency lives in the platform repo'); return; }
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  useRealMiniflare(modules);
+  writeFileSync(join(project, '.vibe-coded.json'), JSON.stringify({ vibeId: 1, userSlug: 'tester', vibeSlug: 'demo', kvAlias: true }));
+  writeFileSync(join(project, 'worker.js'), `export default { async fetch(request, env, ctx) {
+    if (new URL(request.url).pathname === '/api/read') return Response.json({
+      kv: await env.VIBE_STORAGE.get('item', 'json'),
+      file: await (await env.VIBE_R2.get('folder/item')).text(),
+      count: await env.VIBE_D1.prepare('SELECT COUNT(*) AS n FROM items').first('n'),
+      ids: await env.VIBE_STORAGE._allocateIds('items', 1),
+    });
+    await env.KV.put('item', JSON.stringify({ answer: 42 }), { metadata: { tag: 'local' } });
+    const metadata = await env.VIBE_STORAGE.getWithMetadata('item', 'json');
+    await env.VIBE_R2.put('folder/item', new Blob(['file bytes']), { httpMetadata: new Headers({ 'content-type': 'text/plain' }), customMetadata: { tag: 'local' } });
+    const object = await env.VIBE_R2.get('folder/item');
+    const headers = new Headers(); object.writeHttpMetadata(headers);
+    await env.VIBE_D1.prepare('CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY, bytes BLOB)').run();
+    await env.VIBE_D1.batch([env.VIBE_D1.prepare('INSERT INTO items (id, bytes) VALUES (?, ?)').bind(1, new Uint8Array([0, 255])), env.VIBE_D1.prepare('INSERT INTO items (id, bytes) VALUES (?, ?)').bind(2, new Uint8Array([1, 254]))]);
+    const session = env.VIBE_D1.withSession('first-primary');
+    const row = await session.prepare('SELECT bytes FROM items WHERE id = ?').bind(1).first();
+    const batch = await session.batch([session.prepare('SELECT COUNT(*) AS n FROM items')]);
+    const sparse = new Array(2); sparse[0] = { sql: 'DELETE FROM items' };
+    let batchError;
+    try { await ctx.props.STORAGE.d1Batch(sparse); } catch (error) { batchError = error.message; }
+    let tailError;
+    try { await env.VIBE_D1.prepare('SELECT 1; DELETE FROM items').all(); } catch (error) { tailError = error.message; }
+    let signingError;
+    try { await env.VIBE_R2.createDownloadUrl('folder/item'); } catch (error) { signingError = error.message; }
+    let traversalError;
+    try { await env.VIBE_R2.get('../private'); } catch (error) { traversalError = error.message; }
+    return Response.json({ metadata, alias: env.KV === env.VIBE_STORAGE, file: await object.text(),
+      contentType: headers.get('content-type'), custom: object.customMetadata, keys: (await env.VIBE_R2.list({ prefix: 'folder/' })).objects.map(o => o.key),
+      ids: await env.VIBE_STORAGE._allocateIds('items', 2, 100), row, count: batch[0].results[0].n,
+      bookmarkType: typeof await session.getBookmark(), batchError, tailError, signingError, traversalError });
+  } };`);
+  const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'pro' }, ['--generation', 'props']);
+  if (!server) return;
+  const data = await (await fetch(server.base + '/api/exercise')).json();
+  assert.deepEqual(data, { metadata: { value: { answer: 42 }, metadata: { tag: 'local' }, cacheStatus: null },
+    alias: true, file: 'file bytes', contentType: 'text/plain', custom: { tag: 'local' }, keys: ['folder/item'],
+    ids: { startId: 100, count: 2 }, row: { bytes: [0, 255] }, count: 2, bookmarkType: 'string',
+    batchError: 'batch() takes 1 to 100 statements made with prepare()', tailError: 'One SQL statement per prepare(); use batch() to run several',
+    signingError: DEV_PLATFORM_REFUSAL.error, traversalError: 'Invalid key format' });
+  await server.stop();
+  const restarted = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'pro' }, ['--generation', 'props']);
+  assert.deepEqual(await (await fetch(restarted.base + '/api/read')).json(), {
+    kv: { answer: 42 }, file: 'file bytes', count: 2, ids: { startId: 102, count: 1 },
+  });
+  await restarted.stop();
+});
+
+test('props on Free reads, lists and deletes files and refuses file writes with the plan error', async (t) => {
+  if (!existsSync(resolve(RUNTIME_DIR, '../../../src/package.json'))) { t.skip('native runtime dependency lives in the platform repo'); return; }
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  useRealMiniflare(modules);
+  writeFileSync(join(project, 'worker.js'), `export default { async fetch(request, env) {
+    if (new URL(request.url).pathname === '/api/write') { await env.VIBE_R2.put('a', 'x'); return new Response('ran'); }
+    return Response.json({ get: await env.VIBE_R2.get('a'), head: await env.VIBE_R2.head('a'),
+      keys: (await env.VIBE_R2.list()).objects.map(o => o.key), deleted: (await env.VIBE_R2.delete('a')) ?? null });
+  } };`);
+  const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'free' }, ['--generation', 'props']);
+  if (!server) return;
+  assert.deepEqual(await (await fetch(server.base + '/api/read')).json(), { get: null, head: null, keys: [], deleted: null });
+  const write = await outcome(await fetch(server.base + '/api/write'));
+  assert.equal(write.status, 403);
+  assert.equal(write.body.code, 'ENTITLEMENT_EXCEEDED');
+  await server.stop();
+});
+
+test('props gives the Free SQL refusal response without provider terms', async (t) => {
+  if (!existsSync(resolve(RUNTIME_DIR, '../../../src/package.json'))) { t.skip('native runtime dependency lives in the platform repo'); return; }
+  const outcomes = [];
+  for (const generation of ['props']) {
+    const { root, runtimeDir, project, modules } = setupDevRuntime();
+    useRealMiniflare(modules);
+    writeFileSync(join(project, 'worker.js'), `export default { async fetch(request, env) {
+      await env.VIBE_D1.prepare('SELECT 1').all(); return new Response('ran');
+    } };`);
+    const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'free' }, ['--generation', generation]);
+    if (!server) return;
+    outcomes.push(await outcome(await fetch(server.base + '/api/sql')));
+    await server.stop();
+  }
+  assert.equal(outcomes[0].status, 403);
+  assert.equal(outcomes[0].body.code, 'ENTITLEMENT_EXCEEDED');
+  const withoutText = ({ body: { error, ...body }, ...rest }) => ({ ...rest, body });
+
+  assert.match(outcomes[0].body.error, /SQL requires Pro/);
+  assert.doesNotMatch(outcomes[0].body.error, /\bKV\b|\bD1\b/);
+});
+
+test('a direct STORAGE D1 call on Free gets the same structured refusal as the facade', async (t) => {
+  if (!existsSync(resolve(RUNTIME_DIR, '../../../src/package.json'))) { t.skip('native runtime dependency lives in the platform repo'); return; }
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  useRealMiniflare(modules);
+  writeFileSync(join(project, 'worker.js'), `export default { async fetch(request, env, ctx) {
+    await ctx.props.STORAGE.d1Execute({ sql: 'SELECT 1', method: 'all' }); return new Response('ran');
+  } };`);
+  const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'free' }, ['--generation', 'props']);
+  if (!server) return;
+  const result = await outcome(await fetch(server.base + '/api/sql'));
+  await server.stop();
+  assert.equal(result.status, 403);
+  assert.equal(result.body.code, 'ENTITLEMENT_EXCEEDED');
+});
+
+test('props /files reads the local preview R2 tree with inert headers', async (t) => {
+  const { root, runtimeDir, project } = setupDevRuntime();
+  const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'pro' }, ['--generation', 'props']);
+  if (!server) return;
+  const response = await fetch(server.base + '/files/uploads/logo.png');
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), 'preview bytes');
+  assert.equal(response.headers.get('content-security-policy'), 'sandbox');
+  assert.equal(response.headers.get('content-type'), 'image/png');
+  await server.stop();
+});
+
+test('an expired login during upload is not reported as a network failure', () => {
+  const result = runPreview([], 'upload401');
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Your login expired or was revoked — run: vibe login/);
+  assert.doesNotMatch(result.stderr, /reach the API|network error/);
+});
+
+test('the preview file list leaves out the root worker, which is never served', () => {
+  const result = runPreview([], 'withworker');
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Uploaded 2 files\.\n[\s\S]*this 1 is publicly readable at its path /);
+  assert.match(result.stdout, /^ {2}index\.html$/m);
+  assert.doesNotMatch(result.stdout, /^ {2}worker\.js$/m);
+  assert.match(result.calls, /"worker\.js":/);
+});
+
+test('vibe dev answers like production: no worker Set-Cookie or Clear-Site-Data, root source files 404, legacy SSE paths 410', async (t) => {
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  const stub = join(modules, 'miniflare', 'index.js');
+  writeFileSync(stub, readFileSync(stub, 'utf8').replace(/async dispatchFetch\(url\) \{[\s\S]*?\n      \}/, `async dispatchFetch(url) {
+        return new Response('worker ' + new URL(url).pathname, { headers: [
+          ['set-cookie', 'a=1; Path=/'], ['Set-Cookie', 'b=2; Domain=.vibe-coded.ai'], ['clear-site-data', '"cookies"'], ['x-kept', 'yes'],
+        ] });
+      }`));
+  for (const name of ['package.json', 'README.md', 'tsconfig.app.json', 'wrangler.toml', 'vite.config.ts', 'notes.md']) writeFileSync(join(project, name), name.endsWith('.json') ? '{}' : 'source');
+  writeFileSync(join(project, 'index.html'), '<h1>app</h1>');
+  mkdirSync(join(project, 'content'));
+  writeFileSync(join(project, 'content', 'README.md'), 'nested');
+  const server = await startDevServer(t, root, runtimeDir, project, {});
+  if (!server) return;
+  for (const path of ['/api/items', '/some/page']) {
+    const response = await fetch(server.base + path);
+    assert.equal(response.status, 200, path);
+    assert.equal(await response.text(), 'worker ' + path);
+    assert.equal(response.headers.get('x-kept'), 'yes');
+    assert.deepEqual(response.headers.getSetCookie(), [], path);
+    assert.equal(response.headers.get('clear-site-data'), null, path);
+  }
+  for (const path of ['/worker.js', '/%77orker.js', '/package.json', '/README.md', '/tsconfig.app.json', '/wrangler.toml', '/vite.config.ts', '/notes.md', '/.vibe-coded.json', '/worker.js/']) {
+    const response = await fetch(server.base + path);
+    assert.equal(response.status, 404, path);
+    assert.equal(await response.text(), 'Not found', path);
+  }
+  assert.equal(await (await fetch(server.base + '/content/README.md')).text(), 'nested');
+  for (const [method, path] of [['GET', '/mcp/sse'], ['POST', '/mcp/messages'], ['GET', '/mcp/other']]) {
+    const response = await fetch(server.base + path, { method, ...(method === 'POST' ? { body: '{}' } : {}) });
+    assert.equal(response.status, 404, path);
+    assert.deepEqual(await response.json(), { jsonrpc: '2.0', id: null, error: { code: -32600, message: MCP_SUBPATH_MESSAGE } });
+  }
+  await server.stop();
+});
+
+test('the 404 text for a path under /mcp/ is production\'s', (t) => {
+  const proxyPath = resolve(RUNTIME_DIR, '../../../src/services/mcp-proxy.ts');
+  if (!existsSync(proxyPath)) { t.skip('the platform source lives in the platform repo'); return; }
+  const proxy = readFileSync(proxyPath, 'utf8');
+  const production = proxy.match(/export const MCP_SUBPATH_MESSAGE = '([^']+)';/)?.[1];
+  assert.equal(MCP_SUBPATH_MESSAGE, production);
+});
+
