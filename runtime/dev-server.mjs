@@ -308,10 +308,12 @@ export function buildMfOptions(devDir, manifest, secrets, port, plan = 'unknown'
     options.d1Databases = { ...sqlAndFiles.d1Databases, PLATFORM_DB: 'LOCAL_PLATFORM_DB' };
     options.durableObjects = {
       VIBE_STORAGE_DO: { className: 'VibeStorageDO', useSQLite: true },
+      VIBE_KV_DO: { className: 'VibeKvDO', useSQLite: true },
       BUDGET_DO: { className: 'AccountBudgetDO', useSQLite: true },
     };
     options.durableObjectsPersist = join(devDir, 'do');
-    options.bindings = { AUTHOR_ENV: secrets, LOCAL_CONFIG: { ...manifest, plan } };
+    // .dev.vars values reach the worker only through VIBE_SECRETS (local-storage-host.mjs).
+    options.bindings = { LOCAL_SECRETS: secrets, LOCAL_CONFIG: { ...manifest, plan } };
     options.name = 'vibe';
     options.outboundService = 'vibe-outbound';
     const { host, port: mfPort, kvPersist, d1Persist, r2Persist, durableObjectsPersist } = options;
@@ -335,7 +337,7 @@ export function stageRuntime(devDir, generation = 'props', manifest = {}) {
     const adapterPath = join(devDir, 'client-adapter.js');
     writeFileSync(adapterPath, readFileSync(adapterPath, 'utf8').replace('kvAlias:!1', `kvAlias:${manifest.kvAlias === true}`));
     writeFileSync(join(devDir, '_client-adapter.js'),
-      "import { withLocalStorage } from './local-storage-host.mjs';\nimport adapter from './client-adapter.js';\nexport { VibeStorageDO, AccountBudgetDO } from './local-storage-host.mjs';\nexport default withLocalStorage(adapter);\n");
+      "import { withLocalStorage } from './local-storage-host.mjs';\nimport adapter from './client-adapter.js';\nexport { VibeStorageDO, VibeKvDO, AccountBudgetDO } from './local-storage-host.mjs';\nexport default withLocalStorage(adapter);\n");
   }
 }
 

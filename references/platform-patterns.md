@@ -23,42 +23,32 @@ At the monthly allowance, `usage` reports `monthlyCalls.paused: true` and `month
 
 Measured key-value, file and SQL storage pauses worker requests and MCP tools past twice the plan's limit, or past the lowest paid limit for storage the plan does not include; HTTP returns 429 with reason storage_quota.
 Owner totals pause all vibes; a SQL database past its pause threshold pauses its environment. At or below that threshold, writes are refused at the plan cap; reads and deletes work, including after downgrades.
-Free space through platform storage APIs or delete an unused vibe. `execute_sql` runs a plain DELETE on any plan, including while storage is paused, unless the database has triggers, the table is a full-text search table, or a foreign key would SET NULL or SET DEFAULT; the refusal names the restriction. Upgrades recheck immediately.
-Hourly checks restore access at or below the pause threshold, plus up to 60 seconds of caching and key-value propagation; failed measurements retain the prior verdict. Static assets and file reads keep their usual gates.
+Free space through platform storage APIs or delete an unused vibe. `execute_sql` runs a plain DELETE on any plan, including while storage is paused, unless the database has triggers, the table is a full-text search table, or a foreign key would SET NULL or SET DEFAULT; the refusal names the restriction. An upgrade lifts a pause within a minute.
+Freed key-value and file space usually lifts it within a minute too; SQL database space is measured hourly. Static assets and file reads keep their usual gates.
 
 ## Key-value storage (`env.VIBE_STORAGE`, every plan)
 
-Store JSON strings under colon-separated keys (`items:<id>`). `list()` can miss
-a key written in the last minute, so "add, then list" needs a small "recent ids"
-key merged into the listing. The templates do this:
+Store JSON strings under colon-separated keys (`items:<id>`). Reads and
+`list()` see every earlier write, so "add, then list" needs nothing extra. A
+value holds at most 7 MiB (7,340,032 bytes); store larger data as a file
+(`env.VIBE_R2`, Pro) or split it across keys. `cacheTtl` is accepted and has
+no effect. `list()` returns at most 1,000 keys a page and can return a short
+page with `list_complete: false`, so follow `cursor` until `list_complete`:
 
 ```javascript
-async function rememberWrite(env, prefix, id) {
-  const key = `recent:${prefix}`;
-  const recent = JSON.parse((await env.VIBE_STORAGE.get(key)) || '[]');
-  await env.VIBE_STORAGE.put(key, JSON.stringify([id, ...recent.filter((x) => x !== id)].slice(0, 100)));
-}
-
 async function loadAll(env, prefix) {
-  const ids = new Set();
+  const records = [];
   let cursor;
-  do { // list() returns at most 1000 keys per page
+  do {
     const page = await env.VIBE_STORAGE.list({ prefix, cursor });
-    for (const k of page.keys) ids.add(k.name.slice(prefix.length));
+    records.push(...await Promise.all(page.keys.map(async (k) => JSON.parse((await env.VIBE_STORAGE.get(k.name)) || 'null'))));
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
-  for (const id of JSON.parse((await env.VIBE_STORAGE.get(`recent:${prefix}`)) || '[]')) ids.add(id);
-  const records = await Promise.all(
-    [...ids].map(async (id) => JSON.parse((await env.VIBE_STORAGE.get(`${prefix}${id}`)) || 'null'))
-  );
-  return records.filter(Boolean); // deleted records drop out
+  return records.filter(Boolean);
 }
-
-// After every put: await rememberWrite(env, 'items:', id);
-// To list:         const items = await loadAll(env, 'items:');
 ```
 
-Need strictly consistent queries? Use SQL.
+Need queries across fields? Use SQL.
 
 ## SQL (`env.VIBE_D1`, Pro or Pro+)
 
@@ -147,8 +137,8 @@ key with nothing stored is 404 `File not found`), so a `files/` folder in the
 project is never served. Each read counts as a request against the vibe's daily
 and monthly limits.
 
-**Uploading from the browser:** large uploads go straight to file storage with a signed
-URL the worker mints:
+**Uploading from the browser:** a page sends a file without passing it through
+the worker with a one-time upload link the worker mints:
 
 ```javascript
 // Worker tool
@@ -158,16 +148,18 @@ async function upload_url(key, contentType, contentLength, env) {
 // Frontend: get the URL, PUT the file to it, then show it from /files/<key>
 ```
 
-`createUploadUrl` returns `{ url, expiresAt }`. `contentLength` (the exact byte
-size) is required: the signed PUT pins the byte size, not the Content-Type. A
-client can store any type under the key, so a worker that cares checks the first
-bytes; `/files/<key>` serves scriptable types as plain text regardless. The worker
-decides who may upload and to which key.
-A 403 SignatureDoesNotMatch on the PUT means the bytes sent differ from contentLength.
-The browser's PUT to the signed URL is CORS-allowed from the vibe's own origin (preflight answers 204); no CORS setup is needed.
+`createUploadUrl` returns `{ url, expiresAt }`: a link on the vibe's own host
+that takes one PUT of exactly `contentLength` bytes (required, at most 100 MB)
+before `expiresAt` (`ttl` at most 600 seconds). A second PUT, a different size
+or, when `contentType` was given, a different Content-Type is refused with a
+JSON `error`, and the link is spent; mint a new one. The upload counts against
+file storage when it arrives (402 when storage is full). The worker decides who
+may upload and to which key; a worker that cares about the type checks the
+first bytes, and `/files/<key>` serves scriptable types as plain text. The page
+PUTs to its own origin, so no CORS setup is needed.
 
 **Downloading outside the page** (a script, another server): the worker
-mints `createDownloadUrl(key)`, a `/files/<key>?exp=…&sig=…` link on the vibe's
+mints `createDownloadUrl(key)`, a `/files/<key>?exp=…&kid=…&sig=…` link on the vibe's
 own host that lasts at most 120 seconds. Until then anyone holding it can open
 that one file with GET or HEAD, whatever the vibe's access settings; each open
 counts as a file read. A page does not need this: use `/files/<key>`.
@@ -184,7 +176,7 @@ These default to production's files; add `--preview` for the preview tree.
 `vibe files url <key> --expires 7d` (30m, 12h, at most 7d) prints a link anyone can open until it expires, even on a private vibe; it opens only that file. `vibe dev` refuses `createDownloadUrl` and `createUploadUrl`; test them on preview.
 The preview host serves the preview tree and the production host the production tree; upload to both when a page needs the file in both.
 `vibe files usage` (MCP: get_vibe's `r2BytesUsed`) reports file storage across both trees; account `usage` reports key-value, SQL and file storage.
-Signed uploads count at once; files the worker writes with `put()` count within the hour.
+Uploads through a link count at once; files the worker writes with `put()` count within the hour.
 
 **Check a private vibe with curl:** the token in `~/.vibe-coded/credentials.json`
 works on the vibe host as `Authorization: Bearer <token>`, the same as the API.
@@ -222,8 +214,8 @@ provider signature headers (Stripe, Svix…) and any `X-Webhook-*` header do.
 
 ```javascript
 // Create SYNC_TOKEN with set_secret through MCP or vibe secrets create through the CLI.
-function _checkToken(request, env) {
-  const expected = env.SYNC_TOKEN;
+async function _checkToken(request, env) {
+  const expected = await env.VIBE_SECRETS.get('SYNC_TOKEN');
   if (!expected) return false;                 // fail closed if unset
   const got = request.headers.get('X-Webhook-Token') || '';
   if (got.length !== expected.length) return false;
@@ -235,12 +227,14 @@ function _checkToken(request, env) {
 
 Use a dedicated secret (not the user's CLI token), and never echo it in responses
 or logs. Keys the worker calls out with (Stripe, OpenAI) are also secrets, read
-as `env.NAME`.
+with `await env.VIBE_SECRETS.get('NAME')` inside the handler on each request: it
+returns null for a name the vibe has none of and throws in a read-only request.
+Don't keep a secret, or a client built from one, at module scope.
 
 ### Webhook inbox recipe
 
 1. Add a root worker route for `POST /webhooks/inbox`, outside `/api`. Check
-   `_checkToken(request, env)` above before storing the payload or making outbound
+   `await _checkToken(request, env)` above before storing the payload or making outbound
    calls; reject a missing or invalid token before any side effect.
 2. Create `SYNC_TOKEN` with MCP `set_secret` or CLI `vibe secrets create SYNC_TOKEN`.
    Have the sender supply that dedicated secret in `X-Webhook-Token`.
@@ -262,8 +256,8 @@ non-`/api` route has the following capabilities:
 | Interaction policy | Anonymous `POST /webhooks/inbox` |
 |---|---|
 | `public` | Reaches the worker with storage writes and secrets. |
-| `authenticated` | Reaches this non-`/api` route in read mode: storage writes are refused and secrets are hidden. `/api` routes require sign-in, and a signed-in caller without a grant gets read mode on both. |
-| `public_read` | Reaches the worker in read mode: storage writes are refused and secrets are hidden. Outbound fetches still run. |
+| `authenticated` | Reaches this non-`/api` route in read mode: storage writes and secret reads are refused. `/api` routes require sign-in, and a signed-in caller without a grant gets read mode on both. |
+| `public_read` | Reaches the worker in read mode: storage writes and secret reads are refused. Outbound fetches still run. |
 | `invite_only` | Receives 401 before the worker runs. |
 
 Private visibility returns 401 for anonymous requests under every interaction

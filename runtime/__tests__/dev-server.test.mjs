@@ -2086,6 +2086,7 @@ test('props local storage enforces the shared ceiling per request, including dir
   writeFileSync(join(project, 'worker.js'), `export default { async fetch(request, env, ctx) {
     const path = new URL(request.url).pathname;
     if (path === '/api/check') return Response.json({ value: await env.VIBE_STORAGE.get('background') });
+    if (path === '/api/secret') return Response.json({ value: await env.VIBE_SECRETS.get('LOCAL_SECRET') });
     if (path === '/api/background') {
       ctx.waitUntil(ctx.props.STORAGE.put('background', 'saved'));
       return new Response('queued');
@@ -2101,7 +2102,8 @@ test('props local storage enforces the shared ceiling per request, including dir
   writeFileSync(join(project, '.dev.vars'), 'LOCAL_SECRET=local-value');
   const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'free' }, ['--generation', 'props']);
   if (!server) return;
-  const expected = { completed: 500, platformBinding: 'undefined', token: 'undefined', mode: null, secret: 'local-value' };
+  // .dev.vars stays out of env; VIBE_SECRETS serves it (Pro and Pro+ only, as hosted).
+  const expected = { completed: 500, platformBinding: 'undefined', token: 'undefined', mode: null };
   for (let i = 0; i < 2; i++) {
     const { message, ...rest } = await (await fetch(server.base + '/api/ceiling')).json();
     assert.deepEqual(rest, expected);
@@ -2109,6 +2111,32 @@ test('props local storage enforces the shared ceiling per request, including dir
   }
   assert.equal(await (await fetch(server.base + '/api/background')).text(), 'queued');
   assert.deepEqual(await (await fetch(server.base + '/api/check')).json(), { value: 'saved' });
+  // Free has no secrets locally either: the plan's refusal, answered as hosted.
+  const refused = await fetch(server.base + '/api/secret');
+  assert.equal(refused.status, 403);
+  const { error, ...gate } = await refused.json();
+  assert.deepEqual(gate, { success: false, code: 'ENTITLEMENT_EXCEEDED', limitType: 'secret_storage', upgradeUrl: 'https://vibe-coded.ai/pricing' });
+  assert.match(error, /is not included in the Free plan/);
+  await server.stop();
+});
+
+test('vibe dev serves .dev.vars through VIBE_SECRETS with the hosted checks, never in env', async (t) => {
+  if (!existsSync(resolve(RUNTIME_DIR, '../../../src/package.json'))) { t.skip('native runtime dependency lives in the platform repo'); return; }
+  const { root, runtimeDir, project, modules } = setupDevRuntime();
+  useRealMiniflare(modules);
+  writeFileSync(join(project, 'worker.js'), `export default { async fetch(request, env) {
+    const name = new URL(request.url).searchParams.get('name');
+    try { return Response.json({ keys: Object.keys(env).sort(), inEnv: env.LOCAL_SECRET ?? null, value: await env.VIBE_SECRETS.get(name) }); }
+    catch (error) { return Response.json({ name: error.name, code: error.code ?? null }); }
+  } };`);
+  writeFileSync(join(project, '.dev.vars'), 'LOCAL_SECRET=local-value');
+  const server = await startDevServer(t, root, runtimeDir, project, { VIBE_DEV_PLAN: 'pro' }, ['--generation', 'props']);
+  if (!server) return;
+  const read = async name => (await fetch(`${server.base}/api/read?name=${name}`)).json();
+  assert.deepEqual(await read('LOCAL_SECRET'), {
+    keys: ['USER_SLUG', 'VIBE_D1', 'VIBE_ENV', 'VIBE_ID', 'VIBE_R2', 'VIBE_SECRETS', 'VIBE_SLUG', 'VIBE_STORAGE'], inEnv: null, value: 'local-value' });
+  assert.equal((await read('MISSING')).value, null);
+  assert.deepEqual(await read('lowercase'), { name: 'TypeError', code: null });
   await server.stop();
 });
 

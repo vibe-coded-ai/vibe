@@ -1,12 +1,12 @@
 import { withLocalOutbound } from './local-outbound.mjs';
-import { VibeStorage, VibeStorageDO, AccountBudgetDO, bookDispatch, getPlan, getPlanLimit,
+import { VibeStorage, secretSource, VibeStorageDO, VibeKvDO, AccountBudgetDO, chargeStorage, getPlan, getPlanLimit,
   planHasFeature, jsonResponse, D1_STORAGE_FULL,
   classifyD1, assertD1SingleStatement, d1DdlNoop, D1_ENTITLEMENT_REQUIRED, WRITE_ACCESS_DENIED,
   sqlErrorMessageForAuthor } from './dev-storage.js';
 // The adapter's own error class, so a direct STORAGE call gets the same structured refusal as the facade.
 import { D1EntitlementError } from './client-adapter.js';
 
-export { VibeStorageDO, AccountBudgetDO };
+export { VibeStorageDO, VibeKvDO, AccountBudgetDO };
 
 const SIGNED_URL_REFUSAL = 'Signed file links are not available in vibe dev; test them on preview.';
 const INVALID_STATEMENT = 'Invalid SQL statement: prepare() takes a non-empty SQL string of at most 100,000 characters and at most 100 parameters';
@@ -79,8 +79,8 @@ function localD1(env, ctx, props) {
   }
   function book(result) {
     const rows = result?.meta?.rows_written;
-    bookDispatch(env, ctx, { userId: props.ownerUserId, plan: props.plan, nowMs: Date.now(),
-      storageMicro: Number.isSafeInteger(rows) && rows >= 0 ? rows : props.plan === 'free' ? 500 : 10_000 });
+    chargeStorage(env, ctx, { ownerUserId: props.ownerUserId, plan: props.plan, vibeId: props.vibeId,
+      micro: Number.isSafeInteger(rows) && rows >= 0 ? rows : props.plan === 'free' ? 500 : 10_000 });
   }
   function forwarding(target) {
     return {
@@ -129,6 +129,11 @@ class LocalVibeStorage extends VibeStorage {
   d1OpenSession(options) { return localD1(this.env, this.ctx, this.ctx.props).openSession(options); }
   async createUploadUrl() { throw new Error(SIGNED_URL_REFUSAL); }
   async createDownloadUrl() { throw new Error(SIGNED_URL_REFUSAL); }
+  // secretGet's name, mode, plan, lifetime and unit checks are the platform's; only the source is local.
+  async [secretSource](_props, name) {
+    const secrets = this.env.LOCAL_SECRETS ?? {};
+    return Object.hasOwn(secrets, name) ? secrets[name] : null;
+  }
 }
 
 export function withLocalStorage(adapter) { return {
@@ -138,13 +143,11 @@ export function withLocalStorage(adapter) { return {
     await initializeRegistry(env, config);
     const props = { invocationId: crypto.randomUUID(), openedAt: Date.now(), ownerUserId: 1,
       vibeId: Number(config.vibeId), env: 'preview', mode: 'write', plan: config.plan,
-      generation: 'props', unitCeiling: config.plan === 'free' ? 500 : 10_000,
-      kvAlias: `${config.userSlug}--${config.vibeSlug}` };
+      generation: 'props', unitCeiling: config.plan === 'free' ? 500 : 10_000 };
     const storage = new LocalVibeStorage({ props, waitUntil: task => ctx.waitUntil(task) }, env);
     const headers = new Headers(request.headers);
     for (const name of ['x-vibe-access-mode', 'x-vibe-access-token', 'x-vibe-storage-units', 'x-vibe-subrequests']) headers.delete(name);
-    const authorEnv = { ...env.AUTHOR_ENV, VIBE_ID: config.vibeId, VIBE_SLUG: config.vibeSlug,
-      USER_SLUG: config.userSlug, VIBE_ENV: 'preview' };
+    const authorEnv = { VIBE_ID: config.vibeId, VIBE_SLUG: config.vibeSlug, USER_SLUG: config.userSlug, VIBE_ENV: 'preview' };
     try {
       return await withLocalOutbound(props, () => adapter.fetch(new Request(request, { headers }), authorEnv, {
         props: { STORAGE: storage, mode: props.mode }, waitUntil: task => ctx.waitUntil(task),

@@ -71,7 +71,7 @@ HTTP request to `/api/<name>` reaches the worker unchecked.
   (not the paths of the worker's source files or of root files such as `package.json`).
 - SQL: create tables from write paths (`CREATE TABLE IF NOT EXISTS`), and treat
   "no such table" on a read as empty; preview starts with an empty database.
-- Key-value: use the `rememberWrite` / `loadAll` helpers from the template for lists
+- Key-value: reads and lists see every earlier write; a value holds at most 7 MiB
   (see `platform-patterns.md`).
 
 ## Background work and logs

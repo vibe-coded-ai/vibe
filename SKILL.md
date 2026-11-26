@@ -1,6 +1,6 @@
 ---
 name: vibe-coded-ai
-version: 0.9.0
+version: 0.10.0
 description: Build, host, and connect vibes on vibe-coded.ai from your coding agent — data stores your AI reads and writes through MCP tools, or static and Vue web apps. Covers the whole lifecycle — scaffold, run locally, preview, publish, connect an AI client — plus settings, access, and secrets.
 allowed-tools:
   - Bash
@@ -122,7 +122,7 @@ or resend it from https://vibe-coded.ai/account (Resend verification email).
    There is no filesystem and no long-running process.
 4. **Swap the storage:** files or a local database become `env.VIBE_STORAGE`,
    `env.VIBE_D1` or `env.VIBE_R2`; `.env` values become `vibe secrets` (locally,
-   `.dev.vars`).
+   `.dev.vars`), read inside the handler with `await env.VIBE_SECRETS.get('NAME')`.
 5. **Frontend:** static files move as they are; a Vite app builds to `dist/`.
 6. **Keep only what you mean to publish** in the folder (next section).
 7. Add `@mcp-expose` tools if useful, then `vibe dev`, `vibe preview`, `vibe call`,
@@ -162,7 +162,7 @@ Two settings, both changed on the web (the CLI prints the link):
   Uninvited callers are always read-only over MCP; MCP writes need an owner,
   writer or admin.
 
-Read-only callers can't write storage or see secrets, but outbound fetches still
+Read-only callers can't write storage or read secrets (`VIBE_SECRETS.get` throws), but outbound fetches still
 run, so guard email and webhooks yourself. Roles for invited people: `viewer`
 (read), `writer` (read and write), `admin`; only the owner manages access and
 settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug>`.
@@ -189,7 +189,7 @@ settings. To use a vibe someone shared with you, run `vibe connect <owner>/<slug
 | `urls` | Preview, production and MCP URLs |
 | `settings [--title T]` | View settings, change the title; visibility and interaction are web-only |
 | `access list` | List collaborators; grants and revokes are web-only |
-| `secrets list\|create\|update\|delete NAME` | Write-only secrets (Pro), read in the worker as `env.NAME` |
+| `secrets list\|create\|update\|delete NAME` | Write-only secrets (Pro), read in the worker with `await env.VIBE_SECRETS.get('NAME')` |
 | `files upload\|download\|ls\|rm\|url` | Stored files (upload: Pro) |
 | `delete` | Prints the web link to delete the vibe |
 
@@ -209,7 +209,7 @@ retrying.
 **`vibe dev` vs production:** locally there are no access checks, signed file URLs
 don't work, and `/mcp` supports only `initialize`,
 `tools/list` and `tools/call`.
-Check those on preview. Local secrets go in `.dev.vars`.
+Check those on preview. Local secrets go in `.dev.vars`, read through `env.VIBE_SECRETS` as hosted.
 `vibe dev` applies the plan's per-request storage ceiling and outbound allowance and keeps
 state in `.vibe-coded/dev` (`--reset` clears it). Local behaviour is a
 convenience, not authority: verify access, entitlement and error shape on hosted preview.

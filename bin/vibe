@@ -481,15 +481,12 @@ _display_policy() {
 }
 
 # jq: the stores a vibe holds data in (the byte counters on its record), else
-# the storage type it was created with. Key-value bytes are measured hourly;
-# storage_note says so when a key-value vibe's bytes are not counted yet.
+# the storage type it was created with.
 STORAGE_IN_USE_JQ='def storage_in_use: . as $v
   | [ (if $v.storageType == "d1" or (($v.d1BytesUsed // 0) + ($v.d1PreviewBytesUsed // 0)) > 0 then "sql" else empty end),
       (if ($v.kvBytesUsed // 0) > 0 then "key-value" else empty end),
       (if ($v.r2BytesUsed // 0) > 0 then "files" else empty end) ]
-  | if length > 0 then join(", ") else (($v.storageType // "kv") | if . == "kv" then "key-value" elif . == "d1" then "sql" else . end) end;
-def storage_note: if (.storageType // "kv") == "kv" and (storage_in_use | split(", ") | index("key-value") == null)
-  then " (key-value usage is measured hourly)" else "" end;'
+  | if length > 0 then join(", ") else (($v.storageType // "kv") | if . == "kv" then "key-value" elif . == "d1" then "sql" else . end) end;'
 
 # Set .vibe-coded.json's storage from a vibe-detail result ($1): d1 once the
 # platform records SQL for the vibe, else its recorded type. vibe dev's banner
@@ -1835,7 +1832,7 @@ cmd_status() {
   echo "  Visibility: $(_display_visibility "$(echo "$INFO" | jq -r '.vibe.visibility // .visibility // "unknown"')")"
   echo "  Policy:     $(_display_policy "$(echo "$INFO" | jq -r '.vibe.visibility // .visibility // "unknown"')" "$(echo "$INFO" | jq -r '.vibe.interactionPolicy // .interactionPolicy // "unknown"')")"
   local storage_display
-  storage_display=$(echo "$INFO" | jq -r "$STORAGE_IN_USE_JQ"' (.vibe // .) | storage_in_use + storage_note')
+  storage_display=$(echo "$INFO" | jq -r "$STORAGE_IN_USE_JQ"' (.vibe // .) | storage_in_use')
   echo "  Storage:    $storage_display"
   _status_fetch "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/builds?limit=5"
   BUILDS="$STATUS_BODY"
@@ -3005,11 +3002,7 @@ cmd_secrets() {
       _remove_on_exit ""
       _check_success "$RESULT" "vibe secrets create"
       echo "Secret $name created."
-      if [ "$(echo "$RESULT" | jq -r '.pendingDeploy // false')" = "true" ]; then
-        echo "No worker is deployed yet, so nothing reads it until a build deploys one: vibe preview for the preview, vibe publish for production."
-      else
-        echo "The worker reads it as env.$name; one value serves both preview and production."
-      fi
+      echo "The worker reads it with await env.VIBE_SECRETS.get('$name'); one value serves both preview and production."
       ;;
     update)
       local name="${1:-}"
@@ -3028,11 +3021,7 @@ cmd_secrets() {
       _remove_on_exit ""
       _check_success "$RESULT" "vibe secrets update"
       echo "Secret $name updated."
-      if [ "$(echo "$RESULT" | jq -r '.pendingDeploy // false')" = "true" ]; then
-        echo "No worker is deployed yet, so nothing reads it until a build deploys one: vibe preview for the preview, vibe publish for production."
-      else
-        echo "The worker reads the new value as env.$name; one value serves both preview and production."
-      fi
+      echo "The worker's next env.VIBE_SECRETS.get('$name') returns the new value, in preview and production."
       ;;
     delete)
       local name="${1:-}"
@@ -3040,7 +3029,7 @@ cmd_secrets() {
       _validate_secret_name "$name"
       RESULT=$(_api DELETE "/api/v1/vibes/$USER_SLUG/$VIBE_SLUG/secrets/$name")
       _check_success "$RESULT" "vibe secrets delete"
-      echo "Secret $name deleted. A running worker can still read it for up to ~30 seconds."
+      echo "Secret $name deleted. The worker's next env.VIBE_SECRETS.get('$name') returns null."
       ;;
     audit)
       # Build-time secret syncs are left out: they are deploys, not changes.
@@ -3061,7 +3050,7 @@ cmd_secrets() {
       ;;
     *)
       echo "Usage: vibe secrets list|create|update|delete|audit [NAME]" >&2
-      echo "(secrets are write-only — values cannot be read back; they reach your worker as env.<NAME>)" >&2
+      echo "(secrets are write-only — values cannot be read back; your worker reads one with await env.VIBE_SECRETS.get('<NAME>'))" >&2
       exit 1
       ;;
   esac
@@ -3233,18 +3222,16 @@ USAGE
       _check_success "$mint" "File upload"
       local url; url=$(echo "$mint" | jq -r '.url')
 
-      # PUT the file straight to storage through the signed URL; curl reads it
-      # from disk. The response body goes to a private temporary file.
+      # PUT the file to the one-time upload link on the vibe's host; curl reads
+      # it from disk. The response body goes to a private temporary file.
       local put_log; put_log=$(_tmpfile vibe-r2-put) || exit 1
       local http_code; http_code=$(curl -s -o "$put_log" -w "%{http_code}" \
         -X PUT -H "Content-Type: $content_type" --data-binary "@$local_path" "$url") || http_code="000"
       if [ "$http_code" != "200" ] && [ "$http_code" != "204" ]; then
-        # Storage error bodies echo the signed request (storage host, account,
-        # bucket); only the error code is shown.
-        local put_code; put_code=$(grep -o '<Code>[^<]*</Code>' "$put_log" 2>/dev/null | sed 's/<[^>]*>//g' | head -1) || put_code=""
+        local put_error; put_error=$(jq -r '.error // empty' "$put_log" 2>/dev/null) || put_error=""
         rm -f "$put_log"
         if [ "$http_code" = "000" ]; then echo "Upload failed: the request did not complete. Check your connection and retry." >&2
-        else echo "Upload failed: HTTP $http_code${put_code:+ ($put_code)}" >&2; fi
+        else echo "Upload failed: HTTP $http_code${put_error:+: $put_error}" >&2; fi
         exit 1
       fi
       rm -f "$put_log"
@@ -3687,14 +3674,14 @@ _print_command_help() {
     publish) printf '%s\n' "Usage: vibe publish [--open] [--force]" "Promote the live preview build to production. Stops when a file changed since the last vibe preview or when production already serves that build; --force promotes anyway. --open opens the app, or its sharing page while it is private, in your browser." "Preview data does not carry to production; production keeps its own data." ;;
     status) printf '%s\n' "Usage: vibe status [--plan]" "Show live preview/production build IDs and recent build history." "--plan shows your plan instead: monthly calls, vibes, preview builds and source uploads used. No .vibe-coded.json needed." ;;
     urls) printf '%s\n' "Usage: vibe urls" "Print preview and production app/MCP endpoints." ;;
-    fetch) printf '%s\n' "Usage: vibe fetch <path> [--production] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" "Fetch a deployed route as the owner, including from a private vibe. Targets the preview build; --production targets production. GET by default; --header is repeatable. Authorization and Cookie never reach the worker. For a machine endpoint, send a dedicated secret in X-Webhook-Token and check it against env.SYNC_TOKEN in the worker; create it with vibe secrets create SYNC_TOKEN (Pro). Provider signature headers and X-Webhook-* are forwarded." "" "2xx and 3xx responses succeed. Redirects are not followed; 3xx prints the Location header when present." "--headers (-i) prints the status line and all response headers except cookies before the body." "The → owner/slug (env) line goes to stderr; stdout carries only the response." ;;
+    fetch) printf '%s\n' "Usage: vibe fetch <path> [--production] [--headers|-i] [--method M] [--header 'K: V'] [--data <string|@file>]" "Fetch a deployed route as the owner, including from a private vibe. Targets the preview build; --production targets production. GET by default; --header is repeatable. Authorization and Cookie never reach the worker. For a machine endpoint, send a dedicated secret in X-Webhook-Token and check it against await env.VIBE_SECRETS.get('SYNC_TOKEN') in the worker; create it with vibe secrets create SYNC_TOKEN (Pro). Provider signature headers and X-Webhook-* are forwarded." "" "2xx and 3xx responses succeed. Redirects are not followed; 3xx prints the Location header when present." "--headers (-i) prints the status line and all response headers except cookies before the body." "The → owner/slug (env) line goes to stderr; stdout carries only the response." ;;
     call) printf '%s\n' "Usage: vibe call <tool> ['{\"arg\":\"value\"}'] [--production]" "Call one live MCP tool as the owner and print its text result. Targets the preview build; --production targets production." "The → owner/slug (env) line goes to stderr; stdout carries only the result." ;;
     sql) printf '%s\n' "Usage: vibe sql \"<statement>\" [--params '[1, \"a\"]'] [--production] [--write]" "Run one SQL statement on the vibe's own database as the owner (Pro or Pro+; after a downgrade to Free, reads and most DELETEs still run). Targets the preview database; --production the published one." "Read-only by default: only SELECT (or WITH ... SELECT) runs. --write runs INSERT, UPDATE, DELETE or REPLACE, and each write is recorded in an audit log. Schema changes (CREATE, ALTER, DROP, PRAGMA) are refused: make them in the worker's code." "List tables with vibe sql \"SELECT name, sql FROM sqlite_master WHERE type = 'table'\" and a table's columns with vibe sql \"SELECT * FROM pragma_table_xinfo('notes')\" (PRAGMA statements are refused)." "Put values in --params for ? placeholders; numbers bind as numbers, so send a value for a TEXT column as a string (\"42\", not 42); pass a whole number past 9007199254740991 as a string." "Prints the column names, then each row, as JSON arrays on stdout, at most 1,000 rows and 1 MB; the summary goes to stderr." "It runs on the platform, not on vibe dev's local database: vibe dev seed <file.sql> applies SQL there." ;;
     connect) printf '%s\n' "Usage: vibe connect [<owner>/<slug>] [--name N] [--print|--revoke]" "Register or revoke a scoped MCP connection in Claude Code: this vibe, or <owner>/<slug> for a vibe shared with you." "--print creates a real connection token and prints its command. Revoke it with: vibe connect [<owner>/<slug>] --revoke" ;;
     logs) printf '%s\n' "Usage: vibe logs [build-id]" "Show build logs only; defaults to the last build started from this machine; vibe logs <id> for another. Worker console output is not visible anywhere." ;;
     settings) printf '%s\n' "Usage: vibe settings [--title T] [--visibility private|unlisted|public] [--interaction public|public_read|authenticated|invite_only]" "View settings or update the title; exposure changes are web-only and exit non-zero." ;;
     access) printf '%s\n' "Usage: vibe access list|grant|update|revoke|revoke-all [args]" "List access in the CLI; owner-only mutations are completed on the website." ;;
-    secrets) printf '%s\n' "Usage: vibe secrets list|create|update|delete|audit [NAME]" "Manage write-only worker secrets (Pro). Authorization and Cookie never reach the worker. For a machine endpoint, create a dedicated secret with vibe secrets create SYNC_TOKEN, send it in X-Webhook-Token and check it against env.SYNC_TOKEN in the worker. Provider signature headers and X-Webhook-* are forwarded. See references/platform-patterns.md for the webhook inbox recipe, including the website step for anonymous access." ;;
+    secrets) printf '%s\n' "Usage: vibe secrets list|create|update|delete|audit [NAME]" "Manage write-only worker secrets (Pro). Authorization and Cookie never reach the worker. For a machine endpoint, create a dedicated secret with vibe secrets create SYNC_TOKEN, send it in X-Webhook-Token and check it against await env.VIBE_SECRETS.get('SYNC_TOKEN') in the worker. Provider signature headers and X-Webhook-* are forwarded. See references/platform-patterns.md for the webhook inbox recipe, including the website step for anonymous access." ;;
     r2) printf '%s\n' "Usage: vibe files upload|download|url|ls|rm|usage [args]" "Manage the current vibe's stored files. Uploading needs Pro; on Free you can still list, download and delete kept files." \
           "  upload <path> --key <key>     download <key> --to <path>     url <key>" \
           "  ls [prefix]                   rm <key>                       usage" \
